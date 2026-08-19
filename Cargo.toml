@@ -44,7 +44,7 @@ anyhow = "1"
 sha2 = "0.10"
 
 # Graph algorithms (verify-program-fsm: Tarjan SCC + Kahn layering)
-petgraph = "0.6"
+petgraph = "0.8"
 
 # Timestamps (verify-program-fsm: FunctionCompletion.last_attempt_at)
 chrono = { version = "0.4", features = ["serde"] }
