@@ -1,0 +1,47 @@
+# OCaml / dune
+_build/
+*.byte
+*.native
+*.cmo
+*.cmi
+*.cma
+*.cmx
+*.cmxa
+*.cmxs
+*.o
+*.a
+*.so
+.merlin
+*.install
+
+# opam
+_opam/
+
+# Rust (for experiments)
+target/
+Cargo.lock
+
+# Editor
+*~
+*.swp
+*.swo
+.vscode/
+.idea/
+.claude/
+.editorconfig
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Project specific
+skills-lock.json
+*.log
+
+# Frama-C: WP session cache and saved analysis states
+.frama-c/
+*.sav
+
+# frama-c-mcp runtime state: conclusions, sandbox metadata, project state.
+# Holds absolute local paths and PIDs.
+.frama-c-mcp/

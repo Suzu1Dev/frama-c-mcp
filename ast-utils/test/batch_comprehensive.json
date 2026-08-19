@@ -1,0 +1,16 @@
+[
+  {"kind":"GET","id":"f01","request":"plugins.ast-utils.getFunctionAst","data":"add"},
+  {"kind":"GET","id":"f02","request":"plugins.ast-utils.getFunctionAst","data":"apply_op"},
+  {"kind":"GET","id":"f03","request":"plugins.ast-utils.getFunctionAst","data":"clamp"},
+  {"kind":"GET","id":"f04","request":"plugins.ast-utils.getFunctionAst","data":"test_all_stmts"},
+  {"kind":"GET","id":"f05","request":"plugins.ast-utils.getFunctionAst","data":"test_calls"},
+  {"kind":"GET","id":"f06","request":"plugins.ast-utils.getFunctionAst","data":"make_rect"},
+  {"kind":"GET","id":"f07","request":"plugins.ast-utils.getFunctionAst","data":"rect_area"},
+  {"kind":"GET","id":"f08","request":"plugins.ast-utils.getFunctionAst","data":"test_struct_union"},
+  {"kind":"GET","id":"f09","request":"plugins.ast-utils.getFunctionAst","data":"test_array_ptr"},
+  {"kind":"GET","id":"f10","request":"plugins.ast-utils.getFunctionAst","data":"test_typedef"},
+  {"kind":"GET","id":"f11","request":"plugins.ast-utils.getFunctionAst","data":"test_void_return"},
+  {"kind":"GET","id":"f12","request":"plugins.ast-utils.getFunctionAst","data":"test_annotations"},
+  {"kind":"GET","id":"f13","request":"plugins.ast-utils.getFunctionAst","data":"test_asm"},
+  {"kind":"GET","id":"f14","request":"plugins.ast-utils.getFunctionAst","data":"nonexistent_func"}
+]

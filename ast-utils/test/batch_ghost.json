@@ -1,0 +1,15 @@
+[
+  {"kind":"GET","id":"v_ghost_var","request":"plugins.ast-utils.getAcslValidation",
+   "data":{"function":"test_all_stmts","kind":"annot","acsl":"ghost int g = 0;","stmt":23}},
+
+  {"kind":"GET","id":"v_ghost_block","request":"plugins.ast-utils.getAcslValidation",
+   "data":{"function":"test_all_stmts","kind":"annot","acsl":"ghost { int g = 0; g = g + 1; }","stmt":23}},
+
+  {"kind":"GET","id":"v_ghost_assigns","request":"plugins.ast-utils.getAcslValidation",
+   "data":{"function":"test_all_stmts","kind":"spec","acsl":"requires n >= 0; assigns \\nothing;"}},
+
+  {"kind":"EXEC","id":"add_ghost","request":"plugins.ast-utils.execAddAnnotation",
+   "data":{"function":"test_all_stmts","kind":"annot","acsl":"ghost int g = 0;","stmt":23}},
+
+  {"kind":"GET","id":"check_ghost","request":"plugins.ast-utils.getFunctionAst","data":"test_all_stmts"}
+]

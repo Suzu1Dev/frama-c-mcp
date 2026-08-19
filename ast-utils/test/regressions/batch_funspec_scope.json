@@ -1,0 +1,24 @@
+[
+  {"kind":"GET","id":"valid_formal","request":"plugins.ast-utils.getAcslValidation",
+   "data":{"function":"foo","kind":"spec","acsl":"requires n > 0; assigns arr[0..n-1]; ensures \\result == 0;"}},
+  {"kind":"GET","id":"valid_global","request":"plugins.ast-utils.getAcslValidation",
+   "data":{"function":"foo","kind":"spec","acsl":"assigns g, g_arr[0..9];"}},
+  {"kind":"GET","id":"valid_result","request":"plugins.ast-utils.getAcslValidation",
+   "data":{"function":"foo","kind":"spec","acsl":"ensures \\result == 0;"}},
+  {"kind":"GET","id":"valid_old","request":"plugins.ast-utils.getAcslValidation",
+   "data":{"function":"foo","kind":"spec","acsl":"ensures n == \\old(n);"}},
+
+  {"kind":"GET","id":"broken_local_assigns","request":"plugins.ast-utils.getAcslValidation",
+   "data":{"function":"foo","kind":"spec","acsl":"assigns i, j, tmp;"}},
+  {"kind":"GET","id":"broken_local_requires","request":"plugins.ast-utils.getAcslValidation",
+   "data":{"function":"foo","kind":"spec","acsl":"requires i > 0;"}},
+  {"kind":"GET","id":"broken_local_ensures","request":"plugins.ast-utils.getAcslValidation",
+   "data":{"function":"foo","kind":"spec","acsl":"ensures tmp == 0;"}},
+  {"kind":"GET","id":"broken_local_ptr","request":"plugins.ast-utils.getAcslValidation",
+   "data":{"function":"foo","kind":"spec","acsl":"assigns *p;"}},
+
+  {"kind":"GET","id":"broken_undef","request":"plugins.ast-utils.getAcslValidation",
+   "data":{"function":"foo","kind":"spec","acsl":"assigns nonexistent_var;"}},
+  {"kind":"GET","id":"broken_syntax","request":"plugins.ast-utils.getAcslValidation",
+   "data":{"function":"foo","kind":"spec","acsl":"assigns x x x;"}}
+]

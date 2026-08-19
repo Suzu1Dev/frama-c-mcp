@@ -1,0 +1,72 @@
+[package]
+name = "frama-c-mcp"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# MCP protocol (official Rust SDK).
+# Aligned with fv-core-mcp + mcp-server-fsm (both on 1.x).
+rmcp = { version = "1", features = ["server", "transport-io", "macros"] }
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+# preserve_order: Value::Object uses IndexMap to preserve insertion order (= source order of ast-utils emit),
+# which keeps request payload ordering stable. Value equality remains order-independent.
+serde_json = { version = "1", features = ["preserve_order"] }
+
+# Schema generation (rmcp requires schemars 1.0+)
+schemars = "1.0"
+
+# Byte buffer for frame codec
+bytes = "1"
+
+# Error types
+thiserror = "2"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# CLI arguments
+clap = { version = "4", features = ["derive"] }
+
+
+# Regex (for prompt output parsing)
+regex = "1"
+
+# main error handling
+anyhow = "1"
+
+# Hash (for source_hash in snapshots)
+sha2 = "0.10"
+
+# Graph algorithms (verify-program-fsm: Tarjan SCC + Kahn layering)
+petgraph = "0.6"
+
+# Timestamps (verify-program-fsm: FunctionCompletion.last_attempt_at)
+chrono = { version = "0.4", features = ["serde"] }
+
+# kill(pid, 0), the only way to ask whether a sandbox left by an earlier server
+# is still running. A new direct dependency and a new semver commitment; what
+# the existing transitive copy through tokio buys is only that nothing new gets
+# compiled.
+libc = "0.2"
+
+[dev-dependencies]
+# Temp dirs for test fixtures (state dir, project files).
+tempfile = "3"
+
+# MCP client side + child-process transport for end-to-end stdio JSON-RPC tests.
+# Used by tests/mcp_stdio_test.rs to spawn the server binary and drive it
+# through the actual MCP wire protocol (no internal-API shortcuts).
+rmcp = { version = "1", features = ["client", "transport-child-process"] }
+
+# The clippy gate ran as `cargo clippy --all-targets` with no -D, so a warning
+# left the exit status at 0 and the runner printed "passed". Denying here rather
+# than in the gate's command line keeps a plain `cargo clippy` honest too, which
+# is what anyone actually types before pushing.
+[lints.clippy]
+all = "deny"

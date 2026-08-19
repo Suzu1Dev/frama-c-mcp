@@ -1,0 +1,10 @@
+[
+  {"kind":"GET","id":"v1","request":"plugins.ast-utils.getAcslValidation",
+   "data":{"function":"abs_val","kind":"spec","acsl":"requires x >= -100 && x <= 100; ensures \\result >= 0;"}},
+  {"kind":"GET","id":"v2","request":"plugins.ast-utils.getAcslValidation",
+   "data":{"function":"abs_val","kind":"spec","acsl":"requires x >= bad_syntax"}},
+  {"kind":"EXEC","id":"a1","request":"plugins.ast-utils.execAddAnnotation",
+   "data":{"function":"abs_val","kind":"spec","acsl":"requires x >= -100; ensures \\result >= 0;"}},
+  {"kind":"GET","id":"check","request":"plugins.ast-utils.getFunctionAst","data":"abs_val"},
+  {"kind":"EXEC","id":"rm1","request":"plugins.ast-utils.execRemoveAnnotations","data":"abs_val"}
+]

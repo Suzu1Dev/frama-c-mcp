@@ -1,0 +1,4 @@
+interface:
+  display_name: "Frama-C Proofreader"
+  short_description: "Verify C and ACSL with Frama-C MCP, WP, EVA, and E-ACSL."
+  default_prompt: "Use Frama-C to check this C code, explain proof gaps, and state exactly what was verified."

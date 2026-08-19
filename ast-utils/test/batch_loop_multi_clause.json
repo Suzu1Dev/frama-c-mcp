@@ -1,0 +1,13 @@
+[
+  {"kind":"EXEC","id":"spec1","request":"plugins.ast-utils.execAddAnnotation",
+   "data":{"function":"copy_counter","kind":"spec",
+            "acsl":"requires c >= 0;\nassigns \\nothing;\nensures \\result == \\old(c);"}},
+
+  {"kind":"EXEC","id":"loop1","request":"plugins.ast-utils.execAddAnnotation",
+   "data":{"function":"copy_counter","kind":"annot","stmt":10,
+            "acsl":"loop invariant x + y == c;\nloop invariant x >= 0;\nloop invariant y >= 0;\nloop assigns x, y;\nloop variant x;"}},
+
+  {"kind":"GET","id":"check_annot","request":"plugins.ast-utils.getFunctionAst","data":"copy_counter"},
+
+  {"kind":"EXEC","id":"rm1","request":"plugins.ast-utils.execRemoveAnnotations","data":"copy_counter"}
+]

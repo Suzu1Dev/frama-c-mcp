@@ -1,0 +1,398 @@
+//! Where this server keeps state on disk, and what a caller is allowed to name.
+//!
+//! Conclusions, program state and sandbox metadata all land under the state
+//! directory, and every path that gets there comes from a tool argument. The
+//! path checks live next to the writers that depend on them rather than in
+//! server.rs among the request handlers.
+
+use std::collections::HashMap;
+use std::path::{Component, Path, PathBuf};
+
+use rmcp::ErrorData as McpError;
+use sha2::{Digest, Sha256};
+use serde_json::json;
+
+use crate::state::{FunctionVerificationState, ProjectVerificationState, SandboxMetadata};
+
+/// Long-text conclusion fields, paired with what a missing .md file reads back
+/// as. These live in <conclusion_dir>/<field>.md instead of meta.json, because
+/// agents write and edit them with ordinary file tools. Some("") keeps the key
+/// present and empty; None omits it, matching the Option semantics of the
+/// field.
+///
+/// "analysis_summary" used to be a fourth field. It collided with a Claude Code
+/// subagent guard on ANALYSIS*.md and now lives in the "## function_summary"
+/// section of semiformal_proof.md.
+const LONG_TEXT_FIELDS: &[(&str, Option<&str>)] = &[
+    ("semantic_proof", Some("")),
+    ("semiformal_proof", Some("")),
+    ("program_summary", None),
+];
+
+/// Where conclusions and sandbox metadata are written: ".frama-c-mcp/"
+/// relative to cwd by default, overridable with FRAMA_C_MCP_STATE_DIR.
+///
+/// This state outlives the process that wrote it and is keyed by
+/// experiment_id, so an entry an aborted run left behind makes the next
+/// create_sandbox reject the same id. Callers that need a clean slate per run,
+/// the test suite above all, point the variable at a directory of their own.
+pub fn conclusion_base_dir() -> PathBuf {
+    std::env::var_os("FRAMA_C_MCP_STATE_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(".frama-c-mcp"))
+}
+
+/// `.frama-c-mcp/<func>/` Directory path (one subdirectory for each function's
+/// conclusion).
+/// Whether `value` is safe to use as one filesystem path segment.
+///
+/// Function names and sandbox experiment ids both become directory names, so a
+/// value containing `/` or `..` would escape its parent. This is an allowlist
+/// rather than a `..` denylist because the legitimate values are C identifiers
+/// and opaque ids; anything outside that set is a caller mistake worth
+/// rejecting. Excluding `.` entirely is what rules out `..`.
+pub fn is_safe_path_segment(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+}
+
+/// Tool-boundary form of [`is_safe_path_segment`], with a caller-facing error.
+pub fn require_safe_path_segment(value: &str, field: &str) -> Result<(), McpError> {
+    if is_safe_path_segment(value) {
+        return Ok(());
+    }
+    Err(McpError::invalid_params(
+        format!("{field} must be 1-128 characters of [A-Za-z0-9_-]; it becomes a directory name"),
+        Some(json!({
+            "kind": "UnsafePathSegment",
+            "field": field,
+            "value": value,
+        })),
+    ))
+}
+
+/// Resolve a caller-named output path, refusing anything outside the working
+/// directory.
+///
+/// This writes a file with the server's privileges, from a tool a reader of
+/// the surface would take for a context fetcher. Measured before restricting
+/// it: an absolute "/tmp/pwned.c" and a "../../../../tmp/pwned2.c" both
+/// landed. That is an arbitrary write for anyone who can reach the tool, and
+/// README already warns that an agent reading untrusted C source can be
+/// steered into calling things.
+///
+/// The working directory is the root because it is the one that keeps the
+/// documented workflow whole: the server is started in a project and README's
+/// example writes "out/annotated.c". No flag to widen it, since a default that
+/// leaves the hazard open only documents it.
+///
+/// Normalized lexically first so a path whose parent does not exist yet still
+/// resolves, which "out/annotated.c" needs on a fresh checkout. Then the
+/// deepest existing ancestor is canonicalized and re-checked, because a
+/// symlinked directory inside the tree can still point out of it.
+pub fn resolve_output_path(path: &str) -> Result<PathBuf, McpError> {
+    let cwd = std::env::current_dir().map_err(|error| {
+        McpError::invalid_params(
+            format!("output must stay inside the working directory: cannot read it: {error}"),
+            None,
+        )
+    })?;
+    resolve_output_path_in(&cwd, path)
+}
+
+/// The rule above, against an explicit root.
+///
+/// Split out so both halves are testable without set_current_dir, which is
+/// process-global and would race every other test in the binary. The symlink
+/// half needs a root it can plant a symlink in.
+pub fn resolve_output_path_in(root: &Path, path: &str) -> Result<PathBuf, McpError> {
+    let refuse = |reason: &str| {
+        McpError::invalid_params(
+            format!("output must stay inside the working directory: {reason}"),
+            Some(json!({
+                "kind": "OutputPathOutsideWorkingDirectory",
+                "output": path,
+                "reason": reason,
+            })),
+        )
+    };
+
+    // Canonicalized once, and used for both checks. A root carrying its own
+    // ".." or symlink would otherwise satisfy the lexical containment test
+    // while pointing somewhere else, so the cheap check would be measuring the
+    // wrong tree. current_dir returns an absolute path, so this is hardening
+    // rather than a fix for a reachable case.
+    let real_root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    let requested = Path::new(path);
+    let joined = if requested.is_absolute() {
+        requested.to_path_buf()
+    } else {
+        real_root.join(requested)
+    };
+
+    let mut normalized = PathBuf::new();
+    for part in joined.components() {
+        match part {
+            Component::ParentDir => {
+                if !normalized.pop() {
+                    return Err(refuse("path climbs above the filesystem root"));
+                }
+            }
+            Component::CurDir => {}
+            // Prefix, RootDir, and Normal all keep the path they name.
+            other => normalized.push(other),
+        }
+    }
+    if !normalized.starts_with(&real_root) {
+        return Err(refuse("resolved outside it"));
+    }
+
+    // A symlink anywhere on the existing part of the path can leave the tree
+    // even though the text does not.
+    let existing = normalized
+        .ancestors()
+        .find(|ancestor| ancestor.exists())
+        .ok_or_else(|| refuse("no existing ancestor to check"))?;
+    let real = existing
+        .canonicalize()
+        .map_err(|error| refuse(&format!("cannot resolve {}: {error}", existing.display())))?;
+    if !real.starts_with(&real_root) {
+        return Err(refuse("a symlink on the path leaves the working directory"));
+    }
+    Ok(normalized)
+}
+
+pub fn conclusion_dir(func: &str) -> PathBuf {
+    conclusion_base_dir().join(func)
+}
+
+/// Read the long-text `.md` files under `dir` into a JSON object that
+/// `list {kind: "conclusions", function}` merges on top of meta.json.
+pub fn read_long_texts_as_json(dir: &Path) -> serde_json::Map<String, serde_json::Value> {
+    let mut map = serde_json::Map::new();
+    for &(field, when_missing) in LONG_TEXT_FIELDS {
+        let content = std::fs::read_to_string(dir.join(format!("{}.md", field)))
+            .ok()
+            .or_else(|| when_missing.map(str::to_string));
+        if let Some(content) = content {
+            map.insert(field.to_string(), serde_json::Value::String(content));
+        }
+    }
+    map
+}
+
+/// Persist only `meta.json`. Long-text fields never enter in-memory state, so
+/// this cannot clobber an `.md` file the agent just wrote.
+///
+/// Takes `base_dir` so tests can point at a tempdir; production calls
+/// `persist_conclusion`.
+pub fn persist_conclusion_at(
+    base_dir: &Path,
+    func: &str,
+    conclusion: &FunctionVerificationState,
+) -> std::io::Result<()> {
+    // Last line of defence: every persist_conclusion path funnels through here,
+    // so a name that could escape base_dir is refused even if a caller forgot
+    // to validate it.
+    if !is_safe_path_segment(func) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("unsafe function name for a conclusion directory: {func:?}"),
+        ));
+    }
+    let dir = base_dir.join(func);
+    std::fs::create_dir_all(&dir)?;
+
+    // The _long_text_files manifest tells a reader that meta.json omits those
+    // fields on purpose. It lists only files that exist: naming a missing one
+    // reads as a broken conclusion.
+    let mut value = serde_json::to_value(conclusion)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    if let Some(obj) = value.as_object_mut() {
+        let existing_files: Vec<String> = LONG_TEXT_FIELDS.iter()
+            .map(|(field, _)| format!("{}.md", field))
+            .filter(|fname| dir.join(fname).is_file())
+            .collect();
+        if !existing_files.is_empty() {
+            let manifest = serde_json::json!({
+                "_comment": "The truth of the long text field is in the following .md file (same directory). To see the complete conclusion please call list with kind=\"conclusions\" and function set (automatically assembled from .md)",
+                "files": existing_files,
+            });
+            obj.insert("_long_text_files".to_string(), manifest);
+        }
+    }
+
+    let meta_path = dir.join("meta.json");
+    let tmp = meta_path.with_extension("json.tmp");
+    let json = serde_json::to_string_pretty(&value)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    std::fs::write(&tmp, json)?;
+    std::fs::rename(&tmp, &meta_path)?;
+    Ok(())
+}
+
+/// Prod entry: Use the default `.frama-c-mcp/` as base_dir to persist
+/// meta.json.
+pub fn persist_conclusion(func: &str, conclusion: &FunctionVerificationState) -> std::io::Result<()> {
+    persist_conclusion_at(&conclusion_base_dir(), func, conclusion)
+}
+
+/// Write `ProjectVerificationState` to `<base_dir>/_program.json` atomically.
+/// Takes `base_dir` so tests can point at a tempdir; production calls
+/// `persist_program_state`.
+pub fn persist_program_state_at(base_dir: &Path, state: &ProjectVerificationState)
+    -> std::io::Result<()> {
+    std::fs::create_dir_all(base_dir)?;
+    let path = base_dir.join("_program.json");
+    let tmp = path.with_extension("json.tmp");
+    let json = serde_json::to_string_pretty(state)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    std::fs::write(&tmp, json)?;
+    std::fs::rename(&tmp, &path)?;
+    Ok(())
+}
+
+/// Prod entry: Use the default `.frama-c-mcp/` as base_dir to persist
+/// `_program.json`.
+pub fn persist_program_state(state: &ProjectVerificationState) -> std::io::Result<()> {
+    persist_program_state_at(&conclusion_base_dir(), state)
+}
+
+pub fn sandbox_metadata_file(base_dir: &Path) -> PathBuf {
+    base_dir.join("sandboxes.json")
+}
+
+/// The sandbox directory for an experiment, named for the state directory that
+/// records it as well as for the id.
+///
+/// Without the first half the path is just the id, so two checkouts running the
+/// suite at once pick the same fixed ids and delete each other's directories.
+///
+/// Keyed on the state directory rather than on the process, which would isolate
+/// the checkouts and break recovery in the same stroke: a sandbox has to
+/// outlive the server that made it, and a later process rebuilds this path from
+/// the id alone to decide whether a recorded sandbox is one of its own. The
+/// state directory is what a checkout already has one of.
+///
+/// Not canonicalized. Resolving symlinks would change the answer the moment the
+/// state directory is first created, and a prefix that moves is worse than one
+/// that occasionally fails to notice two spellings of the same directory.
+pub fn expected_sandbox_dir(base_dir: &Path, experiment_id: &str) -> PathBuf {
+    // join() returns an absolute base_dir unchanged, so the current directory
+    // only fills in a relative one. Through components() so that "state",
+    // "state/" and "./state" are one owner rather than three, since a spelling
+    // that changes between runs makes every sandbox recorded under the old one
+    // unrecoverable. Lexical only: a ".." is carried along rather than
+    // resolved, because resolving it means asking the filesystem, which is the
+    // canonicalize this deliberately avoids.
+    let absolute: PathBuf = std::env::current_dir()
+        .unwrap_or_default()
+        .join(base_dir)
+        .components()
+        .collect();
+    let owner = &sha256_hex(absolute.to_string_lossy().as_bytes())[..8];
+    PathBuf::from(format!("/tmp/frama-c-sandbox-{owner}-{experiment_id}"))
+}
+
+pub fn has_expected_sandbox_paths(base_dir: &Path, sandbox: &SandboxMetadata) -> bool {
+    let sandbox_dir = expected_sandbox_dir(base_dir, &sandbox.experiment_id);
+    sandbox.sandbox_dir == sandbox_dir && sandbox.sandbox_socket == sandbox_dir.join("frama-c.sock")
+}
+
+/// Sandboxes recorded by earlier server processes. Entries whose experiment id
+/// or persisted paths do not match the generated sandbox layout are dropped: a
+/// file written before that rule existed could otherwise steer cleanup at a
+/// directory outside /tmp.
+pub fn load_sandbox_metadata_from_disk(base_dir: &Path) -> Vec<SandboxMetadata> {
+    std::fs::read_to_string(sandbox_metadata_file(base_dir))
+        .ok()
+        .and_then(|text| serde_json::from_str::<Vec<SandboxMetadata>>(&text).ok())
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|sandbox| {
+            is_safe_path_segment(&sandbox.experiment_id)
+                && has_expected_sandbox_paths(base_dir, sandbox)
+        })
+        .collect()
+}
+
+pub fn persist_sandbox_metadata_at(
+    base_dir: &Path,
+    sandboxes: &[SandboxMetadata],
+) -> std::io::Result<()> {
+    std::fs::create_dir_all(base_dir)?;
+    let path = sandbox_metadata_file(base_dir);
+    let tmp = path.with_extension("json.tmp");
+    let json = serde_json::to_string_pretty(sandboxes)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    std::fs::write(&tmp, json)?;
+    std::fs::rename(&tmp, &path)?;
+    Ok(())
+}
+
+pub fn remember_sandbox_metadata(metadata: &SandboxMetadata) -> std::io::Result<()> {
+    let base_dir = conclusion_base_dir();
+    let mut sandboxes = load_sandbox_metadata_from_disk(&base_dir);
+    sandboxes.retain(|sandbox| sandbox.experiment_id != metadata.experiment_id);
+    sandboxes.push(metadata.clone());
+    sandboxes.sort_by(|left, right| left.experiment_id.cmp(&right.experiment_id));
+    persist_sandbox_metadata_at(&base_dir, &sandboxes)
+}
+
+pub fn mark_sandbox_metadata_deleted(experiment_id: &str) -> std::io::Result<()> {
+    let base_dir = conclusion_base_dir();
+    let mut sandboxes = load_sandbox_metadata_from_disk(&base_dir);
+    for sandbox in &mut sandboxes {
+        if sandbox.experiment_id == experiment_id {
+            sandbox.deleted = true;
+        }
+    }
+    persist_sandbox_metadata_at(&base_dir, &sandboxes)
+}
+
+/// Load the meta part of conclusion (in-memory state) from a
+/// `<base_dir>/<func>/` directory.
+///
+/// Long text fields do not enter state, and this function only reads meta.json.
+/// Get handler in response
+/// Call `read_long_texts_as_json` separately to read the .md file.
+///
+/// Returning None indicates that the directory is not a legal conclusion
+/// directory (no meta.json or JSON parsing failed).
+pub fn load_conclusion_dir(dir: &Path) -> Option<FunctionVerificationState> {
+    let meta_str = std::fs::read_to_string(dir.join("meta.json")).ok()?;
+    serde_json::from_str::<FunctionVerificationState>(&meta_str).ok()
+}
+
+/// Load every `<func>/` conclusion directory under `.frama-c-mcp/` at session
+/// start.
+///
+/// Anything else in there is skipped silently: legacy `<func>.json` files,
+/// `project_state.json`, and any subdirectory without a `meta.json` (which
+/// covers old layouts like `draft/` or `cegis_history/`).
+pub fn load_conclusions_from_disk(base_dir: &Path) -> HashMap<String, FunctionVerificationState> {
+    let mut out = HashMap::new();
+    let entries = match std::fs::read_dir(base_dir) {
+        Ok(e) => e,
+        Err(_) => return out, // Directory does not exist = new session, normal
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() { continue; }
+        let func = match path.file_name().and_then(|s| s.to_str()) {
+            Some(s) if is_safe_path_segment(s) => s.to_string(),
+            _ => continue,
+        };
+        if let Some(c) = load_conclusion_dir(&path) {
+            out.insert(func, c);
+        }
+    }
+    out
+}
+
+pub fn sha256_hex(bytes: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(bytes))
+}

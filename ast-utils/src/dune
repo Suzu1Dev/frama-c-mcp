@@ -1,0 +1,23 @@
+(library
+ (name ast_utils)
+ (public_name ast_utils.core)
+ (libraries frama-c.kernel yojson)
+ (modules :standard \ ast_utils_register ast_utils_property)
+ (flags :standard)
+ (modes byte native)
+ (wrapped false)
+ (optional))
+
+(library
+ (name ast_utils_plugin)
+ (public_name ast_utils.plugin)
+ (libraries ast_utils frama-c.kernel frama-c-server.core frama-c-wp.core frama-c-rtegen.core)
+ (modules ast_utils_register ast_utils_property)
+ (flags :standard)
+ (modes byte native)
+ (optional))
+
+(plugin
+ (name ast_utils_plugin)
+ (libraries ast_utils.plugin)
+ (site (frama-c plugins)))

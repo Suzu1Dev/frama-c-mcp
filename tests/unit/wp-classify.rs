@@ -1,0 +1,1285 @@
+use std::collections::HashMap;
+use serde_json::json;
+use frama_c_mcp::mcp::types::*;
+use frama_c_mcp::mcp::server::receipt::proof_receipt_goals;
+use frama_c_mcp::mcp::server::wpcli::{run_wp_counter_examples, run_why3_dump};
+use frama_c_mcp::mcp::server::wpclass::*;
+
+use frama_c_mcp::mcp::server::*;
+use frama_c_mcp::mcp::server::receipt::{
+    proof_receipt_body, proof_receipt_with_hash, ProofReceiptBody,
+};
+
+#[test]
+fn alarm_diagnostic_summary_reports_division_obligation() {
+    let property = json!({
+        "key": "#p1",
+        "kind": "division_by_zero",
+        "status": "unknown",
+        "normalized_status": "unknown",
+        "counts_as_progress": false,
+        "kinstr": "#s2",
+        "predicate": "den != 0"
+    });
+    let values = json!({
+        "vBefore": {"den": "0..10"},
+        "vAfter": {"result": "[-inf..inf]"}
+    });
+    let goals = vec![json!({
+        "stable_goal_id": "sg-a",
+        "goal_kind": "rte_division",
+        "normalized_status": "unknown",
+        "counts_as_progress": false
+    })];
+    let summary = alarm_diagnostic_summary(&property, Some(&values), &goals, Some(0));
+    assert_eq!(summary["alarm_kind"], "division_by_zero");
+    assert_eq!(summary["property_marker"], "#p1");
+    assert_eq!(summary["kinstr_marker"], "#s2");
+    assert_eq!(summary["callstack"], 0);
+    assert_eq!(summary["wp_status"]["matched"], true);
+    assert!(
+        summary["likely_acsl_obligation"]["description"]
+            .as_str()
+            .unwrap()
+            .contains("nonzero"),
+        "{summary:?}"
+    );
+    assert_eq!(summary["suggestions"][0]["kind"], "requires");
+    assert_eq!(summary["suggestions"][0]["rte_kind"], "division_by_zero");
+    assert_eq!(summary["suggestions"][0]["acsl"], "den != 0");
+    assert_eq!(summary["rte_suggestions"][0]["rte_kind"], "division_by_zero");
+    assert_eq!(summary["rte_suggestions"][0]["source_property_marker"], "#p1");
+    assert_eq!(summary["suggestions"][0]["source"]["property_marker"], "#p1");
+    assert_eq!(
+        summary["suggestions"][0]["source"]["source_statement"]["marker"],
+        "#s2"
+    );
+    assert_eq!(summary["suggestions"][0]["proposed_requires"][0]["acsl"], "den != 0");
+}
+
+#[test]
+fn rte_suggestion_kind_maps_common_alarms() {
+    for (kind, predicate, expected) in [
+        ("division_by_zero", "den != 0", "division_by_zero"),
+        ("index_bound", "0 <= i < n", "index_bound"),
+        ("mem_access", "\\valid(p)", "invalid_pointer"),
+        ("signed_overflow", "x + y <= 2147483647", "overflow"),
+        ("initialization", "\\initialized(p)", "uninitialized_read"),
+    ] {
+        let property = json!({
+            "kind": kind,
+            "predicate": predicate,
+            "property_marker": "#p",
+            "sid": 7,
+        });
+        let suggestions = rte_precondition_suggestions(&property);
+        assert_eq!(suggestions[0]["rte_kind"], expected, "{suggestions:?}");
+        assert_eq!(suggestions[0]["source_property_marker"], "#p");
+        assert_eq!(suggestions[0]["source_statement"]["marker"], 7);
+    }
+}
+
+#[test]
+fn alarm_diagnostic_summary_has_fallback_without_values_or_wp() {
+    let property = json!({
+        "key": "#p9",
+        "kind": "assert",
+        "status": "unknown",
+        "predicate": "x > 0"
+    });
+    let summary = alarm_diagnostic_summary(&property, None, &[], None);
+    assert_eq!(summary["property_marker"], "#p9");
+    assert_eq!(summary["value_before"], serde_json::Value::Null);
+    assert_eq!(summary["wp_status"]["matched"], false);
+    assert_eq!(summary["likely_acsl_obligation"]["confidence"], "low");
+}
+
+fn wp_failure_category(goal: serde_json::Value) -> String {
+    classify_wp_failure_from_goal(&goal, Some("f"))["category"]
+        .as_str()
+        .unwrap()
+        .to_string()
+}
+
+#[test]
+fn classify_wp_failure_rte() {
+    assert_eq!(
+        wp_failure_category(json!({
+            "name": "division_by_zero",
+            "goal_kind": "rte_division",
+            "normalized_status": "unknown"
+        })),
+        "rte"
+    );
+}
+
+#[test]
+fn classify_wp_failure_timeout() {
+    let classification = classify_wp_failure_from_goal(
+        &json!({
+            "name": "Post",
+            "normalized_status": "timeout"
+        }),
+        Some("f"),
+    );
+    assert_eq!(classification["category"], "timeout");
+    assert_eq!(classification["failure_kind"], "prover_timeout");
+    assert_eq!(classification["wp_timeout_triage"]["kind"], "prover_timeout");
+    assert_eq!(
+        classification["wp_timeout_triage"]["retry_with_higher_prover_timeout"],
+        true
+    );
+}
+
+#[test]
+fn classify_wp_failure_includes_proofread_report_shape() {
+    let classification = classify_wp_failure_from_goal(
+        &json!({
+            "name": "division_by_zero",
+            "goal_kind": "rte_division",
+            "normalized_status": "unknown",
+            "source_location": {"file": "src.c", "line": 12, "column": 4}
+        }),
+        Some("f"),
+    );
+    let report = &classification["proofread_report"];
+    assert_eq!(report["summary"]["finding_count"], 1);
+    assert_eq!(
+        report["summary"]["most_severe_finding_id"],
+        report["findings"][0]["id"]
+    );
+    assert!(report["markdown"].as_str().unwrap().contains("src.c:12"));
+    let finding = &report["findings"][0];
+    for key in [
+        "id",
+        "severity",
+        "category",
+        "confidence",
+        "file",
+        "line",
+        "column",
+        "function",
+        "clause_or_goal_kind",
+        "trigger",
+        "current_behavior",
+        "why_problem",
+        "suggested_fix",
+        "evidence",
+    ] {
+        assert!(finding.get(key).is_some(), "missing finding key: {key}");
+    }
+    assert_eq!(finding["severity"], "high");
+    assert_eq!(finding["file"], "src.c");
+    assert_eq!(finding["line"], 12);
+    assert_eq!(finding["function"], "f");
+    assert_eq!(finding["clause_or_goal_kind"], "rte_division");
+}
+
+#[test]
+fn proofread_report_sorts_by_severity_then_file_line() {
+    let report = proofread_report(vec![
+        json!({"id":"m","severity":"medium","file":"b.c","line":1,"column":null}),
+        json!({"id":"hz","severity":"high","file":"z.c","line":9,"column":null}),
+        json!({"id":"ha","severity":"high","file":"a.c","line":20,"column":null}),
+    ]);
+    let ids = report["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|finding| finding["id"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(ids, vec!["ha", "hz", "m"]);
+    assert_eq!(report["summary"]["max_severity"], "high");
+    assert_eq!(report["summary"]["most_severe_finding_id"], "ha");
+}
+
+#[test]
+fn proofread_report_reports_one_row_per_finding_identity() {
+    let report = proofread_report(vec![
+        json!({"id":"dup","severity":"high","file":"a.c","line":1,"column":null}),
+        json!({"id":"dup","severity":"high","file":"unknown","line":null,"column":null}),
+        json!({"id":"dup","severity":"high","file":"unknown","line":null,"column":null}),
+        json!({"id":"other","severity":"medium","file":"b.c","line":2,"column":null}),
+        json!({"severity":"low","file":"c.c","line":3,"column":null}),
+        json!({"severity":"low","file":"d.c","line":4,"column":null}),
+    ]);
+    let findings = report["findings"].as_array().unwrap();
+
+    // Three copies of one id collapse to the copy that sorted first, which is
+    // the one that still knows where it is. The two rows with no id are
+    // separate findings and both survive.
+    assert_eq!(report["summary"]["finding_count"], 4);
+    assert_eq!(findings[0]["id"], "dup");
+    assert_eq!(findings[0]["file"], "a.c");
+    assert_eq!(
+        findings
+            .iter()
+            .filter(|finding| finding["id"] == "dup")
+            .count(),
+        1
+    );
+    assert_eq!(
+        findings
+            .iter()
+            .filter(|finding| finding.get("id").is_none())
+            .count(),
+        2
+    );
+}
+
+#[test]
+fn wp_failure_finding_names_the_goal_owner_not_the_run_target() {
+    let classification = classify_wp_failure_from_goal(
+        &json!({
+            "name": "Assertion",
+            "normalized_status": "timeout",
+            "fct": "thread_reset_for_exec"
+        }),
+        Some("thread_stop_requested"),
+    );
+    assert_eq!(
+        classification["proofread_report"]["findings"][0]["function"],
+        "thread_reset_for_exec"
+    );
+}
+
+#[test]
+fn wp_failure_finding_falls_back_to_the_run_target() {
+    let classification = classify_wp_failure_from_goal(
+        &json!({"name": "Assertion", "normalized_status": "timeout"}),
+        Some("thread_stop_requested"),
+    );
+    assert_eq!(
+        classification["proofread_report"]["findings"][0]["function"],
+        "thread_stop_requested"
+    );
+}
+
+#[test]
+fn proofread_drops_retry_advice_the_run_already_followed() {
+    let mut report = proofread_report(vec![json!({
+        "id": "wp_failure:sg_1:timeout",
+        "severity": "high",
+        "category": "timeout",
+        "file": "a.c",
+        "line": 1,
+        "suggested_fix": "Retry WP with a higher prover timeout.",
+        "evidence": [{"field": "normalized_status", "value": "timeout"}]
+    })]);
+    proofread_drop_stale_retry_advice(
+        &mut report,
+        &json!({"attempted": true, "timed_out_first_pass": 1, "flipped": []}),
+    );
+    let fix = report["findings"][0]["suggested_fix"].as_str().unwrap();
+    assert!(!fix.contains("higher prover timeout"), "{fix}");
+    assert!(fix.contains("already retried"), "{fix}");
+    assert!(report["markdown"].as_str().unwrap().contains("already retried"));
+    assert_eq!(
+        report["findings"][0]["evidence"][1]["field"],
+        "timeout_retry"
+    );
+}
+
+#[test]
+fn proofread_keeps_retry_advice_when_a_goal_flipped() {
+    let advice = "Retry WP with a higher prover timeout.";
+    let mut report = proofread_report(vec![json!({
+        "id": "wp_failure:sg_1:timeout",
+        "severity": "high",
+        "category": "timeout",
+        "suggested_fix": advice,
+        "evidence": []
+    })]);
+    proofread_drop_stale_retry_advice(
+        &mut report,
+        &json!({"attempted": true, "flipped": [{"wpo_id": "other"}]}),
+    );
+    assert_eq!(report["findings"][0]["suggested_fix"], advice);
+}
+
+#[test]
+fn proofread_keeps_retry_advice_when_no_retry_ran() {
+    let advice = "Retry WP with a higher prover timeout.";
+    let mut report = proofread_report(vec![json!({
+        "id": "wp_failure:sg_1:timeout",
+        "severity": "high",
+        "category": "timeout",
+        "suggested_fix": advice,
+        "evidence": []
+    })]);
+    proofread_drop_stale_retry_advice(&mut report, &json!({"attempted": false}));
+    assert_eq!(report["findings"][0]["suggested_fix"], advice);
+}
+
+#[test]
+fn classify_wp_failure_next_action_references_most_severe_finding() {
+    let classification = classify_wp_failure_from_goal(
+        &json!({
+            "name": "assigns frame condition",
+            "normalized_status": "unknown",
+            "source_location": {"file": "frame.c", "line": 7}
+        }),
+        Some("f"),
+    );
+    assert_eq!(
+        classification["next_action"]["finding"]["id"],
+        classification["proofread_report"]["findings"][0]["id"]
+    );
+    assert!(classification["next_action"]["reason"]
+        .as_str()
+        .unwrap()
+        .contains("frame.c:7"));
+}
+
+#[test]
+fn proofread_report_from_wp_goals_merges_classified_failures() {
+    let existing = json!({
+        "name": "assigns frame condition",
+        "normalized_status": "unknown",
+        "failure_classification": {
+            "proofread_report": {
+                "findings": [{
+                    "id": "existing",
+                    "severity": "medium",
+                    "category": "bad_assigns",
+                    "file": "b.c",
+                    "line": 2
+                }]
+            }
+        }
+    });
+    let raw = json!({
+        "name": "loop invariant preservation",
+        "normalized_status": "unknown",
+        "source_location": {"file": "a.c", "line": 1}
+    });
+    let report = proofread_report_from_wp_goals(&[existing, raw], Some("f"));
+    assert_eq!(report["basis"], "wp_goal_metadata_only");
+    assert_eq!(report["summary"]["finding_count"], 2);
+    assert_eq!(report["findings"][0]["category"], "weak_loop_invariant");
+    assert_eq!(report["findings"][1]["category"], "bad_assigns");
+}
+
+#[test]
+fn classify_wp_failure_loop_variant() {
+    let classification = classify_wp_failure_from_goal(
+        &json!({
+            "name": "loop variant decreases",
+            "normalized_status": "unknown"
+        }),
+        Some("f"),
+    );
+    assert_eq!(classification["category"], "weak_loop_variant");
+    assert_eq!(
+        classification["proofread_report"]["findings"][0]["category"],
+        "weak_loop_variant"
+    );
+}
+
+#[test]
+fn classify_wp_failure_behavior_partition() {
+    let classification = classify_wp_failure_from_goal(
+        &json!({
+            "name": "behavior complete disjoint partition",
+            "normalized_status": "unknown"
+        }),
+        Some("f"),
+    );
+    assert_eq!(classification["category"], "incomplete_behavior_partition");
+    assert_eq!(
+        classification["proofread_report"]["findings"][0]["category"],
+        "incomplete_behavior_partition"
+    );
+}
+
+#[test]
+fn classify_wp_failure_rte_report_points_to_precondition_or_assertion() {
+    let classification = classify_wp_failure_from_goal(
+        &json!({
+            "name": "signed_overflow",
+            "goal_kind": "rte_overflow",
+            "normalized_status": "unknown",
+            "source_location": {"file": "abs.c", "line": 5}
+        }),
+        Some("abs_int"),
+    );
+    assert_eq!(classification["category"], "rte");
+    assert_eq!(classification["next_action"]["tool"], "get_wp_goals");
+    assert_eq!(classification["next_action"]["args"]["want"], serde_json::json!(["vc"]));
+    assert_eq!(classification["proofread_report"]["findings"][0]["severity"], "high");
+
+    // The mechanisms, not the sentence. This asserted the exact phrase
+    // "precondition or assertion" and broke when the advice was rewritten to
+    // name the clauses a reader actually types; what the test is for is that
+    // RTE advice sends them to a requires or an assert rather than to the
+    // postcondition, which is what these three checks say.
+    let rte_fix = classification["proofread_report"]["findings"][0]["suggested_fix"]
+        .as_str()
+        .expect("suggested_fix");
+    assert!(rte_fix.contains("requires"), "{rte_fix}");
+    assert!(rte_fix.contains("assert"), "{rte_fix}");
+    assert!(!rte_fix.contains("ensures"), "{rte_fix}");
+    assert_eq!(
+        classification["semantic_verdict"]["kind"],
+        "needs_e_acsl_counterexample"
+    );
+    assert!(classification["semantic_verdict"]["plain_language"]
+        .as_str()
+        .unwrap()
+        .contains("E-ACSL counterexample"));
+    assert_eq!(
+        classification["semantic_verdict"]["runtime_check_suggestion"],
+        classification["runtime_check_suggestion"]
+    );
+}
+
+#[test]
+fn wp_run_response_preserves_top_level_proofread_report() {
+    let params = RunWpParams::default();
+    let report = proofread_report(vec![json!({
+        "id": "x",
+        "severity": "high",
+        "category": "rte",
+        "file": "x.c",
+        "line": 1
+    })]);
+    let object_response = wp_run_response(
+        json!({"done": 0, "total": 1}),
+        &params,
+        vec![],
+        "main",
+        false,
+        vec![],
+        Some(report.clone()),
+    );
+    assert_eq!(object_response["proofread_report"], report);
+
+    let array_response = wp_run_response(
+        json!([]),
+        &params,
+        vec![],
+        "main",
+        false,
+        vec![],
+        Some(report.clone()),
+    );
+    assert_eq!(array_response["proofread_report"], report);
+}
+
+#[test]
+fn wp_run_response_reports_task_failure_kind() {
+    let params = RunWpParams::default();
+    let timeout = wp_run_response(
+        json!({"status": "timeout"}),
+        &params,
+        vec![],
+        "main",
+        false,
+        vec![],
+        None,
+    );
+    assert_eq!(timeout["failure_kind"], "mcp_timeout");
+
+    let rejected = wp_run_response(
+        json!(["rejected task"]),
+        &params,
+        vec![],
+        "main",
+        false,
+        vec![],
+        None,
+    );
+    assert_eq!(rejected["failure_kind"], "request_rejected");
+
+    let missing_prover = wp_run_response(
+        json!({"message": "prover Alt-Ergo not found"}),
+        &params,
+        vec![],
+        "main",
+        false,
+        vec![],
+        None,
+    );
+    assert_eq!(missing_prover["failure_kind"], "missing_prover");
+
+    let unproved = wp_run_response(
+        json!({"goals": [{"stable_goal_id": "g1", "normalized_status": "unknown"}]}),
+        &params,
+        vec![],
+        "main",
+        false,
+        vec![],
+        None,
+    );
+    assert_eq!(unproved["failure_kind"], "proof_obligation");
+}
+
+#[test]
+fn proof_receipt_hash_is_stable_and_status_sensitive() {
+    let environment = json!({"frama_c_version": "31.0", "why3_provers": "Alt-Ergo"});
+    let wp = json!({"model": "Typed+nocast", "timeout_seconds": {"effective": 1}});
+    let goals_a = proof_receipt_goals(
+        &[
+            json!({"stable_goal_id": "sg_b", "normalized_status": "valid"}),
+            json!({"stable_goal_id": "sg_a", "normalized_status": "unknown"}),
+        ],
+        None,
+        &HashMap::new(),
+    );
+    let goals_b = proof_receipt_goals(
+        &[
+            json!({"stable_goal_id": "sg_a", "normalized_status": "unknown"}),
+            json!({"stable_goal_id": "sg_b", "normalized_status": "valid"}),
+        ],
+        None,
+        &HashMap::new(),
+    );
+    let first = proof_receipt_with_hash(proof_receipt_body(ProofReceiptBody {
+        tool: "run_wp",
+        source_files: vec![json!({"path": "a.c", "sha256": "abc"})],
+        contracts: json!({}),
+        environment: environment.clone(),
+        wp_config: wp.clone(),
+        goals: goals_a,
+        goals_status_source: "wp_fetch_goals",
+        reported: json!({"failure_kind": "proof_obligation"}),
+    }));
+    let second = proof_receipt_with_hash(proof_receipt_body(ProofReceiptBody {
+        tool: "run_wp",
+        source_files: vec![json!({"path": "a.c", "sha256": "abc"})],
+        contracts: json!({}),
+        environment: environment.clone(),
+        wp_config: wp.clone(),
+        goals: goals_b,
+        goals_status_source: "wp_fetch_goals",
+        reported: json!({"failure_kind": "proof_obligation"}),
+    }));
+    assert_eq!(first["sha256"], second["sha256"]);
+
+    let changed = proof_receipt_with_hash(proof_receipt_body(ProofReceiptBody {
+        tool: "run_wp",
+        source_files: vec![json!({"path": "a.c", "sha256": "abc"})],
+        contracts: json!({}),
+        environment,
+        wp_config: wp,
+        goals: proof_receipt_goals(
+            &[json!({"stable_goal_id": "sg_a", "normalized_status": "valid"})],
+            None,
+            &HashMap::new(),
+        ),
+        goals_status_source: "wp_fetch_goals",
+        reported: json!({"failure_kind": "none"}),
+    }));
+    assert_ne!(first["sha256"], changed["sha256"]);
+}
+
+/// The environment values are passed in rather than set, because setting
+/// them is a process-wide write and this binary runs its tests on many
+/// threads. The lock this test used to take only held back tests that took
+/// the same lock, which no reader of FRAMAC_PROVERS did.
+#[test]
+fn wp_effective_config_reads_env_defaults_with_call_override() {
+    let params = RunWpParams::default();
+    assert_eq!(
+        effective_wp_provers_from(&params, Some("alt-ergo,z3")).unwrap(),
+        Some(vec!["alt-ergo".to_string(), "z3".to_string()])
+    );
+    assert_eq!(
+        effective_wp_timeout_from(&params, Some("11")).unwrap(),
+        Some(11)
+    );
+    assert_eq!(effective_wp_par_from(&params, Some("3")).unwrap(), Some(3));
+
+    // A call parameter wins over the environment.
+    let params = RunWpParams {
+        prover: Some("cvc5".to_string()),
+        timeout: Some(7),
+        par: Some(1),
+        ..Default::default()
+    };
+    assert_eq!(
+        effective_wp_provers_from(&params, Some("alt-ergo,z3")).unwrap(),
+        Some(vec!["cvc5".to_string()])
+    );
+    assert_eq!(
+        effective_wp_timeout_from(&params, Some("11")).unwrap(),
+        Some(7)
+    );
+    assert_eq!(effective_wp_par_from(&params, Some("3")).unwrap(), Some(1));
+
+    // and still wins when the environment holds something unusable, which is
+    // the case that must not surface the environment's error.
+    assert_eq!(
+        effective_wp_provers_from(&params, Some(",")).unwrap(),
+        Some(vec!["cvc5".to_string()])
+    );
+    assert_eq!(
+        effective_wp_timeout_from(&params, Some("bad")).unwrap(),
+        Some(7)
+    );
+    assert_eq!(effective_wp_par_from(&params, Some("bad")).unwrap(), Some(1));
+
+    // Zero parallelism is refused from either source.
+    let zero_par = RunWpParams {
+        par: Some(0),
+        ..Default::default()
+    };
+    assert!(effective_wp_par_from(&zero_par, None).is_err());
+    assert!(effective_wp_par_from(&RunWpParams::default(), Some("0")).is_err());
+
+    // An unset variable is not an error, it is a default.
+    assert_eq!(
+        effective_wp_provers_from(&RunWpParams::default(), None).unwrap(),
+        None
+    );
+    assert_eq!(
+        effective_wp_timeout_from(&RunWpParams::default(), None).unwrap(),
+        None
+    );
+}
+
+#[test]
+fn proofread_report_has_short_markdown() {
+    let report = proofread_report(vec![json!({
+        "id": "x",
+        "severity": "high",
+        "file": "x.c",
+        "line": 3,
+        "function": "abs_int",
+        "clause_or_goal_kind": "rte_overflow",
+        "why_problem": "The runtime-error obligation is still open.",
+        "suggested_fix": "Add the missing precondition."
+    })]);
+    let markdown = report["markdown"].as_str().unwrap();
+    assert!(markdown.contains("high x.c:3"));
+    assert!(markdown.contains("abs_int"));
+    assert!(markdown.contains("rte_overflow"));
+    assert!(markdown.contains("Add the missing precondition."));
+}
+
+#[test]
+fn classify_wp_failure_noresult_is_status_propagation_delay() {
+    let classification = classify_wp_failure_from_goal(
+        &json!({
+            "name": "Post",
+            "raw_status": "NORESULT",
+            "normalized_status": "noresult"
+        }),
+        Some("f"),
+    );
+    assert_eq!(
+        classification["wp_timeout_triage"]["kind"],
+        "status_propagation_delay"
+    );
+    assert_eq!(
+        classification["wp_timeout_triage"]["retry_with_higher_prover_timeout"],
+        false
+    );
+    assert_eq!(classification["failure_kind"], "status_pending");
+}
+
+#[test]
+fn classify_wp_failure_call_requires() {
+    assert_eq!(
+        wp_failure_category(json!({
+            "name": "wp_goal_call_callee_requires",
+            "normalized_status": "unknown"
+        })),
+        "callee_requires_too_strict"
+    );
+}
+
+#[test]
+fn classify_wp_failure_assigns_frame() {
+    assert_eq!(
+        wp_failure_category(json!({
+            "name": "assigns frame condition",
+            "normalized_status": "unknown"
+        })),
+        "bad_assigns"
+    );
+}
+
+#[test]
+fn classify_wp_failure_loop_invariant() {
+    assert_eq!(
+        wp_failure_category(json!({
+            "name": "loop invariant preservation",
+            "normalized_status": "unknown"
+        })),
+        "weak_loop_invariant"
+    );
+}
+
+#[test]
+fn classify_wp_failure_loop_assigns() {
+    assert_eq!(
+        wp_failure_category(json!({
+            "name": "loop assigns frame condition",
+            "normalized_status": "unknown"
+        })),
+        "weak_loop_assigns"
+    );
+}
+
+#[test]
+fn classify_wp_failure_weak_ensures() {
+    assert_eq!(
+        wp_failure_category(json!({
+            "name": "postcondition ensures result",
+            "normalized_status": "unknown"
+        })),
+        "weak_ensures"
+    );
+}
+
+#[test]
+fn classify_wp_failure_missing_requires() {
+    let classification = classify_wp_failure_from_goal(
+        &json!({
+            "name": "precondition requires n_positive",
+            "normalized_status": "unknown"
+        }),
+        Some("f"),
+    );
+    assert_eq!(classification["category"], "missing_requires");
+    assert_eq!(
+        classification["semantic_verdict"]["kind"],
+        "needs_e_acsl_counterexample"
+    );
+    assert_eq!(
+        classification["semantic_verdict"]["runtime_check_suggestion"],
+        classification["runtime_check_suggestion"]
+    );
+}
+
+#[test]
+fn classify_wp_failure_callee_contract_too_weak() {
+    assert_eq!(
+        wp_failure_category(json!({
+            "name": "call callee ensures result",
+            "normalized_status": "unknown"
+        })),
+        "callee_contract_too_weak"
+    );
+}
+
+#[test]
+fn classify_wp_failure_unsupported_predicate() {
+    assert_eq!(
+        wp_failure_category(json!({
+            "name": "unsupported predicate P",
+            "normalized_status": "unknown"
+        })),
+        "unsupported_predicate"
+    );
+}
+
+#[test]
+fn classify_wp_failure_internal_error() {
+    assert_eq!(
+        wp_failure_category(json!({
+            "name": "WP internal exception",
+            "normalized_status": "failed"
+        })),
+        "internal_error"
+    );
+}
+
+#[test]
+fn classify_wp_failure_unknown_fallback() {
+    let classification = classify_wp_failure_from_goal(
+        &json!({
+            "name": "opaque proof obligation",
+            "normalized_status": "unknown"
+        }),
+        Some("f"),
+    );
+    assert_eq!(classification["category"], "prover_unknown");
+    assert_eq!(classification["failure_kind"], "proof_obligation");
+    assert!(!classification["evidence"].as_array().unwrap().is_empty());
+    assert_eq!(classification["suggested_next_tool"]["tool"], "get_wp_goals");
+    assert_eq!(classification["suggested_next_tool"]["args"]["want"], serde_json::json!(["vc"]));
+    assert_eq!(classification["semantic_verdict"]["kind"], "specification_too_weak");
+    assert!(classification["semantic_verdict"]["plain_language"]
+        .as_str()
+        .unwrap()
+        .contains("inspect the VC"));
+}
+
+#[test]
+fn classify_wp_failure_routes_setup_failures() {
+    let missing_prover = classify_wp_failure_from_goal(
+        &json!({
+            "name": "prover CVC5 not available",
+            "normalized_status": "failed"
+        }),
+        Some("f"),
+    );
+    assert_eq!(missing_prover["failure_kind"], "missing_prover");
+    assert_eq!(missing_prover["next_action"]["tool"], "self_check");
+    assert_eq!(
+        missing_prover["semantic_verdict"]["kind"],
+        "specification_too_weak"
+    );
+
+    let missing_why3 = classify_wp_failure_from_goal(
+        &json!({
+            "name": "why3 configuration not configured",
+            "normalized_status": "failed"
+        }),
+        Some("f"),
+    );
+    assert_eq!(missing_why3["failure_kind"], "missing_why3_config");
+    assert_eq!(missing_why3["next_action"]["tool"], "self_check");
+
+    let rejected = classify_wp_failure_from_goal(
+        &json!({
+            "name": "request rejected by Frama-C",
+            "normalized_status": "failed"
+        }),
+        Some("f"),
+    );
+    assert_eq!(rejected["failure_kind"], "request_rejected");
+    assert_eq!(rejected["next_action"]["tool"], "self_check");
+}
+
+#[test]
+fn runtime_check_suggested_for_unproved_claims() {
+    for goal in [
+        json!({"name": "precondition requires n_positive", "normalized_status": "unknown"}),
+        json!({"name": "postcondition ensures result", "normalized_status": "unknown"}),
+        json!({"name": "loop invariant preservation", "normalized_status": "unknown"}),
+        json!({"goal_kind": "user_assert", "name": "assertion x > 0", "normalized_status": "unknown"}),
+    ] {
+        let classification = classify_wp_failure_from_goal(&goal, Some("f"));
+        let suggestion = &classification["runtime_check_suggestion"];
+        assert_eq!(suggestion["kind"], "external_manual_e_acsl", "{classification:?}");
+        assert_eq!(suggestion["availability"]["tool"], "self_check");
+
+        // The whole list and its order, not just its head. This payload told an
+        // agent to reach for the .sh spelling first while the server's own
+        // default resolution prefers the other, and asserting only [0] is what
+        // let the two disagree.
+        assert_eq!(
+            suggestion["manual_tools"],
+            serde_json::json!(E_ACSL_WRAPPERS)
+        );
+        assert!(
+            suggestion["coverage_warning"]
+                .as_str()
+                .is_some_and(|warning| warning.contains("executed paths")
+                    && warning.contains("assigns clauses")),
+            "{suggestion:?}"
+        );
+        assert_eq!(
+            classification["next_action"]["runtime_check_suggestion"],
+            *suggestion
+        );
+    }
+}
+
+#[test]
+fn semantic_verdict_marks_wrong_spec_shapes() {
+    for goal in [
+        json!({"name": "unsupported predicate P", "normalized_status": "unknown"}),
+        json!({"name": "behavior complete disjoint partition", "normalized_status": "unknown"}),
+    ] {
+        let classification = classify_wp_failure_from_goal(&goal, Some("f"));
+        assert_eq!(
+            classification["semantic_verdict"]["kind"],
+            "specification_wrong",
+            "{classification:?}"
+        );
+        assert_eq!(classification["semantic_verdict"]["next_tool"], "get_wp_goals");
+    }
+}
+
+#[test]
+fn semantic_verdict_routes_runtime_checkable_claims_to_e_acsl() {
+    for goal in [
+        json!({"name": "postcondition ensures result", "normalized_status": "unknown"}),
+        json!({"name": "loop invariant preservation", "normalized_status": "unknown"}),
+        json!({"goal_kind": "user_assert", "name": "assertion x > 0", "normalized_status": "unknown"}),
+    ] {
+        let classification = classify_wp_failure_from_goal(&goal, Some("f"));
+        assert_eq!(
+            classification["semantic_verdict"]["kind"],
+            "needs_e_acsl_counterexample",
+            "{classification:?}"
+        );
+        assert_eq!(classification["semantic_verdict"]["next_tool"], "self_check");
+        assert_eq!(
+            classification["semantic_verdict"]["runtime_check_suggestion"],
+            classification["runtime_check_suggestion"]
+        );
+        let text = classification["semantic_verdict"]["plain_language"]
+            .as_str()
+            .unwrap();
+        assert!(text.contains("code really violates the property"));
+        assert!(!text.contains("code is buggy"));
+        assert!(!text.contains("code bug"));
+    }
+}
+
+#[test]
+fn runtime_check_not_suggested_for_assigns_goals() {
+    for goal in [
+        json!({"name": "assigns frame condition", "normalized_status": "unknown"}),
+        json!({"name": "loop assigns frame condition", "normalized_status": "unknown"}),
+    ] {
+        let classification = classify_wp_failure_from_goal(&goal, Some("f"));
+        assert_eq!(classification["runtime_check_suggestion"], json!(null));
+        assert!(
+            classification["next_action"]
+                .get("runtime_check_suggestion")
+                .is_none(),
+            "{classification:?}"
+        );
+    }
+}
+
+#[test]
+fn parse_wp_print_blocks_keeps_sections_and_conclusion() {
+    let blocks = parse_wp_print_blocks(
+        r#"
+------------------------------------------------------------
+  Function f
+------------------------------------------------------------
+Goal Post-condition ("x.c", line 7) in 'f':
+Assume {
+  Heap: mem_ok.
+  Pre-condition: x > 0.
+}
+Prove: 0 < f_0.
+Prover CFG returns Valid
+"#,
+    );
+    assert_eq!(blocks.len(), 1);
+    assert_eq!(blocks[0]["function"], "f");
+    assert_eq!(blocks[0]["kind"], "ensures");
+    assert_eq!(blocks[0]["source_line"], 7);
+    assert_eq!(blocks[0]["conclusion"], "0 < f_0.");
+    assert_eq!(blocks[0]["sections"][0]["label"], "Heap");
+    assert_eq!(blocks[0]["sections"][1]["label"], "Pre-condition");
+}
+
+#[test]
+fn attach_wp_print_blocks_requires_unambiguous_kind_or_line() {
+    let blocks = vec![
+        json!({
+            "function": "f",
+            "kind": "ensures",
+            "source_line": 7,
+            "title": "Post-condition (\"x.c\", line 7) in 'f'",
+            "hypotheses": [],
+            "sections": [],
+            "conclusion": "a"
+        }),
+        json!({
+            "function": "f",
+            "kind": "ensures",
+            "source_line": 9,
+            "title": "Post-condition (\"x.c\", line 9) in 'f'",
+            "hypotheses": [],
+            "sections": [],
+            "conclusion": "b"
+        }),
+    ];
+    let mut vcs = vec![
+        json!({
+            "function": "f",
+            "source_location": {"line": 9},
+            "related_acsl_clause": {"kind": "ensures"}
+        }),
+        json!({
+            "function": "f",
+            "related_acsl_clause": {"kind": "ensures"}
+        }),
+    ];
+    attach_wp_print_blocks(&mut vcs, &blocks);
+    assert_eq!(vcs[0]["wp_print"]["conclusion"], "b");
+    assert!(vcs[1].get("wp_print").is_none(), "{vcs:?}");
+}
+
+#[test]
+fn attach_wp_print_blocks_rejects_known_line_mismatch() {
+    let blocks = vec![json!({
+        "function": "f",
+        "kind": "ensures",
+        "source_line": 7,
+        "title": "Post-condition (\"x.c\", line 7) in 'f'",
+        "hypotheses": [],
+        "sections": [],
+        "conclusion": "a"
+    })];
+    let mut vcs = vec![json!({
+        "function": "f",
+        "source_location": {"line": 9},
+        "related_acsl_clause": {"kind": "ensures"}
+    })];
+    attach_wp_print_blocks(&mut vcs, &blocks);
+    assert!(vcs[0].get("wp_print").is_none(), "{vcs:?}");
+}
+
+#[test]
+fn parse_wp_print_blocks_uses_call_site_line_and_real_section_syntax() {
+    let blocks = parse_wp_print_blocks(
+        r#"
+  Function caller
+Goal Instance of 'Pre-condition ("x.c", line 6) in 'callee'' in 'caller'
+  at initialization of 'y' ("x.c", line 26)
+:
+(* Pre-condition *)
+Then {
+  x > 0
+}
+Else {
+  x <= 0
+}
+Residual: y == 0.
+Prove: x > 0.
+"#,
+    );
+    assert_eq!(blocks.len(), 1);
+    assert_eq!(blocks[0]["kind"], "requires");
+    assert_eq!(blocks[0]["source_line"], 26);
+    let labels = blocks[0]["sections"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|section| section["label"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(labels, vec!["Pre-condition", "Then", "Else", "Residual"]);
+}
+
+#[test]
+fn parse_wp_print_blocks_classifies_assertions_for_rte_attachment() {
+    let blocks = parse_wp_print_blocks(
+        r#"
+  Function div
+Goal Assertion 'rte,division_by_zero' ("x.c", line 12) in 'div':
+Prove: y != 0.
+"#,
+    );
+    assert_eq!(blocks[0]["kind"], "assert");
+    let mut vcs = vec![json!({
+        "function": "div",
+        "goal_kind": "rte_division",
+        "source_location": {"line": 12},
+        "related_acsl_clause": {"kind": "assertion"}
+    })];
+    attach_wp_print_blocks(&mut vcs, &blocks);
+    assert_eq!(vcs[0]["wp_print"]["conclusion"], "y != 0.");
+}
+
+#[test]
+fn collect_why3_dump_files_reads_typed_goal_tasks() {
+    let temp = tempfile::tempdir().unwrap();
+    let typed = temp.path().join("typed");
+    std::fs::create_dir(&typed).unwrap();
+    std::fs::write(typed.join("typed_f_ensures_Why3_alt-ergo.why"), "goal G\n").unwrap();
+    std::fs::write(typed.join("f_assigns_Why3_Alt_Ergo_.psmt2"), "task T\n").unwrap();
+    std::fs::write(typed.join("ignore.txt"), "no").unwrap();
+
+    let (dumps, omitted) = collect_why3_dump_files(temp.path(), 16, 1024);
+    assert_eq!(dumps.len(), 2);
+    assert_eq!(omitted, 0);
+    assert_eq!(dumps[0]["goal_id"], "typed_f_assigns");
+    assert_eq!(dumps[1]["goal_id"], "typed_f_ensures");
+    assert_eq!(dumps[1]["content"], "goal G\n");
+}
+
+/// The cap keeps the first names in sort order, not the first names readdir
+/// yields, and says how many it dropped.
+///
+/// Capping before the sort is what this pins. That order passed the two
+/// tests above, because both write fewer files than the cap, and it made
+/// the reported set depend on directory layout: the same proof answers with
+/// a different three of nine dumps on a directory whose entries moved.
+#[test]
+fn collect_why3_dump_files_caps_in_name_order_and_counts_the_drop() {
+    let temp = tempfile::tempdir().unwrap();
+    let typed = temp.path().join("typed");
+    std::fs::create_dir(&typed).unwrap();
+
+    // Written in reverse so creation order and sort order disagree. On a
+    // filesystem that hands entries back in insertion order, capping before the
+    // sort keeps g8, g7, g6 here, which is what makes this a control rather
+    // than a test that passes on either implementation.
+    for index in (0..9).rev() {
+        std::fs::write(typed.join(format!("g{index}_Why3_alt-ergo.why")), "goal\n").unwrap();
+    }
+
+    let (dumps, omitted) = collect_why3_dump_files(temp.path(), 3, 1024);
+    assert_eq!(omitted, 6);
+    let names: Vec<&str> = dumps
+        .iter()
+        .map(|dump| dump["file_name"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        names,
+        ["g0_Why3_alt-ergo.why", "g1_Why3_alt-ergo.why", "g2_Why3_alt-ergo.why"]
+    );
+}
+
+/// A file readdir lists but stat cannot open is counted as omitted too.
+///
+/// The count is the difference between what the directory held and what the
+/// payload carries, not the cap arithmetic alone. Subtracting only the cap
+/// would report "16 kept, 0 dropped" for a directory of 17 where one entry
+/// vanished under the read, which is the reassurance this count exists to
+/// refuse. A dangling symlink is the portable way to be listed and unopenable.
+#[test]
+#[cfg(unix)]
+fn collect_why3_dump_files_counts_entries_it_could_not_read() {
+    let temp = tempfile::tempdir().unwrap();
+    let typed = temp.path().join("typed");
+    std::fs::create_dir(&typed).unwrap();
+    std::fs::write(typed.join("g0_Why3_alt-ergo.why"), "goal\n").unwrap();
+    std::os::unix::fs::symlink(
+        typed.join("does-not-exist"),
+        typed.join("g1_Why3_alt-ergo.why"),
+    )
+    .unwrap();
+
+    let (dumps, omitted) = collect_why3_dump_files(temp.path(), 16, 1024);
+    assert_eq!(dumps.len(), 1, "{dumps:?}");
+    assert_eq!(omitted, 1, "the unreadable entry is dropped, so it is counted");
+}
+
+#[test]
+fn collect_why3_dump_files_caps_large_content() {
+    let temp = tempfile::tempdir().unwrap();
+    let typed = temp.path().join("typed");
+    std::fs::create_dir(&typed).unwrap();
+    std::fs::write(typed.join("typed_f_ensures_Why3_alt-ergo.why"), "0123456789").unwrap();
+
+    let (dumps, _) = collect_why3_dump_files(temp.path(), 16, 4);
+    assert_eq!(dumps.len(), 1);
+    assert_eq!(dumps[0]["truncated"], true);
+    assert_eq!(dumps[0]["content"], serde_json::Value::Null);
+}
+
+#[test]
+fn attach_why3_dumps_matches_wpo_id_and_keeps_multiple_files() {
+    let dumps = vec![
+        json!({
+            "goal_id": "typed_f_ensures",
+            "file_name": "typed_f_ensures_Why3_alt-ergo.why",
+            "content": "goal G\n"
+        }),
+        json!({
+            "goal_id": "typed_f_ensures",
+            "file_name": "f_ensures_Why3_Alt_Ergo_.psmt2",
+            "content": "task T\n"
+        }),
+    ];
+    let mut vcs = vec![
+        json!({"wpo_id": "typed_f_ensures"}),
+        json!({"wpo_id": "typed_f_other"}),
+    ];
+    attach_why3_dumps(&mut vcs, &dumps);
+    assert_eq!(vcs[0]["why3_dumps"].as_array().unwrap().len(), 2);
+    assert_eq!(vcs[0]["why3_dumps"][0]["content"], "goal G\n");
+    assert!(vcs[1].get("why3_dumps").is_none(), "{vcs:?}");
+}
+
+#[tokio::test]
+async fn run_why3_dump_reports_failed_generator_as_error() {
+    let payload = run_why3_dump(
+        "false",
+        &["x.c".to_string()],
+        &ProjectLoadOptions::default(),
+        false,
+        "f",
+    )
+    .await;
+    assert_eq!(payload["status"], "error");
+    assert_eq!(payload["file_count"], 0);
+}
+
+#[tokio::test]
+async fn run_wp_counter_examples_reports_failed_generator_as_error() {
+    let payload = run_wp_counter_examples(
+        "false",
+        &["x.c".to_string()],
+        &ProjectLoadOptions::default(),
+        false,
+        "f",
+    )
+    .await;
+    assert_eq!(payload["status"], "error");
+    assert!(payload["raw_stdout"].as_str().is_some(), "{payload:?}");
+    assert!(payload["command"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|arg| arg == "-wp-counter-examples"));
+    assert!(payload["command"].as_array().unwrap().iter().any(|arg| arg == "-wp-fct"));
+    assert!(
+        !payload["command"].as_array().unwrap().iter().any(|arg| arg == "-wp-print"),
+        "{payload:?}"
+    );
+}
+
+#[test]
+fn capped_lossy_string_preserves_raw_bytes_until_cap() {
+    let (raw, truncated) = capped_lossy_string(b"\nmodel\n\n", 32);
+    assert_eq!(raw, "\nmodel\n\n");
+    assert!(!truncated);
+
+    let (raw, truncated) = capped_lossy_string(b"abcdef", 3);
+    assert_eq!(raw, "abc");
+    assert!(truncated);
+}
+
+
+/// A drained scheduler payload says nothing about goals, so triage that reads
+/// only the payload used to answer "No timeout ... evidence was found" at high
+/// confidence while goals sat at TIMEOUT. That is worse than saying nothing: it
+/// tells a caller staring at a red run that nothing timed out.
+#[test]
+fn goal_timeouts_are_not_reported_as_no_timeout_evidence() {
+    // What the scheduler looks like once WP has drained: idle, nothing to say.
+    let drained = json!({"todo": 0, "active": 0, "done": 0, "drained": true});
+    let report = json!({
+        "findings": [
+            {"category": "timeout", "trigger": "Post-condition", "function": "ring_create"},
+            {"category": "timeout", "trigger": "Instance of 'Pre-condition'", "function": "take_locked"},
+        ]
+    });
+
+    let triage = wp_timeout_triage_from_tasks_and_report(&drained, Some(&report));
+    assert_eq!(triage["kind"], "prover_timeout", "{triage:?}");
+    assert_eq!(triage["evidence"][0]["value"], 2, "{triage:?}");
+
+    // And it must not tell the caller to raise the budget. A goal that cannot
+    // be proved in this memory model grinds to the budget exactly like a slow
+    // one, so "retry with more time" is a loop that never terminates.
+    assert_eq!(
+        triage["retry_with_higher_prover_timeout"], false,
+        "{triage:?}"
+    );
+}
+
+/// The payload still wins when it has something to say: a cancelled task
+/// explains the whole run, and goal-level noise should not overwrite it.
+#[test]
+fn task_level_verdict_takes_precedence_over_goal_timeouts() {
+    let cancelled = json!({"tasks": "the WP task was cancelled"});
+    let report = json!({"findings": [{"category": "timeout", "trigger": "x"}]});
+    let triage = wp_timeout_triage_from_tasks_and_report(&cancelled, Some(&report));
+    assert_eq!(triage["kind"], "cancelled_task", "{triage:?}");
+}
+
+/// No goal timeouts and a quiet payload is still a clean "none".
+#[test]
+fn clean_run_still_reports_no_timeout_evidence() {
+    let drained = json!({"todo": 0, "drained": true});
+    let report = json!({"findings": [{"category": "unconstrained_assigns"}]});
+    let triage = wp_timeout_triage_from_tasks_and_report(&drained, Some(&report));
+    assert_eq!(triage["kind"], "none", "{triage:?}");
+    let triage = wp_timeout_triage_from_tasks_and_report(&drained, None);
+    assert_eq!(triage["kind"], "none", "{triage:?}");
+}

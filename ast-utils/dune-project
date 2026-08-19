@@ -1,0 +1,21 @@
+(lang dune 3.0)
+(using dune_site 0.1)
+(name ast_utils)
+(version 0.1)
+
+(generate_opam_files true)
+
+(license MIT)
+(authors "haokun li")
+(maintainers "haokun li")
+
+(package
+ (name ast_utils)
+ (synopsis "Frama-C plugin for CIL AST JSON serialization and ACSL annotation manipulation")
+ (description
+  "A Frama-C plugin providing CIL AST to JSON conversion, ACSL string parsing/type-checking, and annotation insertion/removal via Frama-C Server requests")
+ (depends
+  (ocaml (>= 4.14))
+  (frama-c (>= 33.0))
+  yojson
+  dune))

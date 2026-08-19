@@ -1,0 +1,58 @@
+[
+  {"kind":"GET","id":"v_spec_ok","request":"plugins.ast-utils.getAcslValidation",
+   "data":{"function":"test_all_stmts","kind":"spec","acsl":"requires n >= 0; ensures \\result >= -1;"}},
+
+  {"kind":"GET","id":"v_spec_bad_syntax","request":"plugins.ast-utils.getAcslValidation",
+   "data":{"function":"test_all_stmts","kind":"spec","acsl":"requires n >=;"}},
+
+  {"kind":"GET","id":"v_spec_bad_type","request":"plugins.ast-utils.getAcslValidation",
+   "data":{"function":"test_all_stmts","kind":"spec","acsl":"requires n + \"hello\" > 0;"}},
+
+  {"kind":"GET","id":"v_spec_bad_func","request":"plugins.ast-utils.getAcslValidation",
+   "data":{"function":"no_such_func","kind":"spec","acsl":"requires 1;"}},
+
+  {"kind":"GET","id":"v_annot_assert","request":"plugins.ast-utils.getAcslValidation",
+   "data":{"function":"test_all_stmts","kind":"annot","acsl":"assert n >= 0;","stmt":23}},
+
+  {"kind":"GET","id":"v_annot_loop_inv","request":"plugins.ast-utils.getAcslValidation",
+   "data":{"function":"test_all_stmts","kind":"annot","acsl":"loop invariant i >= 0;","stmt":32}},
+
+  {"kind":"GET","id":"v_annot_no_stmt","request":"plugins.ast-utils.getAcslValidation",
+   "data":{"function":"test_all_stmts","kind":"annot","acsl":"assert 1;"}},
+
+  {"kind":"GET","id":"v_annot_bad_sid","request":"plugins.ast-utils.getAcslValidation",
+   "data":{"function":"test_all_stmts","kind":"annot","acsl":"assert 1;","stmt":99999}},
+
+  {"kind":"GET","id":"v_bad_kind","request":"plugins.ast-utils.getAcslValidation",
+   "data":{"function":"test_all_stmts","kind":"invalid","acsl":"requires 1;"}},
+
+  {"kind":"GET","id":"v_spec_rect","request":"plugins.ast-utils.getAcslValidation",
+   "data":{"function":"rect_area","kind":"spec","acsl":"requires \\valid(r); ensures \\result >= 0;"}},
+
+  {"kind":"GET","id":"v_spec_ptr","request":"plugins.ast-utils.getAcslValidation",
+   "data":{"function":"test_array_ptr","kind":"spec","acsl":"requires \\valid(arr+(0..len-1)); requires len >= 0;"}},
+
+  {"kind":"EXEC","id":"add_spec","request":"plugins.ast-utils.execAddAnnotation",
+   "data":{"function":"add","kind":"spec","acsl":"requires a >= 0; ensures \\result >= a;"}},
+
+  {"kind":"EXEC","id":"add_annot","request":"plugins.ast-utils.execAddAnnotation",
+   "data":{"function":"test_all_stmts","kind":"annot","acsl":"assert result >= -1;","stmt":23}},
+
+  {"kind":"EXEC","id":"add_bad_acsl","request":"plugins.ast-utils.execAddAnnotation",
+   "data":{"function":"add","kind":"spec","acsl":"requires bad syntax here;"}},
+
+  {"kind":"EXEC","id":"add_loop_on_nonloop","request":"plugins.ast-utils.execAddAnnotation",
+   "data":{"function":"test_all_stmts","kind":"annot","acsl":"loop invariant i >= 0;","stmt":23}},
+
+  {"kind":"GET","id":"check_add","request":"plugins.ast-utils.getFunctionAst","data":"add"},
+
+  {"kind":"EXEC","id":"rm_add","request":"plugins.ast-utils.execRemoveAnnotations","data":"add"},
+
+  {"kind":"GET","id":"check_rm","request":"plugins.ast-utils.getFunctionAst","data":"add"},
+
+  {"kind":"EXEC","id":"rm_stmts","request":"plugins.ast-utils.execRemoveAnnotations","data":"test_all_stmts"},
+
+  {"kind":"EXEC","id":"rm_noop","request":"plugins.ast-utils.execRemoveAnnotations","data":"clamp"},
+
+  {"kind":"EXEC","id":"rm_bad_func","request":"plugins.ast-utils.execRemoveAnnotations","data":"no_such_func"}
+]

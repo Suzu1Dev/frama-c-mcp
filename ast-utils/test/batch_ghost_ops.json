@@ -1,0 +1,34 @@
+[
+  {"kind":"EXEC","id":"g_decl","request":"plugins.ast-utils.execInsertGhostStmt",
+   "data":{"function":"add","stmt":2,"op":"decl","name":"gs","type":"int","expr":"0"}},
+
+  {"kind":"GET","id":"g_check1","request":"plugins.ast-utils.getFunctionAst","data":"add"},
+
+  {"kind":"EXEC","id":"g_assign","request":"plugins.ast-utils.execInsertGhostStmt",
+   "data":{"function":"add","stmt":176,"op":"set","name":"gs","expr":"a + b"}},
+
+  {"kind":"GET","id":"g_check2","request":"plugins.ast-utils.getFunctionAst","data":"add"},
+
+  {"kind":"EXEC","id":"g_decl_dup","request":"plugins.ast-utils.execInsertGhostStmt",
+   "data":{"function":"add","stmt":2,"op":"decl","name":"gs","type":"int","expr":"1"}},
+
+  {"kind":"EXEC","id":"g_decl_bad_type","request":"plugins.ast-utils.execInsertGhostStmt",
+   "data":{"function":"add","stmt":2,"op":"decl","name":"gs2","type":"badtype","expr":"0"}},
+
+  {"kind":"EXEC","id":"g_decl_bad_expr","request":"plugins.ast-utils.execInsertGhostStmt",
+   "data":{"function":"add","stmt":2,"op":"decl","name":"gs3","type":"int","expr":""}},
+
+  {"kind":"EXEC","id":"g_set_nonexist","request":"plugins.ast-utils.execInsertGhostStmt",
+   "data":{"function":"add","stmt":2,"op":"set","name":"no_such_var","expr":"1"}},
+
+  {"kind":"EXEC","id":"g_bad_op","request":"plugins.ast-utils.execInsertGhostStmt",
+   "data":{"function":"add","stmt":2,"op":"invalid","name":"x","expr":"1"}},
+
+  {"kind":"EXEC","id":"g_decl2","request":"plugins.ast-utils.execInsertGhostStmt",
+   "data":{"function":"clamp","stmt":11,"op":"decl","name":"gc","type":"int","expr":"0"}},
+
+  {"kind":"EXEC","id":"g_set2","request":"plugins.ast-utils.execInsertGhostStmt",
+   "data":{"function":"clamp","stmt":11,"op":"set","name":"gc","expr":"gc + 1"}},
+
+  {"kind":"GET","id":"g_check4","request":"plugins.ast-utils.getFunctionAst","data":"clamp"}
+]

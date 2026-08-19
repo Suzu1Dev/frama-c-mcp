@@ -1,0 +1,917 @@
+use std::collections::BTreeSet;
+use serde_json::json;
+
+use frama_c_mcp::mcp::server::*;
+use frama_c_mcp::mcp::server::receipt::strip_generated_label;
+use frama_c_mcp::mcp::server::analysis::{incomplete_code, CHECK_SCHEMA};
+use frama_c_mcp::mcp::server::selfcheck;
+
+/// The check payload's frozen vocabulary, in the three places it is written.
+///
+/// The incomplete codes are a published contract: agents branch on them,
+/// README tabulates them, and docs/reference/result-schema.md freezes them.
+/// They were thirteen string literals with nothing connecting the emitters to
+/// the documents, and the set drifted twice before anyone noticed. Deriving
+/// both tables from the documents and comparing against the one list in the
+/// source is what makes a code added in one place and not the others fail
+/// here.
+///
+/// Parsed rather than counted, because the item that asked for this freeze
+/// restated a number and was out of date by the time it was read.
+#[test]
+fn incomplete_codes_match_their_documentation() {
+    // A marker rather than prose. The first version of this split README on a
+    // sentence, and editing that sentence to add a link broke the test in the
+    // same commit that wrote it.
+    const MARKER: &str = "<!-- incomplete-codes -->";
+
+    // Both documents are ours, so the parse insists on the shape instead of
+    // sieving whatever looks code-shaped: the code is the first cell of the row
+    // and is written in backticks. That drops the header and the separator on
+    // their own, and a row written some other way goes missing from the set
+    // rather than being quietly accepted, which the comparison below reports.
+    fn table_codes(markdown: &str) -> std::collections::BTreeSet<String> {
+        markdown
+            .split(MARKER)
+            .nth(1)
+            .expect("marker before the table")
+            .lines()
+            .skip_while(|line| !line.starts_with('|'))
+            .take_while(|line| line.starts_with('|'))
+            .filter_map(|row| {
+                let cell = row.split('|').nth(1)?.trim();
+                cell.strip_prefix('`')?.strip_suffix('`').map(str::to_string)
+            })
+            .collect()
+    }
+
+    let source: std::collections::BTreeSet<String> =
+        incomplete_code::ALL.iter().map(|c| c.to_string()).collect();
+    assert_eq!(source.len(), incomplete_code::ALL.len(), "duplicate in ALL");
+
+    let readme = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/README.md"))
+        .expect("read README.md");
+    assert_eq!(
+        table_codes(&readme),
+        source,
+        "README's code table disagrees with incomplete_code::ALL"
+    );
+
+    let schema = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/docs/reference/result-schema.md"
+    ))
+    .expect("read docs/reference/result-schema.md");
+    assert_eq!(
+        table_codes(&schema),
+        source,
+        "result-schema.md disagrees with incomplete_code::ALL"
+    );
+
+    // The document names the schema string it freezes, so a version bump in the
+    // code with no compatibility-history row fails here too.
+    assert!(
+        schema.contains(&format!("| `{CHECK_SCHEMA}` |")),
+        "result-schema.md has no compatibility-history row for {CHECK_SCHEMA}"
+    );
+}
+
+/// A generated hash label is stripped from a clause before the receipt keeps
+/// it, and nothing else is.
+///
+/// The label is fresh per injection, so leaving it in would make two identical
+/// contracts compare unequal, which is the opposite of what putting the text
+/// in a receipt is for. A user-written label that merely looks similar must
+/// survive: it is part of what the author wrote.
+#[test]
+fn generated_labels_are_stripped_from_receipt_contracts() {
+    // Shape of an injected clause, with and without the trailing user label.
+    assert_eq!(strip_generated_label("an_ffed752e_Req0: x >= 0"), "x >= 0");
+    assert_eq!(strip_generated_label("re_0123abcd: x >= 0"), "x >= 0");
+
+    // Driven off generate_hash_label rather than a second copy of its prefix
+    // table, so teaching it a new kind cannot leave the stripper behind: a
+    // prefix it does not know survives into the receipt as part of the clause,
+    // and every run's fresh hash then reads as a changed contract.
+    for kind in [
+        "requires",
+        "ensures",
+        "assigns",
+        "loop_invariant",
+        "loop_assigns",
+        "loop_variant",
+        "assert",
+        "no_such_kind",
+    ] {
+        let label = generate_hash_label(kind);
+        assert_eq!(
+            strip_generated_label(&format!("{label}_Ens0: \\result >= 0")),
+            "\\result >= 0",
+            "{kind}"
+        );
+    }
+
+    // Not generated: keep the whole text. A contract's own named clause is
+    // content, and dropping it would report a different contract than the one
+    // that was proved.
+    assert_eq!(strip_generated_label("positive: x >= 0"), "positive: x >= 0");
+    assert_eq!(strip_generated_label("an_short: x >= 0"), "an_short: x >= 0");
+    assert_eq!(
+        strip_generated_label("zz_ffed752e: x >= 0"),
+        "zz_ffed752e: x >= 0"
+    );
+    assert_eq!(
+        strip_generated_label("an_nothexdg: x >= 0"),
+        "an_nothexdg: x >= 0"
+    );
+
+    // No label at all, and a predicate that happens to contain a colon.
+    assert_eq!(strip_generated_label("  x >= 0  "), "x >= 0");
+    assert_eq!(
+        strip_generated_label("\\forall integer i: 0 <= i"),
+        "\\forall integer i: 0 <= i"
+    );
+}
+
+/// An output path stays inside the working directory.
+///
+/// Measured before it was restricted: an absolute "/tmp/pwned.c" and a
+/// "../../../../tmp/pwned2.c" both wrote with the server's privileges. See
+/// resolve_output_path for why this tool is the one that can.
+#[test]
+fn output_paths_cannot_leave_the_working_directory() {
+    let cwd = std::env::current_dir().expect("cwd");
+
+    // The documented workflow. README's example writes out/annotated.c, and a
+    // parent that does not exist yet has to resolve, which is why the
+    // normalization is lexical before it touches the filesystem.
+    let inside = resolve_output_path("out/annotated.c").expect("relative path inside cwd");
+    assert_eq!(inside, cwd.join("out/annotated.c"));
+
+    // Interior traversal is fine as long as it lands inside.
+    assert_eq!(
+        resolve_output_path("sub/./dir/../x.c").expect("interior traversal"),
+        cwd.join("sub/x.c")
+    );
+
+    // An absolute path inside the tree is the same place, so it is allowed.
+    let absolute = cwd.join("abs-inside.c");
+    assert_eq!(
+        resolve_output_path(absolute.to_str().expect("utf8")).expect("absolute inside"),
+        absolute
+    );
+
+    // The shapes that used to write anywhere, each paired with the check that
+    // is supposed to stop it. Asserting the reason and not just the refusal is
+    // what keeps the two checks separately alive: they overlap on most inputs,
+    // and a test that only asserts "refused" passes with either one deleted.
+    // One more ".." than the cwd is deep, so this climbs past the root wherever
+    // the checkout lives; a fixed pile of them would quietly fall back to the
+    // lexical check on a deeper path.
+    let above_root = "../".repeat(cwd.components().count() + 1) + "tmp/x.c";
+    for (escape, reason) in [
+        ("/tmp/pwned.c".to_string(), "resolved outside it"),
+        ("../shallow-escape.c".to_string(), "resolved outside it"),
+        (above_root, "climbs above the filesystem root"),
+    ] {
+        let error = resolve_output_path(&escape)
+            .expect_err(&format!("{escape} should be refused"))
+            .to_string();
+        assert!(
+            error.contains("output must stay inside the working directory"),
+            "{escape}: {error}"
+        );
+        assert!(
+            error.contains(reason),
+            "{escape} refused for the wrong reason: {error}"
+        );
+    }
+}
+
+/// A symlink inside the tree cannot be used to write outside it.
+///
+/// The lexical check above cannot see this: the text of
+/// "linked/escape.c" never leaves the root. Only resolving the
+/// deepest existing ancestor does, which is why the two checks are separate
+/// and why this one needs a root it can plant a symlink in.
+#[cfg(unix)]
+#[test]
+fn a_symlink_cannot_carry_an_output_path_out_of_the_root() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let root = tmp.path().join("root");
+    let outside = tmp.path().join("outside");
+    std::fs::create_dir_all(&root).expect("root");
+    std::fs::create_dir_all(&outside).expect("outside");
+    std::fs::create_dir_all(root.join("real")).expect("real");
+    std::os::unix::fs::symlink(&outside, root.join("linked")).expect("symlink");
+    std::os::unix::fs::symlink(root.join("real"), root.join("inner")).expect("inner symlink");
+
+    // Where the symlink lands is the whole question: one inside the root
+    // resolves, so this refuses by destination rather than refusing symlinks.
+    assert!(resolve_output_path_in(&root, "inner/out.c").is_ok());
+
+    let error = resolve_output_path_in(&root, "linked/escape.c")
+        .expect_err("a symlink out of the root must be refused")
+        .to_string();
+    assert!(
+        error.contains("a symlink on the path leaves the working directory"),
+        "{error}"
+    );
+}
+
+/// The E-ACSL wrapper a caller may name is one of the two this server knows.
+///
+/// Why the rule exists is on require_known_e_acsl_tool. This pins the
+/// predicate itself, so a rule change fails here naming the input that broke
+/// it; the lifecycle test covers the same rule at the tool boundary.
+#[test]
+fn only_a_known_e_acsl_wrapper_can_be_named() {
+    // Spelled out once, because the loop below is vacuous against whatever the
+    // const happens to hold. Dropping a name would otherwise pass everywhere
+    // and surface only on an install that ships the other spelling.
+    assert_eq!(E_ACSL_WRAPPERS, ["e-acsl-gcc", "e-acsl-gcc.sh"]);
+
+    for known in E_ACSL_WRAPPERS {
+        assert!(require_known_e_acsl_tool(known).is_ok(), "{known}");
+    }
+
+    // A path is refused rather than resolved. The point is to launch the
+    // installed wrapper, so even a plausible-looking one is not accepted.
+    for refused in [
+        "/usr/bin/curl",
+        "./e-acsl-gcc",
+        "/opt/frama-c/bin/e-acsl-gcc",
+        "../e-acsl-gcc.sh",
+        "e-acsl-gcc ",
+        "",
+    ] {
+        let error = require_known_e_acsl_tool(refused)
+            .expect_err(&format!("{refused:?} should be refused"))
+            .to_string();
+        assert!(error.contains("tool must be one of"), "{refused:?}: {error}");
+    }
+}
+
+/// No em dash survives on a comment line.
+///
+/// House style, and it is enforced here rather than left to review because a
+/// half-swept convention is worse than either whole one: the reader cannot
+/// tell whether a dash is a deliberate exception or an oversight. Only U+2014
+/// is checked; the U+2500 box-drawing runs that head sections in
+/// tests/test-integration.rs are a different character and stay.
+///
+/// Lines whose first non-space is a comment marker, which is every comment in
+/// this tree. A trailing comment after code and a block comment are not
+/// checked, and widening to them is not worth what it costs: this tree carries
+/// C fixtures in raw strings whose ACSL is full of slash-star, so telling a
+/// Rust comment from fixture text needs a lexer rather than a test. CLAUDE.md
+/// states the narrower rule.
+///
+/// The backticks are deliberately NOT enforced here. Measured on 2026-08-12:
+/// 661 backticked comment lines across 22 files, 16 percent of every comment
+/// in the tree, of which 27 carry a pair that spans two lines, which is the
+/// shape a blanket rewrite mangles. That is a standing rule applied on touch,
+/// not a sweep.
+#[test]
+fn no_em_dash_in_a_rust_comment() {
+    let mut offenders = Vec::new();
+    for dir in ["src", "tests"] {
+        let mut stack = vec![std::path::PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"))).join(dir)];
+        while let Some(path) = stack.pop() {
+            let Ok(entries) = std::fs::read_dir(&path) else { continue };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else if path.extension().is_some_and(|ext| ext == "rs") {
+                    let Ok(text) = std::fs::read_to_string(&path) else { continue };
+                    for (number, line) in text.lines().enumerate() {
+                        let trimmed = line.trim_start();
+                        if trimmed.starts_with("//") && line.contains('\u{2014}') {
+                            offenders.push(format!("{}:{}", path.display(), number + 1));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    assert!(offenders.is_empty(), "em dash in a comment: {offenders:?}");
+}
+
+/// The retry counts a goal as flipped only when the first pass timed out on
+/// that same goal and the second pass proved it.
+///
+/// Written by hand because the flip cannot be staged against a real prover: it
+/// needs a goal that proves in more than the first timeout and less than double
+/// it, which is a fact about the machine. The live test drives the plumbing
+/// with a goal no prover discharges, so it only ever reaches the empty case.
+#[test]
+fn a_flip_is_a_goal_that_timed_out_and_then_proved() {
+    let timed_out = BTreeSet::from(["slow_assert".to_string(), "hard_assert".to_string()]);
+    let retried = vec![
+        json!({"wpo": "slow_assert", "name": "Assertion", "property": "#p1", "status": "VALID"}),
+        json!({"wpo": "hard_assert", "name": "Assertion", "property": "#p2", "status": "TIMEOUT"}),
+        // Valid, but it never timed out, so the retry did not turn it around.
+        json!({"wpo": "easy_assert", "name": "Assertion", "property": "#p3", "status": "VALID"}),
+    ];
+
+    let report = timeout_retry_report(&timed_out, &retried, 4, 8);
+
+    assert_eq!(report["attempted"], true);
+    assert_eq!(report["timeout_seconds"]["first_pass"], 4);
+    assert_eq!(report["timeout_seconds"]["retry"], 8);
+    assert_eq!(report["timed_out_first_pass"], 2);
+    assert_eq!(report["still_unproved"], 1);
+    let flipped = report["flipped"].as_array().expect("flipped is an array");
+    assert_eq!(flipped.len(), 1, "{report:?}");
+    assert_eq!(flipped[0]["wpo_id"], "slow_assert");
+    assert_eq!(flipped[0]["property"], "#p1");
+}
+
+/// Every test CI names by hand still exists, and is really a test.
+///
+/// "cargo test --test X some_name" exits 0 with "0 passed" when the filter
+/// matches nothing, so a renamed test turns its CI step into one that passes by
+/// running nothing. Measured: folding run_eva renamed a test the workflow
+/// pinned, and four reviewers plus a grep of src, tests and docs all missed it,
+/// because the surviving reference lives in .github and nothing reads that.
+///
+/// Checked against the target the step actually names, and only against a
+/// function carrying a test attribute. A first version searched every file
+/// under tests/ for the string "fn <name>(", which codex pointed out passes on
+/// a comment, a helper, or a test living in a different target than the one
+/// being filtered: a guard against passing by not running, that could itself
+/// pass without running anything. The parse is asserted to have found steps for
+/// that same reason: an empty result must not read as all clear.
+#[test]
+fn ci_named_tests_still_exist() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let workflow =
+        std::fs::read_to_string(root.join(".github/workflows/ci.yml")).expect("ci.yml");
+
+    /// Every .rs file under a directory, read whole.
+    fn rust_sources(dir: &std::path::Path) -> Vec<String> {
+        let Ok(entries) = std::fs::read_dir(dir) else { return Vec::new() };
+        let mut sources = Vec::new();
+        for path in entries.flatten().map(|entry| entry.path()) {
+            if path.is_dir() {
+                sources.extend(rust_sources(&path));
+            } else if path.extension().is_some_and(|ext| ext == "rs") {
+                sources.push(std::fs::read_to_string(&path).unwrap_or_default());
+            }
+        }
+        sources
+    }
+
+    /// A function by this name, declared directly under a test attribute.
+    fn declares_test(source: &str, name: &str) -> bool {
+        let signature = format!("fn {name}(");
+        let lines: Vec<&str> = source.lines().map(str::trim_start).collect();
+        lines.iter().enumerate().any(|(index, line)| {
+            let line = line.strip_prefix("pub ").unwrap_or(line);
+            let line = line.strip_prefix("async ").unwrap_or(line);
+            if !line.starts_with(&signature) {
+                return false;
+            }
+
+            // Back over the attribute and doc block above, stopping at the
+            // first line that is not part of it. Bounding the scan by a line
+            // count instead would be a guess about how documented a test gets.
+            lines[..index]
+                .iter()
+                .rev()
+                .take_while(|above| {
+                    above.starts_with('#') || above.starts_with("//") || above.is_empty()
+                })
+                .any(|above| above.starts_with("#[test]") || above.starts_with("#[tokio::test"))
+        })
+    }
+
+    // The target each step filters, and the name it pins.
+    let pinned: Vec<(&str, &str)> = workflow
+        .lines()
+        .filter_map(|line| {
+            // A step is "run: <command>" on one line or a command inside a
+            // "run: |" block, and ci.yml uses both. Matching only the second
+            // skipped the one-line form silently.
+            let command = line.trim().trim_start_matches("- ");
+            let command = command.strip_prefix("run:").unwrap_or(command).trim();
+            let mut words = command.strip_prefix("cargo test ")?.split_whitespace();
+
+            // --test need not come first. ci.yml already writes "cargo test
+            // --test X --release", and the mirror ordering "cargo test
+            // --release --test X" parsed as nothing, so a step pinning a test
+            // that had been renamed away passed this guard by being skipped by
+            // it.
+            if !words.any(|word| word == "--test") {
+                return None;
+            }
+            let (target, filter) = (words.next()?, words.next());
+
+            // No filter, or an option where one would be: the step runs the
+            // whole target and has no name to go stale.
+            Some((target, filter.filter(|word| !word.starts_with('-'))?))
+        })
+        .collect();
+    assert!(
+        !pinned.is_empty(),
+        "no ci.yml step parsed as a test pinned by name, so this test checked \
+         nothing: the workflow moved and the parser did not"
+    );
+
+    let mut missing = Vec::new();
+    for (target, filter) in pinned {
+        // A target is its own root file plus, when it has one, the directory of
+        // modules beside it. `unit` keeps its parts under tests/unit/, and
+        // reading only tests/unit.rs would find a list of `mod` lines and
+        // report every name CI pins there as missing.
+        let mut sources = vec![
+            std::fs::read_to_string(root.join("tests").join(format!("{target}.rs")))
+                .unwrap_or_default(),
+        ];
+        sources.extend(rust_sources(&root.join("tests").join(target)));
+        if !sources.iter().any(|source| declares_test(source, filter)) {
+            missing.push(format!("{target} {filter}"));
+        }
+    }
+
+    assert!(
+        missing.is_empty(),
+        "ci.yml names tests that do not exist in the target it filters, so those \
+         steps run nothing: {missing:?}"
+    );
+}
+
+/// Every pub fn in src/ is called from somewhere in src/ or tests/.
+///
+/// This exists because dead_code cannot see these any more. Publishing the
+/// internals so the unit tests could move out of the crate made every one of
+/// them a pub item in a pub mod, and the lint does not fire on those: it
+/// assumes an external consumer. So the 439 published items lost the check
+/// that a helper whose last caller went away gets reported, while the 331 that
+/// stayed private kept it, and nothing anywhere said which half you were in.
+///
+/// Name-based and therefore approximate in one direction only: a name that
+/// appears in a comment or a string counts as a use, so this under-reports
+/// rather than crying wolf. That is the right way round for a guard nobody
+/// asked for, and it still catches the case that matters, which is a function
+/// no longer written down anywhere but its own definition.
+#[test]
+fn every_published_function_has_a_caller() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+
+    fn rust_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(dir) else { return };
+        for path in entries.flatten().map(|entry| entry.path()) {
+            if path.is_dir() {
+                rust_files(&path, out);
+            } else if path.extension().is_some_and(|ext| ext == "rs") {
+                out.push(path);
+            }
+        }
+    }
+
+    let mut sources = Vec::new();
+    rust_files(&root.join("src"), &mut sources);
+    let src_count = sources.len();
+    rust_files(&root.join("tests"), &mut sources);
+    assert!(src_count > 0 && sources.len() > src_count, "found no sources to scan");
+
+    let texts: Vec<(std::path::PathBuf, String)> = sources
+        .into_iter()
+        .filter_map(|path| std::fs::read_to_string(&path).ok().map(|text| (path, text)))
+        .collect();
+
+    // Definition sites, and every other mention of the name anywhere.
+    let mut defined: Vec<(String, String)> = Vec::new();
+    for (path, text) in &texts {
+        if !path.starts_with(root.join("src")) {
+            continue;
+        }
+        for line in text.lines() {
+            let trimmed = line.trim_start();
+            let Some(rest) = trimmed.strip_prefix("pub fn ").or_else(|| {
+                trimmed
+                    .strip_prefix("pub async fn ")
+                    .or_else(|| trimmed.strip_prefix("pub unsafe fn "))
+            }) else {
+                continue;
+            };
+            let name: String = rest
+                .chars()
+                .take_while(|ch| ch.is_alphanumeric() || *ch == '_')
+                .collect();
+            if !name.is_empty() {
+                defined.push((name, format!("{}", path.display())));
+            }
+        }
+    }
+    assert!(defined.len() > 100, "parsed {} pub fns, the scan broke", defined.len());
+
+    let mut orphans = Vec::new();
+    for (name, where_defined) in &defined {
+        let definition = format!("fn {name}");
+        let uses = texts
+            .iter()
+            .flat_map(|(_, text)| text.lines())
+            .filter(|line| line.contains(name.as_str()))
+            .filter(|line| !line.trim_start().contains(definition.as_str()))
+            .count();
+        if uses == 0 {
+            orphans.push(format!("{name} ({where_defined})"));
+        }
+    }
+    orphans.sort();
+    orphans.dedup();
+
+    assert!(
+        orphans.is_empty(),
+        "these pub fns are named nowhere but their own definition, and dead_code \
+         can no longer report them: {orphans:?}"
+    );
+}
+
+/// CI installs a Frama-C the server will call supported.
+///
+/// The pair drifted once already and nothing noticed: capabilities told every
+/// agent the server was "Validated against Frama-C 31.0 (Gallium)" for the six
+/// days after CI, CLAUDE.md and README moved to 33.0. A hardcoded sentence has
+/// no way to be wrong loudly, so the sentence is derived and this checks the
+/// number it derives from.
+///
+/// The comparison is the floor, not equality. MIN_FRAMA_C_MAJOR is the oldest
+/// version accepted rather than the only one, so requiring the matrix to equal
+/// it would fail the day CI moves to a Frama-C the code itself calls supported,
+/// which is a guard failing on the case it exists to allow.
+///
+/// The matrix parse is asserted non-empty for the other direction: a workflow
+/// this stops recognising would otherwise report all clear having compared
+/// nothing.
+#[test]
+fn ci_frama_c_version_matches_supported_minimum() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let workflow =
+        std::fs::read_to_string(root.join(".github/workflows/ci.yml")).expect("ci.yml");
+
+    let matrix: Vec<String> = workflow
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix("frama-c-version:"))
+        .flat_map(|list| {
+            list.trim().trim_start_matches('[').trim_end_matches(']').split(',')
+        })
+        .map(|entry| entry.trim().trim_matches('"').to_string())
+        .filter(|entry| !entry.is_empty())
+        .collect();
+
+    assert!(
+        !matrix.is_empty(),
+        "no frama-c-version matrix found in ci.yml, so this guard compared nothing"
+    );
+    for version in &matrix {
+        let major = selfcheck::frama_c_version_major(version)
+            .unwrap_or_else(|| panic!("no version number in the ci.yml matrix entry {version:?}"));
+        assert!(
+            major >= selfcheck::MIN_FRAMA_C_MAJOR,
+            "ci.yml installs Frama-C {version} but MIN_FRAMA_C_MAJOR is {}, so \
+             self_check would call the version CI tests unsupported",
+            selfcheck::MIN_FRAMA_C_MAJOR
+        );
+    }
+
+    // The two shell gates pin proved-goal counts, so they match an exact
+    // version where the constant is only a floor. That difference is fine until
+    // they disagree: a matrix the scripts refuse means CI installs a Frama-C
+    // its own gates will not run against, and the floor above cannot see it
+    // because the floor is satisfied.
+    for script in ["scripts/check-tutorial-corpus.sh", "scripts/check-abs-int-fixtures.sh"] {
+        let text = std::fs::read_to_string(root.join(script)).expect(script);
+
+        // Whole version strings on both sides, not majors. Comparing majors let
+        // a matrix of 33.1 pass against a gate whose case arm is 33.0, which is
+        // verbatim the mismatch this half exists to catch.
+        let accepted: Vec<String> = text
+            .lines()
+            .find(|line| line.trim_end().ends_with(") ;;"))
+            .map(|line| {
+                line.trim()
+                    .trim_end_matches(") ;;")
+                    .split('|')
+                    .map(|entry| entry.trim().to_string())
+                    .filter(|entry| !entry.is_empty())
+                    .collect()
+            })
+            .unwrap_or_default();
+        assert!(
+            !accepted.is_empty(),
+            "no version case found in {script}, so this guard compared nothing"
+        );
+        for version in &matrix {
+            assert!(
+                accepted.contains(version),
+                "ci.yml installs Frama-C {version}.x and {script} accepts {accepted:?}, \
+                 so the full lane would install a Frama-C its own gate refuses"
+            );
+        }
+    }
+}
+
+/// Every integration test target is run by CI.
+///
+/// A target nothing runs is worse than no target: it reads as coverage, it
+/// keeps being edited, and it says nothing. Measured on 2026-08-13, three of
+/// five were in that state, 51 tests between them, all three touched the day
+/// before. Two of the three were not in the gate list in CLAUDE.md either, so
+/// following the documentation did not run them and neither did the machine.
+///
+/// Pairs with ci_named_tests_still_exist, which catches the other direction: a
+/// step naming a test that has gone. This one catches a target no step names.
+#[test]
+fn ci_runs_every_test_target() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let workflow =
+        std::fs::read_to_string(root.join(".github/workflows/ci.yml")).expect("ci.yml");
+
+    // Word by word off the command lines, not a substring of the file: a
+    // comment mentioning the target would satisfy a contains, and so would a
+    // longer target name that starts with this one. "any" leaves the iterator
+    // just past the flag, so the next word is the target the step names.
+    let run_by_ci = |target: &str| {
+        workflow.lines().any(|line| {
+            let Some(rest) = line.trim().strip_prefix("cargo test ") else {
+                return false;
+            };
+            let mut words = rest.split_whitespace();
+            words.any(|word| word == "--test") && words.next() == Some(target)
+        })
+    };
+
+    let files = std::fs::read_dir(root.join("tests"))
+        .expect("tests dir")
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "rs"));
+
+    let mut unrun = Vec::new();
+    for path in files {
+        let Some(target) = path.file_stem().and_then(|stem| stem.to_str()) else {
+            continue;
+        };
+        // Not a target: the shared harness is compiled into the others.
+        if target != "harness" && !run_by_ci(target) {
+            unrun.push(target.to_string());
+        }
+    }
+    // read_dir order is arbitrary, and a failure message is read by a human.
+    unrun.sort();
+
+    assert!(
+        unrun.is_empty(),
+        "these test targets exist and CI never runs them, so they prove nothing: {unrun:?}"
+    );
+}
+
+/// Every gate CI runs, as the gate name this repository uses for it.
+///
+/// Split out because two tests need it and they check different halves: one
+/// that the runner covers CI, one that the documents cover the runner.
+fn ci_gates(root: &std::path::Path) -> Vec<String> {
+    // Every workflow, not just ci.yml. artifact-scans.yml runs a gate of its
+    // own on every push, and a version of this that read one file could not see
+    // it: the exact failure this test exists to prevent, one file over.
+    let mut workflow = String::new();
+    let workflows = root.join(".github/workflows");
+    for entry in std::fs::read_dir(&workflows).expect("workflows dir").flatten() {
+        let path = entry.path();
+        if path.extension().is_some_and(|ext| ext == "yml" || ext == "yaml") {
+            workflow.push_str(&std::fs::read_to_string(&path).unwrap_or_default());
+            workflow.push('\n');
+        }
+    }
+    assert!(
+        workflow.contains("cargo test"),
+        "no workflow was read, so this test would pass on an empty requirement set"
+    );
+
+    let mut required: Vec<String> = Vec::new();
+    for line in workflow.lines() {
+        // A step is either "run: <command>" on one line or a command inside a
+        // "run: |" block. Both forms are gates, and reading only the second
+        // silently dropped the one-line pure-Rust step, which is how this test
+        // came to check the gate list for a command it had never collected.
+        let command = line.trim().trim_start_matches("- ");
+        let command = command.strip_prefix("run:").unwrap_or(command).trim();
+        if let Some(gate) = gate_of(command) {
+            required.push(gate);
+        }
+    }
+    required.sort();
+    required.dedup();
+
+    // Counted by kind, because the kinds fail independently. A parser that
+    // stops recognising cargo lines still collects the scripts, so a bare total
+    // stayed comfortably above any threshold while seeing no test at all, which
+    // is how this missed its own control the first time.
+    let suites = required.iter().filter(|gate| gate.starts_with("--test")).count();
+    assert!(
+        suites >= 3 && required.iter().any(|gate| gate == "--test unit"),
+        "the workflow parser stopped recognising cargo test lines: {required:?}"
+    );
+    required
+}
+
+/// The whole-suite gate a CI command runs, if it runs one.
+fn gate_of(command: &str) -> Option<String> {
+    if command.starts_with("scripts/") {
+        return Some(command.to_string());
+    }
+    if command.ends_with("dune runtest") {
+        return Some("dune runtest".to_string());
+    }
+
+    // The two lint gates. Neither is a cargo test, and leaving them out is how
+    // clippy came to run in scripts/run-gates.sh and in no workflow at all,
+    // where nothing could fail a push on it. The shfmt step spans several lines
+    // of a "run: |" block, so it is matched on the invocation rather than on
+    // the whole command.
+    if command.contains("shfmt -i 4 -d") {
+        return Some("shfmt".to_string());
+    }
+    if command.starts_with("cargo clippy") {
+        return Some("cargo clippy".to_string());
+    }
+
+    // The release build, because two suites spawn the binary from disk rather
+    // than the harness cargo just built. Leaving it out of the list made the
+    // list fail on a clean checkout and, worse, pass against a stale binary
+    // while testing the code as it was before the change.
+    if command.starts_with("cargo build --release") {
+        return Some("cargo build --release".to_string());
+    }
+
+    // As in ci_named_tests_still_exist: --test is not always the first word,
+    // and requiring it there dropped whole gates from the set this compares
+    // against the documents.
+    let mut words = command.strip_prefix("cargo test ")?.split_whitespace();
+    if !words.any(|word| word == "--test") {
+        return None;
+    }
+    let gate = format!("--test {}", words.next()?);
+
+    // Nothing after the target, or an option where a name would be: the step
+    // runs the whole target rather than filtering it to one test.
+    words.next().is_none_or(|word| word.starts_with('-')).then_some(gate)
+}
+
+/// scripts/run-gates.sh runs every gate CI runs.
+///
+/// The runner is what the documents send a person to, so a gate CI has and the
+/// runner lacks is one that running the runner will not catch. Measured on
+/// 2026-08-19: clippy was in the runner and in no workflow, and the shfmt step
+/// was in ci.yml and not in the runner, so neither one was a superset of the
+/// other and following either left a gate unrun.
+#[test]
+fn run_gates_runs_every_ci_gate() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let script = std::fs::read_to_string(root.join("scripts/run-gates.sh")).expect("run-gates.sh");
+
+    // The dispatch lines, not the whole file, for the reason
+    // claude_md_lists_every_ci_gate reads a fenced block rather than a
+    // document: a comment naming a gate satisfies a whole-file search while
+    // nothing runs it. This file's own comments name shfmt and clippy, so the
+    // first version of this test passed on a runner that had dropped both.
+    let runner: String =
+        script.lines().filter(|line| line.trim_start().starts_with("want ")).collect();
+    assert!(
+        runner.contains("--test unit"),
+        "no dispatch line was read, so this test would pass on an empty runner"
+    );
+
+    let missing: Vec<String> = ci_gates(root)
+        .into_iter()
+        .filter(|gate| !runner.contains(gate.as_str()))
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "CI runs these and scripts/run-gates.sh does not, so the runner the \
+         documents point at is not the gate set: {missing:?}"
+    );
+}
+
+/// The gate list in CLAUDE.md covers everything CI runs over a whole suite.
+///
+/// That list is what a person follows before saying a change is green, so a
+/// gate missing from it is one nobody runs by hand. Measured on 2026-08-13:
+/// "dune runtest" was absent, and the whole OCaml plug-in suite went unrun for
+/// a session that edited the plug-in twice. It passed, which is luck, not
+/// method.
+///
+/// A document may instead delegate, by naming scripts/run-gates.sh in its test
+/// block. That is only honest because run_gates_runs_every_ci_gate pins the
+/// runner against CI; without that test, delegation would let a document say
+/// nothing and pass.
+///
+/// Only whole-suite commands. CI also runs single tests by name as smoke
+/// checks, and those are not gates; ci_named_tests_still_exist covers them.
+#[test]
+fn claude_md_lists_every_ci_gate() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let required = ci_gates(root);
+
+    // The fenced block under the test heading, not the whole file. Prose
+    // elsewhere naming a gate satisfies a whole-file search without anyone
+    // being told to run it, which is how the first version of this passed its
+    // own control: the paragraph explaining the gap mentioned "dune runtest".
+    //
+    // Both documents, because both carry the list. Reading only CLAUDE.md let
+    // README's copy sit at "cargo test --lib" after the unit tests moved to
+    // their own target, and it took a human noticing rather than a gate.
+    let gate_lists: Vec<(&str, String)> = ["CLAUDE.md", "README.md"]
+        .into_iter()
+        .map(|name| {
+            let text = std::fs::read_to_string(root.join(name)).expect(name);
+            let block = text
+                .split_once("## test")
+                .or_else(|| text.split_once("## Testing"))
+                .and_then(|(_, rest)| rest.split_once("```bash"))
+                .and_then(|(_, rest)| rest.split_once("```"))
+                .map(|(block, _)| block.to_string())
+                .unwrap_or_else(|| panic!("{name} has no bash block under its test heading"));
+            (name, block)
+        })
+        .collect();
+
+    // Delegation, not a second copy. README sends a person to the runner
+    // instead of restating twelve commands, and run_gates_runs_every_ci_gate is
+    // what makes that equivalent to restating them.
+    let missing: Vec<(&str, &String)> = gate_lists
+        .iter()
+        .filter(|(_, list)| !list.contains("scripts/run-gates.sh"))
+        .flat_map(|(name, list)| {
+            required
+                .iter()
+                .filter(move |gate| !list.contains(gate.as_str()))
+                .map(move |gate| (*name, gate))
+        })
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "CI runs these and the gate list in that document does not mention them, so \
+         nobody runs them by hand: {missing:?}"
+    );
+}
+
+/// The tool surface is exactly what README documents.
+///
+/// A `#[tool]` attribute binds to whatever function follows it, so inserting a
+/// helper between the attribute and its handler silently moves the tool: the
+/// handler stops being a tool and the helper becomes one under the handler's
+/// description. That happened while splitting run_wp, and nothing in this
+/// suite noticed, because every other test calls the handlers directly rather
+/// than through the router.
+///
+/// Compared against README rather than against a list written here, for the
+/// reason incomplete_codes_match_their_documentation gives: a list in the test
+/// is a second copy to keep in step, and it goes stale in exactly the commit
+/// that renames a tool in both the router and the test while leaving the
+/// documentation behind.
+#[test]
+fn tool_router_matches_the_documented_surface() {
+    // The Tools table names its tools in the second cell, several per row, each
+    // in backticks. The parse insists on that shape, so a row written some
+    // other way goes missing from the set and the comparison reports it, rather
+    // than being quietly accepted.
+    fn documented_tools(markdown: &str) -> std::collections::BTreeSet<String> {
+        let table = markdown
+            .split("## Tools")
+            .nth(1)
+            .expect("README has a Tools section");
+        table
+            .lines()
+            .skip_while(|line| !line.starts_with('|'))
+            .take_while(|line| line.starts_with('|'))
+            .filter_map(|line| line.split('|').nth(2))
+            .flat_map(|cell| cell.split(','))
+            .filter_map(|entry| {
+                let entry = entry.trim();
+                entry
+                    .strip_prefix('`')
+                    .and_then(|entry| entry.strip_suffix('`'))
+                    .map(str::to_string)
+            })
+            .collect()
+    }
+
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let readme = std::fs::read_to_string(root.join("README.md")).expect("README.md");
+    let documented = documented_tools(&readme);
+    assert_eq!(documented.len(), 14, "parsed {documented:?}");
+
+    let registered = FramaCMcpServer::tool_router()
+        .list_all()
+        .iter()
+        .map(|tool| tool.name.to_string())
+        .collect::<std::collections::BTreeSet<_>>();
+
+    assert_eq!(registered, documented);
+}
+

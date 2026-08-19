@@ -1,0 +1,4 @@
+[
+  {"kind":"GET","id":"r1","request":"plugins.ast-utils.getFunctionAst","data":"abs_val"},
+  {"kind":"GET","id":"r2","request":"plugins.ast-utils.getFunctionAst","data":"sum"}
+]

@@ -1,0 +1,19 @@
+(rule
+ (alias runtest)
+ (deps (source_tree regressions))
+ (action (run ./regressions/run.sh)))
+
+(rule
+ (alias runtest)
+ (deps (source_tree regressions))
+ (action (run ./regressions/run_exec_add_funspec.sh)))
+
+(rule
+ (alias runtest)
+ (deps (source_tree regressions))
+ (action (run ./regressions/run_funspec_scope.sh)))
+
+(rule
+ (alias runtest)
+ (deps (source_tree regressions))
+ (action (run ./regressions/run-payload-shapes.sh)))

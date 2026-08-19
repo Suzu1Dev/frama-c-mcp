@@ -1,0 +1,529 @@
+# frama-c-mcp
+
+An [MCP](https://modelcontextprotocol.io/) server that gives an AI agent
+[Frama-C](https://frama-c.com/): EVA abstract interpretation, WP deductive
+proof, ACSL annotation injection, and isolated sandboxes for trying annotations
+out.
+
+The server is designed to be driven by an agent rather than by a person. An MCP
+client spawns it and speaks to it over stdio, so there is no command for a human
+to type. It is built around an iterative loop: propose an annotation, prove it,
+read why the goal did not close, then revise. The session state follows from
+that loop rather than from shell use, since one project stays loaded across
+calls, sandboxes are addressed by name, and proof receipts compare only within
+a run.
+
+Wire it into Claude Code, Claude Desktop, or any MCP client, then prompt in
+English. See [Connect an agent](#connect-an-agent) and
+[Prompt patterns](#prompt-patterns). A `check` subcommand exists for CI and is
+the only part intended to be run by hand.
+
+## Architecture
+
+```text
+┌──────────┐  MCP over stdio   ┌────────────────┐  Unix socket  ┌─────────────────┐
+│ AI agent │◄─────────────────►│ frama-c-mcp    │◄─────────────►│ Frama-C main    │
+└──────────┘                   │ Rust server    │               │ + ast-utils     │
+                               └───────┬────────┘               └─────────────────┘
+                                       │ Unix socket per sandbox
+                                       ▼
+                               ┌──────────────────┐
+                               │ Frama-C sandbox  │
+                               │ + ast-utils      │
+                               │  per experiment  │
+                               └──────────────────┘
+```
+
+The server has two required components:
+
+- Rust MCP server: exposes the tools over MCP stdio, translates requests into
+  Frama-C's server protocol, and lazily starts the main Frama-C process on the
+  first project operation.
+- `ast-utils` Frama-C plugin: provides the custom requests for AST access,
+  dependency extraction, ACSL injection, sandboxing, and WP configuration.
+  Build and install it in the same opam switch as Frama-C.
+
+`create_sandbox` extracts a function together with its type, callee, and global
+dependencies into a temporary C file, then starts a separate Frama-C process.
+An agent can iterate on annotations there without mutating the main project;
+verified sandbox annotations are merged back explicitly.
+
+### Session model
+
+The server holds one project: `reload_project` or the first `check` loads it,
+and later calls operate on that AST. Sandboxes are separate processes,
+addressed as `experiment_id:function`.
+
+The preprocessor surface is `include_paths`, `defines`, `force_includes`, and
+`machdep`, applied in that order. Each value is written without its compiler
+flag.
+
+## Quick start
+
+Build the Frama-C plugin, build and install the server, then point an MCP client
+at it. The plugin and Frama-C must be installed in the same opam switch.
+
+### Prerequisites
+
+- Frama-C 33.0 (the version exercised by CI)
+- OCaml 4.14.2, opam, and dune >= 3.0
+- Rust 2021 toolchain
+- WP provers: Alt-Ergo, with Z3 and CVC5 optional
+
+### Build
+
+```bash
+eval $(opam env --switch=frama-c-33)
+
+cd ast-utils
+dune build && dune install
+cd ..
+
+cargo build --release
+```
+
+`dune` resolves Frama-C through the opam switch, not through `PATH`. Setting
+only `PATH` builds the plugin against whichever switch is active and fails with
+unbound modules in files you did not touch.
+
+After changing the plugin, run `dune clean && dune build && dune install`.
+Incremental builds may not relink the installed `.cmxs`.
+
+### Install
+
+```bash
+./scripts/install.sh          # to ~/.local/bin
+BINDIR=/usr/local/bin ./scripts/install.sh
+```
+
+The script builds and installs both the Rust binary and the `ast-utils` plugin.
+It runs `dune` through `opam exec`, so the plugin lands in the active switch;
+select the switch holding Frama-C before running it. The install fails if the
+resulting plugin is not loadable by that switch's `frama-c`. `BINDIR` must be
+writable without `sudo`, which would discard the opam environment.
+
+Use the script instead of copying over an existing binary. On macOS, replacing
+an executed binary in place can leave a stale code-signature blob and cause
+every subsequent execution to fail with `SIGKILL (Code Signature Invalid)`.
+The script installs through a temporary file, ad-hoc signs it, runs it once,
+and then renames it into place.
+
+### Connect an agent
+
+Declare the server in `.mcp.json` for a project, or in
+`claude_desktop_config.json` for Claude Desktop:
+
+```json
+{
+  "mcpServers": {
+    "frama-c": {
+      "command": "/path/to/frama-c-mcp",
+      "args": ["--frama-c", "/path/to/frama-c"]
+    }
+  }
+}
+```
+
+The client spawns that command and speaks MCP over its stdin and stdout, so
+there is nothing to start beforehand; run the binary from a terminal and it
+simply waits on stdin. Frama-C itself is spawned lazily, on the agent's first
+project operation, which is why a misconfigured `--frama-c` surfaces on the
+first `check` rather than at startup.
+
+The arguments the client passes:
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--frama-c` | `frama-c` | Path to the Frama-C binary |
+| `--max-sandboxes` | `32` | Maximum concurrent sandbox Frama-C processes |
+| `--socket` | none | Deprecated; ignored when set because sockets are generated per process |
+
+Once connected, drive it in English rather than by naming tools; the agent picks
+the calls. [Prompt patterns](#prompt-patterns) is the table of what to say.
+
+### CLI escape hatch for CI
+
+The `check` subcommand runs the same code path as the `check` tool and prints
+its JSON payload, so a pipeline can use the server without an agent and without
+speaking MCP. It is the one entry point meant to be typed:
+
+```bash
+./target/release/frama-c-mcp check src/foo.c --function foo \
+    -I include -D NDEBUG --force-include builtins.h --require-complete
+```
+
+`--require-complete` exits non-zero when `incomplete[]` is non-empty, which is
+the difference between "nothing was reported" and "everything was checked".
+The rest of the tool surface has no CLI form, on purpose: it is stateful across
+calls and there is no session to hold that state in from a shell.
+
+### Prompt patterns
+
+Say what evidence you want back, and hand over what the server cannot infer:
+the include paths, the defines, and which function is the target. The left
+column is what you type; the middle is what a well-behaved agent does with it;
+the right is the trap that makes the obvious call the wrong one.
+
+| Say | Call | Trap |
+|-----|------|------|
+| *"Check foo.c for runtime errors and prove its contracts; it builds with `-Iinclude -DNDEBUG`. Target `bar`. Tell me what was left unchecked."* | `check({files:["foo.c"], function:"bar", include_paths:["include"], defines:["NDEBUG"]})` | `check` reloads the project, so it needs the real build flags. Without them Frama-C parses a different program, or none |
+| *"Give me every goal and alarm, not the first few."* | `check({..., detail:"full"})` | The default is `summary`. `full` runs to hundreds of kilobytes on a real file, and `verdict` and `incomplete[]` are computed from the complete data either way |
+| *"Frama-C cannot parse this. Reproduce the compiler configuration; do not delete code to make it parse."* | `reload_project({files, include_paths, defines, force_includes, machdep})` | `force_includes` supplies declarations Frama-C lacks. A define that erases the call site parses, and then proves the wrong program |
+| *"What can `n` hold at foo.c:42?"* | `context({want:["marker_at"], file:"foo.c", line:42})` → `context({want:["eva_value"], marker})` | Needs EVA to have run. Which marker comes back follows the position, not the intent: a declaration line answers with the variable's `#v`, so read `marker_kind` before passing it on |
+| *"Why might line 42 overflow? Show the values, the callers, and the annotations in force."* | `get_wp_goals({want:["alarms"]})` → `get_wp_goals({want:["investigation"], marker:"#p10", depth:"deep"})` | `investigation` takes the property marker off the alarm row. `depth` defaults to `normal`, which omits the annotations |
+| *"List everything this run did not establish for `bar`."* | `get_wp_goals({want:["alarms","goals"], function:"bar", status:"unproved"})` | `unproved` is every status other than valid. A status that is neither a Frama-C name nor one this run produced is an error, so a typo cannot read as proved |
+| *"Why is that goal not proved? Show the hypotheses WP had."* | `get_wp_goals({want:["vc"], function:"bar"})` | The sequent is per function, and `vc` requires `function` |
+| *"Show me `bar` as Frama-C sees it, with my contract read back."* | `context({want:["contract_context","loop_effects"], function:"bar"})` | The read-back route for annotations you injected: type-checked, macros expanded, as WP will use them |
+| *"I have no annotations yet. What does the code itself determine?"* | `propose_annotations({function:"bar"})` → `inject_all_annotations({function:"bar", dry_run:true, annotations:[...]})` | Frames only, each already type-checked against the AST. The predicates that make a proof go through are under `not_proposed`, named rather than guessed |
+| *"Type-check this ACSL against the real AST but change nothing."* | `inject_all_annotations({function:"bar", dry_run:true, annotations:[...]})` | Invariants, asserts, `assigns`, ghost code and lemmas all inject on main. `requires` and `ensures` are the exception, refused there whatever `dry_run` says |
+| *"Try requiring `n >= 0` without touching the main project."* | `create_sandbox({function:"bar", experiment_id:"exp42"})` → `inject_all_annotations({sandbox_name:"exp42:bar", annotations:[...]})` → `run_wp({functions:["exp42:bar"]})` | Contracts belong to whoever reviews the source, so main refuses them and the sandbox is where one gets tried. Merge back explicitly |
+| *"Prove `bar` now, and tell me what my last change actually bought."* | `run_wp({functions:["bar"], cache:"None"})` → `get_wp_goals({since:"<earlier receipt sha256>"})` | `-wp-cache` defaults to `update`, so a valid verdict may be replayed rather than computed. `since` only names receipts from this session |
+| *"Prove the ready functions, one bounded batch at a time, then record what `bar` assumed."* | `run_wp({functions:["bar"], retry_unproved:true})` → `store_function_conclusion({function:"bar", status:"verified", proof_receipt, wp_summary})` → `list({kind:"conclusions", function:"bar"})` | WP's budget is per call, so an oversized batch returns nothing at all. `verified` is refused unless the receipt's goals are all valid and their count matches `wp_summary` |
+| *"Verify the file bottom up and tell me what to do next."* | `verify_program_step({lock_project:false})` | The lock defaults on and blocks every later `run_wp` on main |
+| *"Does it actually break when it runs?"* | `run_e_acsl({use_current_ast:true, args:[...]})` | Compiles and executes the code with your privileges; trusted source only. Without `use_current_ast` it runs the files on disk, which do not carry this session's annotations |
+| *"Write out the annotated source."* | `context({want:["source"], output:"out/annotated.c"})` | Whole program, every contract and generated RTE assert. The path must stay inside the working directory |
+| *"Why did that tool fail?"* | `self_check({canary:true})` | Versions, provers, which requests answer. `canary` adds about 30s proving the backend still tells a bundled bug from its fix |
+
+The WP memory model is process state. Frama-C takes some changes within one
+process and not others, so a change that aborts reports what it changed from
+and points at `reload_project`.
+
+Ask for a verdict rather than a summary. `check` reports `proved` only when
+`incomplete[]` is empty, so "no alarms were reported" and "everything was
+checked" stay distinguishable. See [docs/agent-playbook.md](docs/agent-playbook.md)
+for the shortest reliable call order for each workflow, and
+[docs/writing-acsl.md](docs/writing-acsl.md) for what to write when a goal will
+not close, keyed to the finding categories and `incomplete[]` codes.
+
+## Tools
+
+The server exposes the following tool groups:
+
+| Domain | Tools | Purpose |
+|--------|-------|---------|
+| Project | `reload_project`, `list`, `context`, `self_check` | Load source, inspect declarations, navigate call relationships, and report server capabilities |
+| EVA/WP | `check`, `run_wp`, `get_wp_goals`, `run_e_acsl` | Run verification, read what it concluded, and execute runtime counterexamples |
+| Annotations | `inject_all_annotations`, `propose_annotations` | Dry-run validate and inject ACSL annotations, and propose the frame conditions the code determines |
+| Sandbox | `create_sandbox`, `delete_sandbox` | Isolate annotation experiments |
+| Orchestration | `verify_program_step` | Run bottom-up verification steps |
+| State | `store_function_conclusion` | Persist verification conclusions |
+
+> `run_e_acsl` compiles the loaded source and runs the resulting binary with
+> your privileges. Every other tool only analyzes. Do not point it at C source
+> you do not trust, and note that an agent reading untrusted source can be
+> steered into calling it.
+
+The rest of this section covers the parameters whose behavior is not obvious
+from the tool schema.
+
+### Input constraints
+
+Identifiers that become directory names, `store_function_conclusion {function}`
+and `create_sandbox {experiment_id}`, are restricted to `[A-Za-z0-9_-]` so they
+cannot escape `.frama-c-mcp/` or the sandbox root.
+
+`context {want: ["source"], output}` is the only tool that writes a file the
+caller names, and the path must resolve inside the working directory. An
+absolute path elsewhere, a `..` that climbs out, and a symlink inside the tree
+that points out of it are all refused.
+
+`run_e_acsl {tool}` names the E-ACSL wrapper, not an arbitrary executable: it
+must be `e-acsl-gcc` or `e-acsl-gcc.sh`, resolved through PATH. Both names
+exist because installs differ.
+
+`reload_project {include_paths, defines, force_includes}` become preprocessor
+flags, and Frama-C hands those to a shell (its `-cpp-extra-args` is "unsafe in
+sandbox mode"). Each entry is therefore restricted to `[A-Za-z0-9_./+-]`, plus
+`=` for defines, with no leading dash, so a value cannot carry a command
+substitution or the `${IFS}` space trick into that shell. A define needing a
+shell-active character (a parenthesized expression, a quoted string) is refused;
+`force_includes` a header that spells it instead.
+
+### `list` and `run_wp`
+
+`list` accepts a `kind` of `files`, `functions`, `globals`, `declarations`,
+`sandboxes`, or `conclusions`. For conclusions, `status` filters the summaries
+and `function` returns one full conclusion.
+
+`run_wp` accepts `smoke: true` together with `provers` to run isolated CLI
+smoke tests.
+
+### `self_check`
+
+`self_check` reports `tool_surface`: the tool count, the byte size of the
+`tools/list` result that is resent on every agent turn, and the three heaviest
+tools. Computed from the running server, so it cannot be quoted stale.
+
+It parses the `frama-c -version` banner rather than only checking that
+the command exited zero. `frama_c.major`, `frama_c.supported` and
+`frama_c.minimum_major` report whether the installed version meets this
+server's minimum supported major version, and `frama_c.unsupported_reason`
+names the mismatch when it does not. An older Frama-C exits zero like any other,
+and the failure it causes lands somewhere with no version in it: a plugin that
+will not load, or a request answered `invalid`.
+`capabilities.known_frama_c_version_limitations` repeats the reason and is
+derived from the same probe, so it cannot go stale against the version actually
+installed.
+
+`self_check` also accepts `canary: true`. The request probes report which
+requests answer; they cannot report whether EVA and WP still catch anything, and
+an install where every request answers and no alarm is ever raised passes them
+while being useless. The canary runs `tests/fixtures/abs-int-buggy.c` and its
+fixed twin through `check` and judges the reason rather than the verdict: the
+buggy file must report an `ALARM_NOT_VALID` naming `signed_overflow`, and the
+fixed one must be `proved` with an empty `incomplete[]`. The pair is the test,
+not either half: with WP dead the buggy file still reports its alarm from EVA,
+and it is the fixed file that catches it.
+
+The canary is off by default because it is two full EVA and WP runs, about 30
+seconds, and it performs them in a separate Frama-C process with its own state.
+`check` reloads whatever project it runs against, so a canary sharing the
+session would discard the loaded AST and every annotation injected into it.
+
+### `get_wp_goals`
+
+`get_wp_goals` reads the one property table every analysis writes to, selected by
+a `want` array in the idiom `context` uses: `goals` (the default, WP proof
+goals, filtered by `function` and `status`, or diffed against an earlier run
+with `since`), `alarms` (EVA alarms, filtered by `function`, `alarm_kind` or
+`status`), `counts` (property counts plus EVA and WP state), `vc` (one
+function's verification condition as a sequent), and `investigation` (one
+property joined to its value ranges, callers, and annotations, keyed on
+`marker` and taking `depth`).
+
+Each of `alarm_kind`, `marker`/`depth`/`callstack`, and `since` belongs to one
+want and is rejected without it, so a call cannot quietly get an answer that
+ignored what it passed. `status` is the one parameter two wants read, and it
+means the same thing on both: `unproved` selects everything not valid, whether
+the rows are goals or alarms.
+
+### `inject_all_annotations`
+
+`inject_all_annotations` takes every clause in one `annotations` array, each entry
+tagged with a `kind` of global, behavior, requires, ensures, assigns, assert,
+loop, complete_behaviors, disjoint_behaviors, terminates, exits, or decreases.
+Generated clauses get readable labels by default, so WP goals trace back to the
+entry that produced them, and diagnostics name the failing `annotations[i]`.
+
+The same array carries ghost code: `ghost_global`, `ghost_formal`,
+`ghost_lemma_function`, `ghost_loop`, and `ghost_stmt`, each with its fields on
+the entry rather than nested under a `spec`. Ghost entries
+are applied before clause entries in one call, because a ghost formal changes
+the signature a `requires` refers to, and the clause plan is skipped entirely
+if any ghost fails. Each one answers under `ghosts[]`, which carries the
+plug-in's payload verbatim: `vid` for a ghost global, `loop_sid` and `sids` for
+a ghost loop.
+
+`ghost_global` and `ghost_lemma_function` belong to a project rather than to a
+function, so `function` there only selects main or which sandbox.
+
+Under `dry_run`, ghost entries are checked for their kind's fields and a
+resolvable target but not inserted, and the clauses are then validated against
+an AST that does not carry them. The response says so with
+`ghosts_not_applied`, because a `requires` naming a proposed ghost formal reads
+as invalid there and may not be.
+
+### `context`
+
+`context` accepts `want` values for `function_ast`, `cil_context`,
+`contract_context`, `logic_deps`, `property_context`, `rte_obligations`,
+`current_annotations`, `write_effects`, `loop_effects`, `messages`, `source`,
+`symbol`, `marker_at`, `eva_value`, `callgraph`, `callers`, and `call_chain`.
+
+`marker_at` and `eva_value` are the two halves of "what does this variable hold
+here": `marker_at` turns `{file, line, column?}` into a statement marker, and
+`eva_value` reads EVA's range at it. `eva_value` was once its own tool; it lives
+here because `get_wp_goals` reads the property table, and a statement marker is
+not in that table.
+
+The navigation wants divide as follows. `symbol` takes the identifier in
+`function` and answers for a global variable too. `callgraph` and `call_chain`
+read the syntactic call graph, while `callers` returns EVA caller data and so
+requires `check` to have run first. `callgraph` is whole-program and rejects
+`function` when it is the only want.
+
+## Verdicts and evidence
+
+### Verdicts
+
+Silence is not a proof, so results carry both what was found and what was
+actually checked.
+
+`check` returns a `verdict` of `proved` only when `incomplete[]` is empty. Any
+step that did not run, timed out, or was skipped becomes an `incomplete[]`
+entry, and the verdict falls back to `incomplete` even when nothing failed.
+
+Every entry carries a `code`, and only the code is frozen; see
+[docs/reference/result-schema.md](docs/reference/result-schema.md) for the
+payload contract and the change rule. The full set:
+
+<!-- incomplete-codes -->
+
+| Code | Meaning |
+|------|---------|
+| `RTE_DISABLED` | Ran without RTE, so no alarms does not exclude runtime errors |
+| `EVA_NOT_RUN` | EVA did not complete, so `eva_alarms` proves nothing |
+| `WP_NOT_RUN` | WP did not complete, so `wp_goals` proves nothing |
+| `WP_STILL_RUNNING` | WP was working when its goals were read, so a goal may be missing entirely |
+| `ALARM_NOT_VALID` | EVA left a generated runtime-error alarm undischarged |
+| `GOAL_NOT_VALID` | WP has a non-valid goal |
+| `PROVER_TIMEOUT` | A prover timed out on a goal |
+| `PROPERTY_DEAD` | EVA proved the code unreachable, so nothing proved about it constrains a run |
+| `PROPERTY_DISPROVED` | Frama-C disproved a property and WP emits no goal for one that already has a status |
+| `PROPERTY_INCONSISTENT` | Frama-C consolidated contradictory statuses, so the verdict cannot be trusted |
+| `LEMMA_NOT_PROVED` | WP assumed a lemma everywhere without discharging it |
+| `ASSUMED_VALID` | Recorded valid by external assumption, an `axiom`, not by proof |
+| `ASSUMED_CALLEE_CONTRACT` | A callee's contract was taken on faith, with no finite `assigns` |
+| `UNCONSTRAINED_ASSIGNS` | The contract lists a location in `assigns` that no postcondition mentions, so proving the function says nothing about the value written there |
+| `RESULT_UNCONSTRAINED` | The contract bounds `\result` to a small range but never ties some of those values to the inputs, so proving it does not pin down what the function returns |
+| `UNPROVED_ASSUMPTION` | An assertion or postcondition WP could not prove, which it still hands to later goals as a hypothesis |
+| `VALID_UNDER_HYP` | WP proved the goal, but Frama-C consolidated its property as valid only under hypotheses nothing has established |
+| `EVA_NOT_REQUESTED` | `want` excluded EVA, so nothing here excludes the alarms it finds |
+| `WP_NOT_REQUESTED` | `want` excluded WP, so nothing here is a proof |
+
+Treat the set as additive: codes are added as gaps are found, and three were
+added in one day. Branch on the ones you handle and surface the rest rather
+than assuming an unknown code is benign.
+
+`check` also returns `messages[]`, Frama-C's own errors and warnings from the
+run, each with its plugin and source location. A generated `assigns` for an
+uncontracted callee is announced there and nowhere else, and it weakens every
+proof above it.
+
+`check`, `run_wp`, and stored conclusions carry a `proof_receipt`
+(`frama-c-mcp.proof-receipt.v3`): the source-file hash, the Frama-C and prover
+environment, the effective WP configuration, per-goal statuses, and a sha256
+over all of it. Two runs are comparable exactly when their receipts match.
+
+### Proof evidence
+
+Each goal also reports `from_cache`. Frama-C's `-wp-cache` defaults to
+`update`, so WP reuses verdicts it proved in earlier runs; such a verdict is a
+real proof of that obligation by that prover, but not one the current run
+performed, and the receipt records the difference. Pass
+`run_wp {cache: "None"}` to prove everything in this run.
+
+A proof is only as good as what it assumed. `run_wp` reports an
+`assumed_callee_contract` finding for every callee whose contract it took on
+faith instead of proving. Conclusions carry `stale_dependencies` when a callee's
+conclusion changed underneath them and `stale_proof_environment` when the
+prover environment moved, so a stored `verified` does not quietly outlive its
+justification. `store_function_conclusion` refuses `verified` without a receipt,
+and `list {kind: "conclusions", function}` returns `verified_with`: the memory
+model, provers, timeout, assumed callee contracts, and receipt hash behind that
+conclusion.
+
+`verify_program_step` returns one `next_action` plus the unverified `frontier`
+and any `blocked_functions`, under a hard `payload_budget` cap; when the payload
+would exceed it, lists are truncated and the dropped count is reported rather
+than silently omitted.
+
+## Verification workflows
+
+The common workflows are:
+
+Direct EVA/WP loop:
+
+```text
+check {files or source, function?, detail?}
+
+# detail defaults to "summary": wp_goals and eva_alarms come back as counts
+# plus the first few entries that need attention. Pass detail: "full" for every
+# goal and alarm, which runs to hundreds of kilobytes on a real file. The
+# verdict and incomplete[] are computed from the complete data either way.
+
+# Or step-by-step:
+check {files, want: ["eva"]} -> get_wp_goals {want: ["alarms"]}
+  -> get_wp_goals {want: ["investigation"], marker}
+               -> inject_all_annotations
+               -> run_wp -> get_wp_goals
+```
+
+Sandboxed CEGIS loop:
+
+```text
+create_sandbox -> inject_all_annotations {dry_run: true} -> inject_all_annotations -> run_wp
+               -> get_wp_goals
+               -> inject_all_annotations with the verified annotations -> run_wp
+               -> store_function_conclusion -> delete_sandbox
+```
+
+Whole-program bottom-up loop:
+
+```text
+reload_project -> verify_program_step
+               -> create_sandbox -> inject_all_annotations {dry_run: true}
+               -> inject_all_annotations -> run_wp -> get_wp_goals
+               -> store_function_conclusion
+               -> repeat until every function has a conclusion
+```
+
+## Testing
+
+Use the gate runner locally; it runs all thirteen repository checks, keeps logs
+under `target/gate-logs`, and names failed tests. A unit test pins the runner
+against the CI workflows, so the two cannot drift apart.
+
+```bash
+# Fast lane: formatting, lint, unit tests and the release build; no Frama-C needed.
+scripts/run-gates.sh fast
+
+# Full lane: requires Frama-C, WP provers, and ast-utils on PATH.
+eval "$(opam env)"
+scripts/run-gates.sh
+
+# Run selected gates by name, for example:
+scripts/run-gates.sh unit stdio
+```
+
+| Suite | Needs Frama-C? | Coverage |
+|-------|----------------|----------|
+| `shfmt -i 4 -d` | no | Every tracked shell script is 4-space formatted |
+| `cargo clippy --all-targets` | no | Lint checks for all targets, denied via `[lints.clippy]` |
+| `cargo test --test unit` | no | Codec, state, callgraph, topological order, tool payload shapes |
+| `test-store-conclusion` | no | Conclusion persistence and the on-disk long-text layout |
+| `test-integration` | yes | Live Frama-C EVA, WP, annotations, and sandbox behavior |
+| `test-mcp-stdio` | yes | Full MCP stdio surface |
+| `test-process-lifecycle` | yes | Lazy spawn, SIGTERM cleanup, zombie reaping, capabilities |
+| `test-reload-project-regression` | yes | In-place reload versus respawn |
+
+CI runs a fast Rust-only job and a full job that installs Frama-C, provers, and
+the `ast-utils` plugin, then runs version smoke tests, the tutorial and
+abs-int fixture gates, and the live suites.
+
+## Technical notes
+
+### Frama-C server protocol
+
+Frama-C uses a custom binary protocol, not JSON-RPC. Commands are `GET`,
+`SET`, `EXEC`, `POLL`, and `SHUTDOWN`; `SET` and `EXEC` are queued and must be
+driven with `POLL`.
+
+### AST reload
+
+Reparsing files requires `setFiles([])`, then `setFiles(files)`, then `compute`.
+Directly setting the same file list is a no-op in Frama-C's state dependency
+system.
+
+### Incremental fetch APIs
+
+`fetchFunctions` returns a full list only after `reloadFunctions`; later calls
+return deltas.
+
+### WP memory model
+
+The server uses `Typed+nocast`, so casts fail safely instead of being silently
+assumed away.
+
+### Callee contracts
+
+A bare declaration without a contract defaults to `assigns \nothing`, which is
+unsound for many callees. Sandbox extraction emits empty-body stubs for callees
+that lack explicit `assigns`.
+
+## License
+
+`frama-c-mcp` is available under a permissive
+[MIT](https://opensource.org/license/mit)-style license.
+Use of this source code is governed by a MIT license that can be found
+in the [LICENSE](LICENSE) file.

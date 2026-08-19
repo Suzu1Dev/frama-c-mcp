@@ -1,0 +1,4 @@
+[
+  {"kind":"GET","id":"g1","request":"plugins.ast-utils.getFunctionAst","data":"sum_old_ghost"},
+  {"kind":"GET","id":"g2","request":"plugins.ast-utils.getFunctionAst","data":"sum_attr_ghost"}
+]

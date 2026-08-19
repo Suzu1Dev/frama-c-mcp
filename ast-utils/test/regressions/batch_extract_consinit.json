@@ -1,0 +1,3 @@
+[
+  {"kind":"GET","id":"extract_wrapper","request":"plugins.ast-utils.extractFunctionWithDeps","data":"caller"}
+]
