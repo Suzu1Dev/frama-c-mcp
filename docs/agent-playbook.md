@@ -181,8 +181,7 @@ the caller's postcondition.
 
 `check` is all-or-nothing today, and `--require-complete` is its CLI form, so a
 project that wants to adopt this gradually has to read `incomplete[]` and the
-goal counts itself. A tiered bar is planned; see the acceptance-bar item in
-[TODO.md](../TODO.md).
+goal counts itself.
 
 A contract edited directly in the C file bypasses the injection path entirely.
 `context {want: ["contract_context"]}` still shows the clauses as they now

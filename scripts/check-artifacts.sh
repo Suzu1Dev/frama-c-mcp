@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+
 set -euo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -6,13 +7,13 @@ cd "$root"
 
 python3 - <<'PY'
 from pathlib import Path
+import os
 import re
+import subprocess
 import sys
 
 roots = [
     Path("README.md"),
-    Path("CLAUDE.md"),
-    Path("TODO.md"),
     Path("Cargo.toml"),
     Path("docs"),
     Path("src"),
@@ -22,7 +23,7 @@ roots = [
     Path(".github"),
 ]
 skip_dirs = {".git", ".frama-c-mcp", "_build", "_opam", "target"}
-skip_files = {Path("DONE.md"), Path("framac.md"), Path("scripts/check-artifacts.sh")}
+skip_files = {Path("scripts/check-artifacts.sh")}
 
 cjk = re.compile(r"[\u2e80-\u9fff\u3040-\u30ff\u3100-\u312f\uac00-\ud7af\uff00-\uffef]")
 translator = re.compile(
@@ -80,6 +81,46 @@ for path in active_files():
             seen.add(key)
             if not Path(target).exists():
                 report(path, line_no, f"dead docs path {target}", line)
+                failed = True
+
+# Relative markdown links, resolved against the tracked file list rather than
+# against the working tree. CLAUDE.md, TODO.md and DONE.md live in a checkout
+# nobody publishes: they sit in the working tree and are never committed, so
+# os.path.exists answers yes on the machine that wrote the link and the link is
+# a 404 for every reader. Measured once, on docs/agent-playbook.md linking to
+# ../TODO.md, which every local check passed and no reader could follow.
+#
+# The doc_path scan above is not a substitute. It matches paths beginning with
+# "docs/" wherever they appear, so a link that climbs out of the directory, or
+# points at a file at the repository root, is not a path it recognises.
+# In a repository the tracked list is the oracle, for the reason above. Outside
+# one, an unpacked release tarball say, there is no such list and the files
+# present are exactly the files published, so the filesystem answers the same
+# question correctly. Falling back rather than skipping, because a check that
+# quietly does nothing outside git is the failure this whole script is about.
+listing = subprocess.run(["git", "ls-files"], capture_output=True, text=True)
+tracked = set(listing.stdout.split()) if listing.returncode == 0 else None
+
+
+def is_published(rel_path):
+    return rel_path in tracked if tracked is not None else Path(rel_path).exists()
+md_link = re.compile(r"\[[^\]]*\]\(([^)]+)\)")
+md_files = (
+    sorted(p for p in tracked if p.endswith(".md"))
+    if tracked is not None
+    else sorted(str(p) for p in Path(".").rglob("*.md") if not any(part in skip_dirs for part in p.parts))
+)
+for path in md_files:
+    for line_no, line in enumerate(read_text(Path(path)), 1):
+        for target in md_link.findall(line):
+            if target.startswith(("http://", "https://", "#", "mailto:")):
+                continue
+            target = target.split("#", 1)[0]
+            if not target:
+                continue
+            resolved = os.path.normpath(os.path.join(os.path.dirname(path), target))
+            if not is_published(resolved):
+                report(path, line_no, f"link to untracked or missing {target}", line)
                 failed = True
 
 if failed:

@@ -19,7 +19,6 @@ _opam/
 
 # Rust (for experiments)
 target/
-Cargo.lock
 
 # Editor
 *~

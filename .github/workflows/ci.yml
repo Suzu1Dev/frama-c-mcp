@@ -1,0 +1,460 @@
+name: CI
+
+# One workflow, not two. The artifact scan used to live in its own file, and a
+# guard in tests/unit/repo-guards.rs had to learn to read every file under
+# .github/workflows before it could see that a whole gate ran there: exactly the
+# failure it exists to prevent, one file over. One file is one place to look.
+on:
+  push:
+    # Work lands on dev, so dev needs the full lane too. The pull_request
+    # trigger filters on the base branch, which a dev to main pull request
+    # already matches, so it needs no entry of its own.
+    branches: [main, dev]
+  pull_request:
+    branches: [main]
+
+# There is no paths-ignore, and that is deliberate. The old one skipped every
+# job on a push touching only markdown, which skipped cargo test --test unit,
+# which is the target holding documented_gate_list_covers_ci,
+# tool_router_matches_the_documented_surface and
+# incomplete_codes_match_their_documentation. So the filter turned off precisely
+# the gates that read the files being changed, and scripts/check-artifacts.sh
+# reads README.md and docs/ as well. A documentation-only push pays the full
+# lane now; that is cheaper than a documentation gate that cannot fail.
+
+# A push to a branch with a pull request open fires both triggers: one run on
+# the branch head, one on the merge ref, each paying a Frama-C install and a
+# fourteen minute suite. Keying on the head ref puts them in one group, so the
+# later run cancels the earlier.
+#
+# The repository is in the key as well as the branch, because the branch name
+# alone is not unique across forks: two pull requests from two forks whose
+# branches are both called "dev" shared a group, and cancel-in-progress then
+# had one contributor's checks killed by the other's push. The fallbacks are
+# what keep the pair above in one group, since a push event carries neither
+# field and answers with this repository and the bare branch, which is exactly
+# what a pull request from this repository resolves to.
+#
+# Except on main, where a run may be holding the release window below open with
+# the previous release already deleted. Cancelling that leaves no release at
+# all, so pushes to main queue rather than replace each other.
+concurrency:
+  group: >-
+    ${{ github.workflow }}-${{ github.event.pull_request.head.repo.full_name || github.repository }}-${{ github.event.pull_request.head.ref || github.ref_name }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+# Nothing here writes to the repository, except the release job, which raises
+# this to contents: write for itself alone.
+permissions:
+  contents: read
+
+# Runner images are pinned to a release rather than "-latest", so an image
+# rollover is a deliberate bump in this file instead of a surprise on a Monday.
+#
+# Actions are named by major version only, "@v7" rather than "@v7.0.1" or a
+# commit. A major tag tracks its own patches, so a fix upstream arrives without
+# a commit here, and .github/dependabot.yml opens the pull request when the
+# major itself moves. Write the short form when adding one.
+#
+# Every job carries timeout-minutes. The default is 360, and the Frama-C lane
+# drives real processes over Unix sockets and can hang rather than fail, which
+# is six wasted runner hours before anyone notices.
+jobs:
+  # Fast lane: builds + pure unit tests. No Frama-C needed.
+  #
+  # macOS is in this matrix because the build job below ships a macOS binary,
+  # and a released artifact whose test suite has never run on the target is a
+  # promise nobody checked. It is also where this server differs: process spawn,
+  # socket paths and signal handling are all platform behavior, and
+  # test-mcp-stdio already counts differently there, since
+  # e_acsl_catches_a_runtime_violation skips where e-acsl-gcc cannot run.
+  # Compiling for a platform is not the same as running on it.
+  rust-quick:
+    name: Rust unit / build (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-15]
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      # Shell is 4-space indented, matching the [*.sh] rule in the .editorconfig
+      # this repo does not track. The flag below is therefore the whole rule, not
+      # a restatement of one, and a drifted script fails here rather than in the
+      # next diff that happens to touch it.
+      #
+      # Linux only: the pinned download is a linux_amd64 binary, and the check
+      # reads tracked files, so running it twice would compare the same bytes
+      # against the same formatter.
+      - name: Shell formatting (shfmt -i 4)
+        if: runner.os == 'Linux'
+        run: |
+          curl -sSfL -o /tmp/shfmt https://github.com/mvdan/sh/releases/download/v3.13.1/shfmt_v3.13.1_linux_amd64
+          echo "fb096c5d1ac6beabbdbaa2874d025badb03ee07929f0c9ff67563ce8c75398b1  /tmp/shfmt" | sha256sum -c -
+          chmod +x /tmp/shfmt
+          git ls-files '*.sh' '*.hook' | xargs /tmp/shfmt -i 4 -d
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry & target
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.os }}
+
+      # Was local-only, in scripts/run-gates.sh and nowhere else, so the one
+      # gate that would catch a lint regression could not fail a push. The
+      # denial level lives in Cargo.toml, not in a -D here, so this command and
+      # the one a person types before pushing mean the same thing.
+      - name: Clippy
+        run: cargo clippy --all-targets
+
+      - name: Unit tests (no Frama-C)
+        run: cargo test --test unit
+
+      # --tests, matching the release gate in scripts/run-gates.sh. Without it
+      # the test targets are never compiled in release mode here, so a release
+      # only compile error in a test passes this lane and surfaces an hour
+      # later in the suite that spawns the binary from disk.
+      - name: Release build
+        run: cargo build --release --tests
+
+  # Reads the tree and nothing else, so it costs a minute and needs no
+  # toolchain. Kept a separate job rather than a step of the fast lane because
+  # its finding is about the documents, and a person reading a red run should
+  # see which of the two it was without opening a log.
+  artifact-scans:
+    name: Artifact scans
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - run: scripts/check-artifacts.sh
+
+  # Full lane: Frama-C + WP provers + the ast-utils plugin, then the
+  # integration / MCP-stdio suites that drive a real Frama-C server.
+  integration:
+    name: ast-utils plugin + Frama-C ${{ matrix.frama-c-version }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        frama-c-version: ["33.0"]
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Install WP provers (z3, cvc5)
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y z3 cvc5
+
+      - name: Setup OCaml
+        uses: ocaml/setup-ocaml@v3
+        with:
+          ocaml-compiler: "4.14.2"
+
+      - name: Validate Frama-C matrix version
+        run: |
+          case "${{ matrix.frama-c-version }}" in
+            33.0) ;;
+            *)
+              echo "Unsupported Frama-C CI version: ${{ matrix.frama-c-version }}" >&2
+              echo "Supported smoke-test version is 33.0." >&2
+              exit 1
+              ;;
+          esac
+
+      # Cache the whole opam state keyed by frama-c + compiler + OS: frama-c is
+      # not declared as a project dependency, so without this the ~10 min install
+      # repeats every run. setup-ocaml uses a project-local switch in ./_opam
+      # (OPAMROOT at ~/.opam holds global metadata + download cache), and frama-c
+      # binaries land in _opam/bin, so both paths must be cached.
+      - name: Cache opam state (~/.opam + _opam)
+        id: cache-opam
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.opam
+            _opam
+          key: ${{ runner.os }}-opam-ocaml-4.14.2-frama-c-${{ matrix.frama-c-version }}-alt-ergo-2.6.3-v2
+
+      # alt-ergo is named explicitly because it is an OPTIONAL dependency of
+      # frama-c, not a hard one. This step used to say "alt-ergo + why3 pulled
+      # as deps" and install frama-c alone: why3 did come along, alt-ergo did
+      # not, and "why3 config detect" then found something it could not put a
+      # version on ("Prover Alt-Ergo version  is not recognized"). WP ran it
+      # anyway, proved 24 of 33 goals where the baseline is 33, and the corpus
+      # gate reported eleven confusing count mismatches for one missing package.
+      #
+      # The version is pinned rather than left to the solver because
+      # scripts/check-tutorial-corpus.sh keys its per-fixture proved-goal counts
+      # to the prover, not to the Frama-C version, and every row in it was
+      # measured under 2.6.3. Moving this means re-measuring that table.
+      - name: Install Frama-C ${{ matrix.frama-c-version }} and Alt-Ergo 2.6.3
+        if: steps.cache-opam.outputs.cache-hit != 'true'
+        run: opam install -y frama-c.${{ matrix.frama-c-version }} alt-ergo.2.6.3
+
+      - name: Check installed Frama-C and Alt-Ergo versions
+        run: |
+          version="$(opam exec -- frama-c -version)"
+          case "$version" in
+            "${{ matrix.frama-c-version }}"*) ;;
+            *)
+              echo "Expected Frama-C ${{ matrix.frama-c-version }}, got: $version" >&2
+              exit 1
+              ;;
+          esac
+
+          # Checked here as well as inside the corpus gate, because the gate
+          # reads the version out of WP's own output and so can only report it
+          # after a fixture has run. This says which binary is installed, before
+          # anything is proved.
+          prover="$(opam exec -- alt-ergo --version)"
+          case "$prover" in
+            v2.6.3 | 2.6.3) ;;
+            *)
+              echo "Expected Alt-Ergo 2.6.3, got: ${prover:-nothing}" >&2
+              echo "scripts/check-tutorial-corpus.sh baselines are keyed to that version." >&2
+              exit 1
+              ;;
+          esac
+
+      # why3 keeps its prover registry in ~/.why3.conf (outside ~/.opam), so this
+      # must run even on a cache hit, otherwise WP finds no prover and every goal
+      # comes back NORESULT.
+      - name: Configure why3 (detect z3, cvc5, alt-ergo)
+        run: opam exec -- why3 config detect
+
+      # Every step below needs frama-c and the provers on PATH, and each one
+      # used to prepend the switch itself. Written once here it applies to the
+      # whole job, and it also stops hiding a failure: prepending inside an
+      # export makes the status that of the export rather than of the command
+      # substitution, so an opam that could not answer set an empty prefix and
+      # the step carried on to fail somewhere less obvious. This form fails
+      # where the problem is. It is the six SC2155 warnings shellcheck
+      # reported, and the reason they were worth listening to.
+      - name: Put the opam switch on PATH
+        run: opam var bin >> "$GITHUB_PATH"
+
+      - name: ast-utils, build & install plugin
+        working-directory: ast-utils
+        run: |
+          opam exec -- dune build
+          opam exec -- dune install
+          opam exec -- dune runtest
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry & target
+        uses: Swatinem/rust-cache@v2
+
+      - name: Frama-C version smoke tests
+        run: |
+          cargo build --release
+          # request compatibility and explicit capability probing
+          cargo test --test unit self_check_live_reports_frama_c_when_available -- --nocapture
+          # AST export and sandbox extraction
+          cargo test --test test-mcp-stdio create_sandbox_keeps_unused_static_target_function -- --nocapture
+          # EVA compute plus alarm fetch
+          cargo test --test test-mcp-stdio check_running_eva_alone_accepts_ilevel_and_echoes_options -- --nocapture
+          # WP run and model request compatibility
+          cargo test --test test-mcp-stdio run_wp_accepts_installed_model_modifiers -- --nocapture
+          # WP goal fetch
+          cargo test --test test-mcp-stdio wp_goals_surface_vacuous_call_precondition_status -- --nocapture
+          # ACSL validation and injection
+          cargo test --test test-mcp-stdio inject_all_accepts_global_acsl_first -- --nocapture
+
+      - name: Tutorial corpus WP shape gate
+        run: scripts/check-tutorial-corpus.sh
+
+      - name: Abs-int false-OK guard
+        run: scripts/check-abs-int-fixtures.sh
+
+      - name: Integration tests (live Frama-C server)
+        run: cargo test --test test-integration -- --test-threads=1
+
+      # Must stay after the "cargo build --release" above: test-process-lifecycle
+      # spawns target/release/frama-c-mcp from disk rather than the harness
+      # binary cargo just built, so moving this earlier tests a stale binary or
+      # no binary at all.
+      - name: Process lifecycle, reload and conclusion tests
+        run: |
+          cargo test --test test-process-lifecycle -- --test-threads=1
+          cargo test --test test-reload-project-regression -- --test-threads=1
+          cargo test --test test-store-conclusion -- --test-threads=1
+
+      - name: MCP stdio E2E tests
+        run: cargo test --test test-mcp-stdio --release -- --test-threads=1
+
+  # The MCP server half of the product, prebuilt. The ast-utils plugin is not
+  # here and cannot be: a .cmxs is tied to the exact OCaml and Frama-C the
+  # switch holds, so a downloaded one either refuses to load or loads against a
+  # different AST. README says so where it says how to download this.
+  #
+  # No Windows row. src/frama-c/transport.rs speaks tokio UnixStream, and
+  # Frama-C does not target Windows either.
+  build:
+    name: Binary ${{ matrix.name }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux x86_64
+            os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+          - name: macOS arm64
+            os: macos-15
+            target: aarch64-apple-darwin
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - run: cargo build --release --locked --target ${{ matrix.target }}
+      # A binary that ships having never been executed is a promise nobody
+      # checked. Both rows build natively, so the runner can run what it just
+      # produced. --help is enough to prove it links and starts: Frama-C is
+      # spawned lazily on the first project operation and is not installed in
+      # this job, so nothing further would run here anyway.
+      - name: Smoke-run the binary this job ships
+        run: ./target/${{ matrix.target }}/release/frama-c-mcp --help > /dev/null
+      # A tarball rather than a bare binary, because it carries the executable
+      # bit and HTTPS does not.
+      - name: Package
+        run: |
+          tar czf frama-c-mcp-${{ matrix.target }}.tar.gz \
+            -C target/${{ matrix.target }}/release frama-c-mcp
+      - uses: actions/upload-artifact@v7
+        with:
+          name: frama-c-mcp-${{ matrix.target }}
+          path: frama-c-mcp-${{ matrix.target }}.tar.gz
+
+  # A rolling "latest" release, so the newest main build is one download away
+  # instead of behind a login wall with a 90-day expiry, which is all the
+  # artifacts above are. It needs every other job, not only "build": shipping a
+  # binary whose suite went red is worse than shipping nothing. A matrix leg
+  # that fails still fails its job, so a broken macOS row skips this even under
+  # fail-fast: false.
+  #
+  # Delete and recreate rather than upload --clobber: the "latest" tag has to
+  # move to the commit that produced these binaries, and no gh invocation
+  # repoints an existing tag. That leaves a window where the release is gone and
+  # its replacement does not exist yet, which drives the care below. The assets
+  # are staged and named before anything is deleted, so a missing artifact fails
+  # while the old release is still up, and cancel-in-progress is off for main so
+  # nothing kills this job mid-window.
+  release:
+    needs: [rust-quick, artifact-scans, integration, build]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    concurrency:
+      group: release-latest
+      cancel-in-progress: false
+    # No checkout: nothing here reads the tree, and gh resolves the repository
+    # from GH_REPO rather than from a git remote.
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          # Without a pattern this collects every artifact in the run, so an
+          # artifact added to another job later would silently ship as a release
+          # asset.
+          pattern: frama-c-mcp-*
+          path: dist
+          merge-multiple: true
+      # Name every asset rather than counting them. A bare count passes when a
+      # target is renamed or swapped for another, which publishes the wrong set
+      # under a name users are told to trust, and these names are what README
+      # documents. The list duplicates the build matrix on purpose: Actions has
+      # no YAML anchors, and threading the targets through a setup job's
+      # fromJSON output buys one less duplicated line at the cost of a whole
+      # extra job. A rename fails here rather than shipping quietly, and
+      # released_tarball_names_match_the_build_matrix covers the copy in README,
+      # which this step cannot see.
+      - name: Stage assets
+        run: |
+          expected=(
+            frama-c-mcp-x86_64-unknown-linux-gnu.tar.gz
+            frama-c-mcp-aarch64-apple-darwin.tar.gz
+          )
+          shopt -s nullglob
+          found=(dist/*.tar.gz)
+          missing=()
+          for name in "${expected[@]}"; do
+            [ -f "dist/$name" ] || missing+=("$name")
+          done
+          if [ ${#missing[@]} -ne 0 ] || [ ${#found[@]} -ne ${#expected[@]} ]; then
+            echo "release assets do not match the expected set" >&2
+            echo "  missing: ${missing[*]:-none}" >&2
+            echo "  found:   ${found[*]:-none}" >&2
+            exit 1
+          fi
+          printf 'dist/%s\n' "${expected[@]}" > assets.txt
+      # Read the HTTP status rather than branching on gh's exit code. gh exits
+      # nonzero for every HTTP failure alike, so "if gh ... ; then" reads a 500,
+      # a revoked token or a DNS blip as "no release here" and walks straight
+      # into the deletions below. Only 200 and 404 are answers; anything else is
+      # an unknown state, and deleting from an unknown state is how the tag of a
+      # live release gets removed.
+      - name: Replace the latest release
+        run: |
+          status_of() {
+            gh api "$1" --silent -i 2>/dev/null | head -1 | awk '{print $2}'
+          }
+          require_answer() {
+            case "$1" in
+              200|404) return 0 ;;
+            esac
+            echo "unexpected status '${1:-none}' querying $2, aborting before any deletion" >&2
+            exit 1
+          }
+
+          release_status=$(status_of "repos/$GH_REPO/releases/tags/latest")
+          require_answer "$release_status" "the latest release"
+          if [ "$release_status" = 200 ]; then
+            gh release delete latest --yes --cleanup-tag
+          fi
+
+          # The tag can outlive the release: deleting a release in the web UI
+          # leaves its tag behind, and so does a run that got as far as the
+          # delete and then failed. "gh release create" ignores --target when the
+          # tag already exists (the API documents target_commitish as unused in
+          # that case), so a stale "latest" tag would publish these binaries
+          # under a release pointing at an older commit.
+          #
+          # Queried only after the delete above, because --cleanup-tag already
+          # removes the tag and a status read taken earlier would send us to
+          # delete a ref that no longer exists.
+          tag_status=$(status_of "repos/$GH_REPO/git/ref/tags/latest")
+          require_answer "$tag_status" "the latest tag"
+          if [ "$tag_status" = 200 ]; then
+            gh api -X DELETE "repos/$GH_REPO/git/refs/tags/latest" >/dev/null
+          fi
+
+          mapfile -t assets < assets.txt
+          gh release create latest "${assets[@]}" \
+            --target "$GITHUB_SHA" \
+            --title "latest" \
+            --notes "Automated build of ${GITHUB_SHA:0:7} on $(date -u +%Y-%m-%d). The ast-utils Frama-C plugin is not included; build it from source in your opam switch."

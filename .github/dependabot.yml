@@ -1,0 +1,17 @@
+# ci.yml names actions by major version, so upstream patches arrive on their own
+# and only a major bump needs a commit. This is what opens that pull request,
+# rather than leaving it to somebody noticing that v7 became v8.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+
+  # Cargo.lock is tracked so the released binaries are a function of the commit
+  # that produced them, which means a dependency fix now needs a commit here
+  # rather than arriving on its own at the next build.
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
