@@ -82,21 +82,9 @@ jobs:
         with:
           persist-credentials: false
 
-      # Shell is 4-space indented, matching the [*.sh] rule in the .editorconfig
-      # this repo does not track. The flag below is therefore the whole rule, not
-      # a restatement of one, and a drifted script fails here rather than in the
-      # next diff that happens to touch it.
-      #
-      # Linux only: the pinned download is a linux_amd64 binary, and the check
-      # reads tracked files, so running it twice would compare the same bytes
-      # against the same formatter.
       - name: Shell formatting (shfmt -i 4)
         if: runner.os == 'Linux'
-        run: |
-          curl -sSfL -o /tmp/shfmt https://github.com/mvdan/sh/releases/download/v3.13.1/shfmt_v3.13.1_linux_amd64
-          echo "fb096c5d1ac6beabbdbaa2874d025badb03ee07929f0c9ff67563ce8c75398b1  /tmp/shfmt" | sha256sum -c -
-          chmod +x /tmp/shfmt
-          git ls-files '*.sh' '*.hook' | xargs /tmp/shfmt -i 4 -d
+        run: .ci/check-shell-formatting.sh
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -163,15 +151,7 @@ jobs:
           ocaml-compiler: "4.14.2"
 
       - name: Validate Frama-C matrix version
-        run: |
-          case "${{ matrix.frama-c-version }}" in
-            33.0) ;;
-            *)
-              echo "Unsupported Frama-C CI version: ${{ matrix.frama-c-version }}" >&2
-              echo "Supported smoke-test version is 33.0." >&2
-              exit 1
-              ;;
-          esac
+        run: .ci/check-frama-c-matrix-version.sh '${{ matrix.frama-c-version }}'
 
       # Cache the whole opam state keyed by frama-c + compiler + OS: frama-c is
       # not declared as a project dependency, so without this the ~10 min install
@@ -204,29 +184,7 @@ jobs:
         run: opam install -y frama-c.${{ matrix.frama-c-version }} alt-ergo.2.6.3
 
       - name: Check installed Frama-C and Alt-Ergo versions
-        run: |
-          version="$(opam exec -- frama-c -version)"
-          case "$version" in
-            "${{ matrix.frama-c-version }}"*) ;;
-            *)
-              echo "Expected Frama-C ${{ matrix.frama-c-version }}, got: $version" >&2
-              exit 1
-              ;;
-          esac
-
-          # Checked here as well as inside the corpus gate, because the gate
-          # reads the version out of WP's own output and so can only report it
-          # after a fixture has run. This says which binary is installed, before
-          # anything is proved.
-          prover="$(opam exec -- alt-ergo --version)"
-          case "$prover" in
-            v2.6.3 | 2.6.3) ;;
-            *)
-              echo "Expected Alt-Ergo 2.6.3, got: ${prover:-nothing}" >&2
-              echo "scripts/check-tutorial-corpus.sh baselines are keyed to that version." >&2
-              exit 1
-              ;;
-          esac
+        run: .ci/check-installed-versions.sh '${{ matrix.frama-c-version }}'
 
       # why3 keeps its prover registry in ~/.why3.conf (outside ~/.opam), so this
       # must run even on a cache hit, otherwise WP finds no prover and every goal
@@ -259,20 +217,7 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Frama-C version smoke tests
-        run: |
-          cargo build --release
-          # request compatibility and explicit capability probing
-          cargo test --test unit self_check_live_reports_frama_c_when_available -- --nocapture
-          # AST export and sandbox extraction
-          cargo test --test test-mcp-stdio create_sandbox_keeps_unused_static_target_function -- --nocapture
-          # EVA compute plus alarm fetch
-          cargo test --test test-mcp-stdio check_running_eva_alone_accepts_ilevel_and_echoes_options -- --nocapture
-          # WP run and model request compatibility
-          cargo test --test test-mcp-stdio run_wp_accepts_installed_model_modifiers -- --nocapture
-          # WP goal fetch
-          cargo test --test test-mcp-stdio wp_goals_surface_vacuous_call_precondition_status -- --nocapture
-          # ACSL validation and injection
-          cargo test --test test-mcp-stdio inject_all_accepts_global_acsl_first -- --nocapture
+        run: .ci/frama-c-smoke-tests.sh
 
       - name: Tutorial corpus WP shape gate
         run: scripts/check-tutorial-corpus.sh
@@ -283,10 +228,10 @@ jobs:
       - name: Integration tests (live Frama-C server)
         run: cargo test --test test-integration -- --test-threads=1
 
-      # Must stay after the "cargo build --release" above: test-process-lifecycle
-      # spawns target/release/frama-c-mcp from disk rather than the harness
-      # binary cargo just built, so moving this earlier tests a stale binary or
-      # no binary at all.
+      # Must stay after the release build in .ci/frama-c-smoke-tests.sh:
+      # test-process-lifecycle spawns target/release/frama-c-mcp from disk
+      # rather than the harness binary cargo just built, so moving this earlier
+      # tests a stale binary or no binary at all.
       - name: Process lifecycle, reload and conclusion tests
         run: |
           cargo test --test test-process-lifecycle -- --test-threads=1
@@ -370,12 +315,22 @@ jobs:
     concurrency:
       group: release-latest
       cancel-in-progress: false
-    # No checkout: nothing here reads the tree, and gh resolves the repository
-    # from GH_REPO rather than from a git remote.
     env:
       GH_TOKEN: ${{ github.token }}
       GH_REPO: ${{ github.repository }}
     steps:
+      # Needed since the shell below moved into .ci/: this job runs two scripts
+      # out of the tree and would otherwise fail on the first push to main with
+      # no such file. It is first so that checkout's workspace clean cannot wipe
+      # the artifacts the next step downloads.
+      #
+      # persist-credentials matters more here than in the jobs above, not less:
+      # this is the one job with contents: write, so the default would write a
+      # token that can push to the repository into .git/config. Nothing here
+      # uses git; gh reads GH_TOKEN from the environment.
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
       - uses: actions/download-artifact@v8
         with:
           # Without a pattern this collects every artifact in the run, so an
@@ -384,77 +339,7 @@ jobs:
           pattern: frama-c-mcp-*
           path: dist
           merge-multiple: true
-      # Name every asset rather than counting them. A bare count passes when a
-      # target is renamed or swapped for another, which publishes the wrong set
-      # under a name users are told to trust, and these names are what README
-      # documents. The list duplicates the build matrix on purpose: Actions has
-      # no YAML anchors, and threading the targets through a setup job's
-      # fromJSON output buys one less duplicated line at the cost of a whole
-      # extra job. A rename fails here rather than shipping quietly, and
-      # released_tarball_names_match_the_build_matrix covers the copy in README,
-      # which this step cannot see.
       - name: Stage assets
-        run: |
-          expected=(
-            frama-c-mcp-x86_64-unknown-linux-gnu.tar.gz
-            frama-c-mcp-aarch64-apple-darwin.tar.gz
-          )
-          shopt -s nullglob
-          found=(dist/*.tar.gz)
-          missing=()
-          for name in "${expected[@]}"; do
-            [ -f "dist/$name" ] || missing+=("$name")
-          done
-          if [ ${#missing[@]} -ne 0 ] || [ ${#found[@]} -ne ${#expected[@]} ]; then
-            echo "release assets do not match the expected set" >&2
-            echo "  missing: ${missing[*]:-none}" >&2
-            echo "  found:   ${found[*]:-none}" >&2
-            exit 1
-          fi
-          printf 'dist/%s\n' "${expected[@]}" > assets.txt
-      # Read the HTTP status rather than branching on gh's exit code. gh exits
-      # nonzero for every HTTP failure alike, so "if gh ... ; then" reads a 500,
-      # a revoked token or a DNS blip as "no release here" and walks straight
-      # into the deletions below. Only 200 and 404 are answers; anything else is
-      # an unknown state, and deleting from an unknown state is how the tag of a
-      # live release gets removed.
+        run: .ci/stage-release-assets.sh
       - name: Replace the latest release
-        run: |
-          status_of() {
-            gh api "$1" --silent -i 2>/dev/null | head -1 | awk '{print $2}'
-          }
-          require_answer() {
-            case "$1" in
-              200|404) return 0 ;;
-            esac
-            echo "unexpected status '${1:-none}' querying $2, aborting before any deletion" >&2
-            exit 1
-          }
-
-          release_status=$(status_of "repos/$GH_REPO/releases/tags/latest")
-          require_answer "$release_status" "the latest release"
-          if [ "$release_status" = 200 ]; then
-            gh release delete latest --yes --cleanup-tag
-          fi
-
-          # The tag can outlive the release: deleting a release in the web UI
-          # leaves its tag behind, and so does a run that got as far as the
-          # delete and then failed. "gh release create" ignores --target when the
-          # tag already exists (the API documents target_commitish as unused in
-          # that case), so a stale "latest" tag would publish these binaries
-          # under a release pointing at an older commit.
-          #
-          # Queried only after the delete above, because --cleanup-tag already
-          # removes the tag and a status read taken earlier would send us to
-          # delete a ref that no longer exists.
-          tag_status=$(status_of "repos/$GH_REPO/git/ref/tags/latest")
-          require_answer "$tag_status" "the latest tag"
-          if [ "$tag_status" = 200 ]; then
-            gh api -X DELETE "repos/$GH_REPO/git/refs/tags/latest" >/dev/null
-          fi
-
-          mapfile -t assets < assets.txt
-          gh release create latest "${assets[@]}" \
-            --target "$GITHUB_SHA" \
-            --title "latest" \
-            --notes "Automated build of ${GITHUB_SHA:0:7} on $(date -u +%Y-%m-%d). The ast-utils Frama-C plugin is not included; build it from source in your opam switch."
+        run: .ci/publish-latest-release.sh

@@ -62,6 +62,20 @@ impl McpHandle {
         Self::spawn_with_binary_frama_c_and_dir(release_binary(), &frama_c, Some(cwd))
     }
 
+    /// Spawn and hand-shake at a named protocol revision.
+    ///
+    /// Separate from spawn() because the handshake happens during spawn, and
+    /// re-initializing an already-initialized session is not the same thing.
+    pub fn spawn_test_binary_speaking(frama_c: &str, protocol_version: &str) -> Self {
+        let mut handle = Self::spawn_uninitialized(
+            PathBuf::from(env!("CARGO_BIN_EXE_frama-c-mcp")),
+            frama_c,
+            None,
+        );
+        handle.initialize_with_protocol(protocol_version);
+        handle
+    }
+
     pub fn spawn_test_binary_with_frama_c(frama_c: &str) -> Self {
         Self::spawn_with_binary_and_frama_c(
             PathBuf::from(env!("CARGO_BIN_EXE_frama-c-mcp")),
@@ -125,8 +139,52 @@ impl McpHandle {
         handle
     }
 
+    /// The process, started but not yet hand-shaken.
+    fn spawn_uninitialized(binary: PathBuf, frama_c: &str, cwd: Option<&Path>) -> Self {
+        assert!(
+            binary.exists(),
+            "MCP binary missing: {}\nRun `cargo build --release` first.",
+            binary.display()
+        );
+
+        let mut cmd = StdCommand::new(&binary);
+        cmd.arg("--frama-c")
+            .arg(frama_c)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        match cwd {
+            Some(cwd) => {
+                cmd.current_dir(cwd);
+            }
+            None => {
+                cmd.env("FRAMA_C_MCP_STATE_DIR", suite_state_dir());
+            }
+        }
+        let mut child = cmd.spawn().expect("spawn MCP server");
+        let pid = child.id();
+        let stdin = Some(child.stdin.take().unwrap());
+        let stdout = BufReader::new(child.stdout.take().unwrap());
+        Self {
+            child,
+            stdin,
+            stdout,
+            pid,
+            last_response_bytes: 0,
+        }
+    }
+
     fn initialize(&mut self) {
-        let init = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"stdio-test","version":"0"}}}"#;
+        self.initialize_with_protocol("2024-11-05");
+    }
+
+    /// Hand-shake naming a protocol revision, for the tests that care which one
+    /// was negotiated rather than only that a session exists.
+    pub fn initialize_with_protocol(&mut self, protocol_version: &str) {
+        let init = format!(
+            r#"{{"jsonrpc":"2.0","id":1,"method":"initialize","params":{{"protocolVersion":"{protocol_version}","capabilities":{{}},"clientInfo":{{"name":"stdio-test","version":"0"}}}}}}"#
+        );
+        let init = init.as_str();
         let notify = r#"{"jsonrpc":"2.0","method":"notifications/initialized","params":{}}"#;
         let stdin = self.stdin.as_mut().expect("stdin");
         writeln!(stdin, "{}", init).unwrap();

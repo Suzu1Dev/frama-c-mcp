@@ -259,6 +259,16 @@ async fn self_check_capabilities_shape_with_missing_frama_c() {
     let payload = &payload["capabilities"];
     assert_eq!(payload["server"]["tool_count"], MCP_TOOL_COUNT);
     assert_eq!(payload["server"]["protocol_version"], "2024-11-05");
+
+    // The revisions this server agrees to, reported rather than assumed. 2026
+    // -07-28 is absent on purpose: it turns on SEP-2322 resultType and the
+    // SEP-2164 error-code remap, which nothing here has been tested against.
+    // Listing them here means adding one is a visible change to this test
+    // rather than a silent widening of what the server accepts.
+    assert_eq!(
+        payload["server"]["supported_protocol_versions"],
+        serde_json::json!(["2024-11-05", "2025-03-26", "2025-06-18", "2025-11-25"])
+    );
     assert_eq!(payload["frama_c"]["status"], "missing");
     assert_eq!(payload["wp"]["memory_model"]["default"], "Typed+nocast");
     assert!(payload["wp"]["memory_model"]["supported"]
@@ -2047,4 +2057,61 @@ fn unconstrained_assigns_prefers_the_resolved_leaf() {
     // A null leaf falls back to reading the printed target rather than being
     // dropped.
     assert!(targets.contains(&"*(gx ? p : q)"), "{findings:?}");
+}
+
+/// Every revision rmcp knows is either supported or excluded on purpose.
+///
+/// Cargo.toml asks for rmcp "3", so `cargo update` can extend
+/// `ProtocolVersion::KNOWN_VERSIONS` without any diff in this repository. The
+/// list of supported revisions would then quietly stop covering what the SDK
+/// offers, clients asking for the new one would negotiate down to the fallback,
+/// and nothing would say so. The assertion that used to stand here compared the
+/// const against a hand-copied literal, which agrees with it by construction
+/// and
+/// so could not catch that at all.
+///
+/// A new revision fails here until someone reads its SEPs and puts it in one
+/// list or the other, which is the deliberate decision the const's comment asks
+/// for.
+#[test]
+fn supported_protocol_versions_cover_every_known_revision() {
+    use rmcp::model::ProtocolVersion;
+
+    let excluded: Vec<&ProtocolVersion> =
+        EXCLUDED_PROTOCOL_VERSIONS.iter().map(|(version, _)| version).collect();
+
+    let unaccounted: Vec<&str> = ProtocolVersion::KNOWN_VERSIONS
+        .iter()
+        .filter(|known| {
+            !SUPPORTED_PROTOCOL_VERSIONS.contains(known) && !excluded.contains(known)
+        })
+        .map(ProtocolVersion::as_str)
+        .collect();
+    assert!(
+        unaccounted.is_empty(),
+        "rmcp knows protocol revisions this server neither supports nor \
+         declines, so clients asking for them negotiate down with nobody \
+         having decided that: {unaccounted:?}"
+    );
+
+    // The other direction: an excluded revision that rmcp has dropped is a
+    // reason nobody needs any more, and a supported one it has dropped is a
+    // list that no longer describes anything.
+    for (version, _) in EXCLUDED_PROTOCOL_VERSIONS {
+        assert!(
+            ProtocolVersion::KNOWN_VERSIONS.contains(version),
+            "{} is declined but rmcp no longer knows it",
+            version.as_str()
+        );
+    }
+    for version in SUPPORTED_PROTOCOL_VERSIONS {
+        assert!(
+            ProtocolVersion::KNOWN_VERSIONS.contains(version),
+            "{} is offered but rmcp no longer knows it",
+            version.as_str()
+        );
+    }
+
+    // The fallback has to be one this server would actually agree to.
+    assert!(SUPPORTED_PROTOCOL_VERSIONS.contains(&FALLBACK_PROTOCOL_VERSION));
 }

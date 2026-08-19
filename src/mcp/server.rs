@@ -6,7 +6,7 @@ use tokio::sync::{Mutex as AsyncMutex, RwLock};
 
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
-use rmcp::model::{CallToolResult, Content, ProtocolVersion, ServerCapabilities, ServerInfo};
+use rmcp::model::{CallToolResult, ContentBlock, ProtocolVersion, ServerCapabilities, ServerInfo};
 use rmcp::{tool, tool_handler, tool_router, ErrorData as McpError, ServerHandler};
 use serde_json::json;
 
@@ -1165,6 +1165,44 @@ pub fn sandbox_not_found_err(experiment_id: &str, existing: &[String]) -> McpErr
 
 pub const MCP_TOOL_COUNT: usize = 14;
 
+/// The revision a client gets when it asks for one rmcp does not recognize.
+///
+/// Named once and read by both get_info and self_check. It was spelled at both
+/// sites independently, under a comment claiming it was not.
+pub const FALLBACK_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::V_2024_11_05;
+
+/// The protocol revisions this server will agree to.
+///
+/// rmcp's default is ProtocolVersion::KNOWN_VERSIONS, which includes
+/// 2026-07-28. That revision is deliberately absent: it turns on SEP-2322,
+/// which adds a resultType field to every tool result, and the SEP-2164
+/// error-code remap, and neither has been exercised against this server's
+/// fourteen tools or the frozen result schema. Accepting a revision whose wire
+/// behavior nobody has looked at is a claim this repository cannot back, so a
+/// client asking for it negotiates down to the get_info fallback rather than
+/// getting untested semantics. Adding it back is a deliberate change with
+/// tests behind it, not a dependency bump.
+pub const SUPPORTED_PROTOCOL_VERSIONS: &[ProtocolVersion] = &[
+    ProtocolVersion::V_2024_11_05,
+    ProtocolVersion::V_2025_03_26,
+    ProtocolVersion::V_2025_06_18,
+    ProtocolVersion::V_2025_11_25,
+];
+
+/// Revisions rmcp knows and this server declines, with the reason attached.
+///
+/// Spelled as an exclusion rather than left implicit in what the list above
+/// omits, so supported_protocol_versions_cover_every_known_revision can check
+/// the two against rmcp's own set. Cargo.toml asks for rmcp "3", so a cargo
+/// update can add a revision with no diff here; without that test a new one
+/// would be declined silently and clients would negotiate down without anyone
+/// deciding to.
+pub const EXCLUDED_PROTOCOL_VERSIONS: &[(ProtocolVersion, &str)] = &[(
+    ProtocolVersion::V_2026_07_28,
+    "SEP-2322 adds resultType to every tool result and SEP-2164 remaps error \
+     codes; neither is exercised against the fourteen tools or the result schema",
+)];
+
 fn default_wp_provers() -> String {
     let mut provers = vec!["Alt-Ergo"];
     if executable_in_path("cvc5") {
@@ -1850,6 +1888,38 @@ pub struct FramaCMcpServer {
     max_sandboxes: usize,
     /// Path to frama-c binary (for spawning sandbox instances + main)
     frama_c_path: String,
+    /// The directory holding the AST printed for the most recent run_e_acsl
+    /// with use_current_ast.
+    ///
+    /// Held rather than dropped at the end of the call because the path is
+    /// reported as `instrumented` and callers read the file afterwards to see
+    /// what was handed to E-ACSL;
+    /// run_e_acsl_can_instrument_injected_annotations
+    /// is built on exactly that, since it is how the test stays meaningful on a
+    /// platform where e-acsl-gcc itself cannot run. Replacing the entry drops
+    /// the previous directory, so a session keeps one rather than one per call.
+    ///
+    /// Per server rather than per process: the old fixed path meant two servers
+    /// in one process, which lib.rs and the test harness both build, wrote over
+    /// each other's file.
+    ///
+    /// Outside the lock sequence above, and allowed to be: it is taken for a
+    /// single assignment and never held while acquiring another, so it cannot
+    /// take part in a cycle. Anything that later reads it for longer than that
+    /// has to be placed in the ordering first.
+    current_ast_dir: Arc<AsyncMutex<Option<tempfile::TempDir>>>,
+    /// The directory holding the inline source the loaded project was built
+    /// from, when `check` was given `source` rather than `files`.
+    ///
+    /// Tied to the session and not to the call. reload_project records the
+    /// paths it loaded in MainFramaCState::files, and run_wp, run_e_acsl and
+    /// the WP goal detail path all re-read that list from disk afterwards, so a
+    /// scratch directory dropped when check returned left the session pointing
+    /// at a file that no longer existed. check recommends those very calls as
+    /// the next step, so the broken sequence is the documented one. Replaced by
+    /// the next inline-source check, which is also when the session stops
+    /// referring to the old one.
+    current_check_source_dir: Arc<AsyncMutex<Option<tempfile::TempDir>>>,
     /// Main Frama-C process state (child + socket + files + rte).
     /// Replaces the old `main_frama_c_child: Option<Child>` - multiple
     /// sockets/files/rte to support
@@ -1910,10 +1980,64 @@ fn scope_for_function(function: &str) -> FunctionScope<'_> {
     }
 }
 
-fn json_result(value: &impl serde::Serialize) -> CallToolResult {
-    CallToolResult::success(vec![Content::text(
-        serde_json::to_string_pretty(value).unwrap_or_default(),
-    )])
+/// The one way a tool returns JSON.
+///
+/// Both halves when the payload is a JSON object. structuredContent is what a
+/// 2025-06-18 or later client should read, and it saves every caller a parse of
+/// a document that was serialized only to be turned back into one.
+///
+/// An object, and only an object. The schema types structuredContent as a JSON
+/// object, and a client that validates the result against that schema rejects
+/// the whole response rather than the one field: the TypeScript SDK parses it
+/// as an object with unknown keys, which an array fails. Five of the six kinds
+/// "list" answers are arrays, so setting it unconditionally broke that tool
+/// outright for any client on 2025-06-18 or later. A non-object payload keeps
+/// the text block alone, which is what every client understood before this
+/// field existed.
+///
+/// The text block stays, and stays pretty-printed. Clients below 2025-06-18 see
+/// only content, docs/reference/result-schema.md is written against that text,
+/// and this server's own readers parse it: see tool_result_json and the stdio
+/// tests. CallToolResult::structured is not used for the same reason, since it
+/// writes the compact form into content.
+///
+/// Takes the value rather than borrowing it. Every caller owns a Value and
+/// drops it on the next line, so borrowing meant serializing the document
+/// twice,
+/// once to text and once back into a Value that was a deep copy of the tree the
+/// caller was about to discard. On a check with detail "full" that copy is
+/// around 21,000 nodes.
+fn json_result(value: serde_json::Value) -> CallToolResult {
+    let mut result = CallToolResult::success(vec![ContentBlock::text(
+        serde_json::to_string_pretty(&value).unwrap_or_default(),
+    )]);
+    if value.is_object() {
+        result.structured_content = Some(value);
+    }
+    result
+}
+
+/// A temporary directory only this user can enter, removed when the guard drops.
+///
+/// tempfile picks the random O_EXCL name, which is what closes the pre-created
+/// symlink class. It does not pick the mode: Builder::tempdir creates the
+/// directory with the process default, so under the usual umask of 022 it is
+/// 0755 and under a permissive one it is group or world writable. That matters
+/// most where the directory holds a compiled executable this server then runs,
+/// so the mode is asked for here rather than assumed.
+#[cfg(unix)]
+fn private_temp_dir(prefix: &str) -> std::io::Result<tempfile::TempDir> {
+    use std::os::unix::fs::PermissionsExt;
+
+    tempfile::Builder::new()
+        .prefix(prefix)
+        .permissions(std::fs::Permissions::from_mode(0o700))
+        .tempdir()
+}
+
+#[cfg(not(unix))]
+fn private_temp_dir(prefix: &str) -> std::io::Result<tempfile::TempDir> {
+    tempfile::Builder::new().prefix(prefix).tempdir()
 }
 
 async fn reload_fetch(
@@ -2389,6 +2513,8 @@ impl FramaCMcpServer {
             sandboxes: Arc::new(RwLock::new(SandboxRegistry::default())),
             max_sandboxes,
             frama_c_path,
+            current_ast_dir: Arc::new(AsyncMutex::new(None)),
+            current_check_source_dir: Arc::new(AsyncMutex::new(None)),
             main_frama_c_state: Arc::new(AsyncMutex::new(None)),
             main_spawn_lock: Arc::new(AsyncMutex::new(())),
             project_locked: Arc::new(RwLock::new(false)),
@@ -2605,7 +2731,7 @@ impl FramaCMcpServer {
             report_function,
         )
         .await?;
-        Ok(json_result(&response))
+        Ok(json_result(response))
     }
 
     /// Kill a sandbox Frama-C process and clean up state.
@@ -3336,7 +3462,15 @@ impl FramaCMcpServer {
             "server": {
                 "version": env!("CARGO_PKG_VERSION"),
                 "tool_count": MCP_TOOL_COUNT,
-                "protocol_version": "2024-11-05",
+
+                // The fallback, not the negotiated version of any one session:
+                // this payload is built without a peer, and a client that asked
+                // for a later revision got that one on the wire. The list of
+                // revisions this server agrees to is beside it so the two
+                // cannot drift. ProtocolVersion serializes as its bare string,
+                // so neither needs converting here.
+                "protocol_version": FALLBACK_PROTOCOL_VERSION,
+                "supported_protocol_versions": SUPPORTED_PROTOCOL_VERSIONS,
             },
             "processes": self_check["processes"].clone(),
             "frama_c": self_check["frama_c"].clone(),
@@ -3797,19 +3931,72 @@ fn parse_conclusion_status(s: &str) -> Result<crate::state::VerificationStatus, 
 
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for FramaCMcpServer {
+    /// Route the call, then take structuredContent back off it for a peer whose
+    /// protocol revision predates the field.
+    ///
+    /// structuredContent arrived in 2025-06-18. This server also agrees to
+    /// 2024-11-05 and 2025-03-26, and json_result fills the field for every tool
+    /// that answers with an object, so those peers were being sent a key their
+    /// revision does not define. Most clients ignore what they do not know; one
+    /// that validates its input is entitled not to.
+    ///
+    /// Done here rather than at the twenty-seven call sites because this is the
+    /// one place a response leaves the server, and because the negotiated
+    /// version is only knowable here: it is a property of the peer, not of the
+    /// payload. It is also what rmcp does one revision later, stripping
+    /// resultType for peers below 2026-07-28.
+    ///
+    /// tool_handler generates this method only when the impl does not already
+    /// define it, so writing it here replaces the generated one and the routing
+    /// line below is the body it would have had.
+    async fn call_tool(
+        &self,
+        request: rmcp::model::CallToolRequestParams,
+        context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> Result<rmcp::model::CallToolResponse, McpError> {
+        // Read before the context moves into the call. An absent version is a
+        // peer that never completed a handshake this server saw, so treat it as
+        // the oldest thing it agrees to rather than assuming the newest.
+        let structured_is_known = context
+            .protocol_version()
+            .is_some_and(|version| version.as_str() >= ProtocolVersion::V_2025_06_18.as_str());
+
+        let tcc = rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
+        let mut response = self.tool_router.call(tcc).await?;
+
+        if !structured_is_known {
+            if let rmcp::model::CallToolResponse::Complete(result) = &mut response {
+                // The text block carries the same document, so nothing is lost:
+                // docs/reference/result-schema.md is written against it and it
+                // is what these revisions have always read.
+                result.structured_content = None;
+            }
+        }
+        Ok(response)
+    }
+
     fn get_info(&self) -> ServerInfo {
-        // ServerInfo (alias for InitializeResult) is #[non_exhaustive] in rmcp
-        // 1.x; can't use struct literal, go via ::new plus with_* builder.
+        // ServerInfo (alias for InitializeResult) is #[non_exhaustive], so this
+        // goes via ::new plus with_* builders rather than a struct literal.
         //
-        // Pin protocol_version to 2024-11-05: rmcp 1.x default is LATEST
-        // (2025-11-25) which exceeds Claude Code 2.1.146's known set; pin to
-        // the oldest broadly-supported version as defensive hardening (mirrors
-        // fv-core-mcp).
+        // with_protocol_version sets the FALLBACK, not a pin. rmcp's
+        // negotiate_protocol_version echoes whatever the client asked for
+        // whenever supported_protocol_versions contains it, and only reaches
+        // for this value when the requested string is one it does not know. The
+        // comment here used to call it a pin and credit rmcp 1.x with a LATEST
+        // default it would be holding back; neither was ever true, in 1.x or in
+        // 3.x, so anything reasoned from it was wrong. The revisions this
+        // server will actually agree to are below, in
+        // supported_protocol_versions.
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
             .with_instructions(
                 "Frama-C formal verification server. Provides EVA abstract interpretation, \
                  WP deductive verification, and CIL AST navigation."
             )
-            .with_protocol_version(ProtocolVersion::V_2024_11_05)
+            .with_protocol_version(FALLBACK_PROTOCOL_VERSION)
+    }
+
+    fn supported_protocol_versions(&self) -> std::borrow::Cow<'static, [ProtocolVersion]> {
+        std::borrow::Cow::Borrowed(SUPPORTED_PROTOCOL_VERSIONS)
     }
 }

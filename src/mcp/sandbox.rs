@@ -286,7 +286,7 @@ impl FramaCMcpServer {
             }
         }
 
-        Ok(json_result(&json!({
+        Ok(json_result(json!({
             "sandbox_name": sandbox_name,
             "experiment_id": experiment_id,
             "ast_stmt_count": ast_stmt_count,
@@ -335,9 +335,7 @@ impl FramaCMcpServer {
             self.mark_sandbox_deleted(&func).await;
         }
 
-        Ok(CallToolResult::success(vec![Content::text(
-            json!({"success": true}).to_string(),
-        )]))
+        Ok(json_result(json!({"success": true})))
     }
 
 }

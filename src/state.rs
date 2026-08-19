@@ -3,6 +3,32 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+/// A SHA-256 digest as lower case hex, two digits per byte, no separator.
+///
+/// Spelled out rather than reached through "{:x}", because sha2 0.11 returns an
+/// Array where 0.10 returned a GenericArray and only the latter implemented
+/// LowerHex. The output has to stay exactly what the old formatter produced.
+/// Every proof receipt and stored conclusion on disk carries a hash written by
+/// the old code, and a receipt is the whole basis on which two runs are called
+/// comparable, so a different spelling would not fail, it would quietly stop
+/// matching. sha256_hex_is_lowercase_unseparated pins that.
+///
+/// One home, because there were three: this, a hand-rolled write! loop, and an
+/// eight-way {:02x} format string in wpclass for the first eight bytes.
+pub fn sha256_hex(bytes: &[u8]) -> String {
+    use std::fmt::Write;
+
+    // One buffer, sized up front. The map-and-collect spelling allocates a
+    // String per byte, 33 allocations against this one, and wpclass hashes once
+    // per WP goal.
+    let mut out = String::with_capacity(64);
+    for byte in Sha256::digest(bytes) {
+        // Writing to a String cannot fail; the Result exists for the trait.
+        let _ = write!(out, "{byte:02x}");
+    }
+    out
+}
+
 /// Serializable metadata for a sandbox Frama-C instance.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SandboxMetadata {
@@ -869,7 +895,7 @@ impl SessionState {
 
     fn specs_hash(specs: &[AnnotationEntry]) -> String {
         let bytes = serde_json::to_vec(specs).unwrap_or_default();
-        format!("{:x}", Sha256::digest(&bytes))
+        sha256_hex(&bytes)
     }
 
     fn proof_environment_hash(receipt: &serde_json::Value) -> String {
@@ -877,7 +903,7 @@ impl SessionState {
             .get("environment")
             .and_then(|environment| serde_json::to_vec(environment).ok())
             .unwrap_or_default();
-        format!("{:x}", Sha256::digest(&bytes))
+        sha256_hex(&bytes)
     }
 
     // sandbox lifecycle side effects (§13.6 changed 5/15)

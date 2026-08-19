@@ -1283,3 +1283,39 @@ fn clean_run_still_reports_no_timeout_evidence() {
     let triage = wp_timeout_triage_from_tasks_and_report(&drained, None);
     assert_eq!(triage["kind"], "none", "{triage:?}");
 }
+
+/// A computed stable goal id, pinned to a literal.
+///
+/// Every other stable_goal_id in this file is a synthetic input ("sg_a"), so
+/// until this test nothing ran the digest that produces a real one. That gap
+/// was found the day the eight-way {:02x} format string in stable_goal_id_for
+/// was replaced by a slice of the shared sha256_hex: the two spell the same
+/// bytes, and no test could have said so.
+///
+/// The id is a join key. It appears in stored conclusions and proof receipts,
+/// and a run is compared to an earlier one by matching them, so a change to
+/// how it is spelled does not fail, it silently stops joining. Pin it.
+#[test]
+fn stable_goal_id_is_sixteen_hex_characters_of_the_payload_digest() {
+    let mut goal = json!({
+        "fct": "abs",
+        "descr": "Post-condition",
+        "source": {"file": "abs.c", "line": 12},
+    });
+    enrich_goal_stable_id(&mut goal, "spec", None);
+
+    let id = goal["stable_goal_id"].as_str().expect("stable_goal_id");
+    let hex = id.strip_prefix("sg_").expect("sg_ prefix");
+
+    // Measured against the eight-way {:02x} format string this replaced, not
+    // copied from the new implementation: both spell 682ebebdbb98c969 for this
+    // goal, which is what makes the two interchangeable. The literal pins the
+    // length and the character class too, so neither needs its own assertion.
+    assert_eq!(hex, "682ebebdbb98c969", "{id}");
+
+    // A hash_label wins outright, unhashed. receipt.rs and server.rs both
+    // document depending on this.
+    let mut labelled = json!({"hash_label": "re_0badf00d", "fct": "abs"});
+    enrich_goal_stable_id(&mut labelled, "spec", None);
+    assert_eq!(labelled["stable_goal_id"], "re_0badf00d");
+}

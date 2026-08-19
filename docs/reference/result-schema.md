@@ -87,6 +87,39 @@ The same table is in README, and `src/mcp/analysis.rs` names the codes once in
 `incomplete_code`. A test asserts all three agree, so a code added in one place
 and not the others fails the build rather than a consumer.
 
+## Where the payload appears in an MCP result
+
+Twice, and identically, whenever the payload is a JSON object. Every tool sets:
+
+- `content[0]`, a text block holding this document pretty-printed. This is what
+  a client below protocol revision 2025-06-18 sees, it is what the schema above
+  describes, and it is always set.
+- `structuredContent`, the same document as JSON rather than as a string, set
+  only when that document is an object. A client that reads it skips a parse of
+  a document that was serialized only to be parsed again.
+
+They are the same value, moved rather than serialized twice, so a consumer may
+read either. The text block is not going away: it predates `structuredContent`,
+the older revisions have nothing else, and this server's own readers parse it.
+
+The object condition is not a nicety. The schema types `structuredContent` as a
+JSON object, and a client that validates the result against it rejects the whole
+response rather than the one field: the TypeScript SDK parses it as an object
+with unknown keys, which an array fails. Five of the six kinds `list` answers
+are arrays, so a payload that is not an object sets the text block alone, which
+is what every client understood before this field existed.
+
+Every tool that returns JSON goes through one function, `json_result`, which is
+what makes that true of all of them rather than of most. The single exception
+returns no JSON at all: `context` asked for one `want` of `source` answers with
+raw C, which must not be wrapped in a JSON string, and so sets a text block
+alone.
+
+There is no `outputSchema` on any tool. The payloads are assembled as ad-hoc
+JSON rather than from Rust types, so there is nothing for rmcp to derive one
+from, and a hand-written schema that drifts from this page would be worse than
+none.
+
 ## What is not frozen
 
 - The contents of `reload`, `eva`, `wp`, and the entries of `eva_alarms` and

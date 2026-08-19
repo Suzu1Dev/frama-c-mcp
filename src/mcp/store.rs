@@ -9,10 +9,11 @@ use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
 
 use rmcp::ErrorData as McpError;
-use sha2::{Digest, Sha256};
 use serde_json::json;
 
-use crate::state::{FunctionVerificationState, ProjectVerificationState, SandboxMetadata};
+use crate::state::{
+    sha256_hex, FunctionVerificationState, ProjectVerificationState, SandboxMetadata,
+};
 
 /// Long-text conclusion fields, paired with what a missing .md file reads back
 /// as. These live in <conclusion_dir>/<field>.md instead of meta.json, because
@@ -391,8 +392,4 @@ pub fn load_conclusions_from_disk(base_dir: &Path) -> HashMap<String, FunctionVe
         }
     }
     out
-}
-
-pub fn sha256_hex(bytes: &[u8]) -> String {
-    format!("{:x}", Sha256::digest(bytes))
 }

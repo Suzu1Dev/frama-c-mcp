@@ -98,7 +98,7 @@ impl FramaCMcpServer {
         if params.canary.unwrap_or(false) {
             result["canary"] = self.canary_payload().await;
         }
-        Ok(json_result(&result))
+        Ok(json_result(result))
     }
 
     #[tool(
@@ -220,7 +220,7 @@ impl FramaCMcpServer {
             "messages": messages,
             "messages_truncated": truncated,
         });
-        Ok(json_result(&result))
+        Ok(json_result(result))
     }
 
     /// Declaration of one function. Sandbox instances keep no function cache,
@@ -532,7 +532,7 @@ impl FramaCMcpServer {
             ListKind::Sandboxes => self.sandbox_list_payload().await?,
             ListKind::Conclusions => self.conclusions_payload(params.status, params.function).await?,
         };
-        Ok(json_result(&result))
+        Ok(json_result(result))
     }
 }
 

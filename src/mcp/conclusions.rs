@@ -81,14 +81,14 @@ impl FramaCMcpServer {
             // `durable` is separate from `stored` so a caller reading only the
             // success key cannot mistake an in-memory update for one that
             // reached disk.
-            return Ok(json_result(&json!({
+            return Ok(json_result(json!({
                 "stored": func_name,
                 "durable": false,
                 "persist_errors": persist_errors,
             })));
         }
 
-        Ok(json_result(&json!({"stored": func_name})))
+        Ok(json_result(json!({"stored": func_name})))
     }
 
     pub async fn conclusions_payload(

@@ -1,4 +1,9 @@
-use rmcp::model::{CallToolResult, Content};
+use rmcp::model::{CallToolResult, ContentBlock};
+
+/// A plugin response as a tool result, which is how the parsers below read one.
+fn plugin_result(json: serde_json::Value) -> CallToolResult {
+    CallToolResult::success(vec![ContentBlock::text(json.to_string())])
+}
 use serde_json::json;
 use frama_c_mcp::mcp::types::*;
 use frama_c_mcp::mcp::server::wpclass::*;
@@ -13,8 +18,7 @@ fn parse_plugin_success_wrapped_result() {
         "result": {"success": true, "error": null},
         "hash_label": "re_12345678"
     });
-    let content = Content::text(json.to_string());
-    let result = CallToolResult::success(vec![content]);
+    let result = plugin_result(json);
     assert!(parse_plugin_success(&result));
 }
 
@@ -24,8 +28,7 @@ fn parse_plugin_success_false_wrapped() {
         "result": {"success": false, "error": "ACSL syntax error in function contract"},
         "hash_label": "an_12345678"
     });
-    let content = Content::text(json.to_string());
-    let result = CallToolResult::success(vec![content]);
+    let result = plugin_result(json);
     assert!(!parse_plugin_success(&result));
 }
 
@@ -35,8 +38,7 @@ fn parse_plugin_error_wrapped_result() {
         "result": {"success": false, "error": "unbound logic variable i"},
         "hash_label": "an_12345678"
     });
-    let content = Content::text(json.to_string());
-    let result = CallToolResult::success(vec![content]);
+    let result = plugin_result(json);
     assert_eq!(parse_plugin_error(&result), Some("unbound logic variable i".to_string()));
 }
 

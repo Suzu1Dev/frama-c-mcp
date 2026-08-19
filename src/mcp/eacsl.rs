@@ -278,23 +278,21 @@ pub async fn run_e_acsl_counterexample(
         Err(payload) => return payload,
     };
 
-    let unique = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| duration.as_nanos())
-        .unwrap_or_default();
-    let out_dir = std::env::temp_dir().join(format!(
-        "frama-c-mcp-e-acsl-{}-{}",
-        std::process::id(),
-        unique
-    ));
-    if let Err(error) = std::fs::create_dir_all(&out_dir) {
-        return json!({
-            "status": "error",
-            "error": format!("create temp dir: {error}"),
-            "path": out_dir.display().to_string(),
-        });
-    }
-    let output_exec = out_dir.join("run");
+    // A random O_EXCL name at mode 0700 rather than pid plus a clock reading.
+    // What lands here is a compiled executable this function then runs, so the
+    // directory has to be one nobody else can write into, which is why the mode
+    // is asked for rather than left to the umask. The guard is bound for the
+    // whole call, which is also what removes it.
+    let out_dir = match private_temp_dir("frama-c-mcp-e-acsl-") {
+        Ok(dir) => dir,
+        Err(error) => {
+            return json!({
+                "status": "error",
+                "error": format!("create temp dir: {error}"),
+            });
+        }
+    };
+    let output_exec = out_dir.path().join("run");
     let instrumented_exec = PathBuf::from(format!("{}.e-acsl", output_exec.display()));
 
     let args = match compile_args(
@@ -305,16 +303,12 @@ pub async fn run_e_acsl_counterexample(
         &output_exec,
     ) {
         Ok(args) => args,
-        Err(payload) => {
-            let _ = std::fs::remove_dir_all(&out_dir);
-            return payload;
-        }
+        Err(payload) => return payload,
     };
 
     let timeout = Duration::from_secs(timeout_seconds.max(1));
     let compile_payload = compile_step(&tool, args, timeout).await;
     if compile_payload["status"] != "ok" {
-        let _ = std::fs::remove_dir_all(&out_dir);
         return json!({
             "status": "compile_error",
             "compile": compile_payload,
@@ -323,8 +317,10 @@ pub async fn run_e_acsl_counterexample(
         });
     }
 
+    // out_dir's guard is dropped when this function returns, on every path,
+    // which is what the three hand-written removes here used to do one exit at
+    // a time.
     let run_payload = run_step(&instrumented_exec, program_args, timeout).await;
-    let _ = std::fs::remove_dir_all(&out_dir);
 
     json!({
         "status": run_payload["status"].clone(),

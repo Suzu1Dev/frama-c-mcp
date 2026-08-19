@@ -1074,3 +1074,49 @@ fn annotation_count_zero_on_empty_specs() {
     }).expect("store_conclusion");
     assert_eq!(state.get_conclusion("f").unwrap().annotation_count, 0);
 }
+
+/// sha256_hex is lower case, two digits per byte, no separator.
+///
+/// Pinned against published vectors rather than against itself, because the
+/// spelling is a compatibility surface and not an implementation detail. Every
+/// proof receipt and stored conclusion already on disk carries a hash written
+/// by the sha2 0.10 GenericArray LowerHex formatter, and a receipt is the whole
+/// basis on which two runs are called comparable. A rewrite emitting upper case
+/// or colon-separated hex would not fail anything, it would quietly stop
+/// matching, and before this test it passed all thirteen gates.
+///
+/// The vectors are themselves 64 lower case unseparated hex characters, so they
+/// pin the length and the alphabet that store.rs and wpclass.rs slice into
+/// without needing a separate assertion for either.
+#[test]
+fn sha256_hex_is_lowercase_unseparated() {
+    assert_eq!(
+        sha256_hex(b""),
+        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    );
+    assert_eq!(
+        sha256_hex(b"abc"),
+        "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+    );
+}
+
+/// Two runs of the same inline source produce the same receipt subject.
+///
+/// A receipt exists so two runs can be compared by their hashes, and the scratch
+/// directory a check writes inline source into is chosen fresh every call, so
+/// digesting its name made every such run incomparable with every other. The old
+/// pid-shaped name hid this by being constant for a session; moving to a random
+/// name is what surfaced it.
+#[test]
+fn receipt_subject_ignores_the_check_scratch_directory() {
+    use frama_c_mcp::mcp::server::receipt::receipt_source_path;
+
+    assert_eq!(receipt_source_path("/tmp/frama-c-check-AbC123/input.c"), "input.c");
+    assert_eq!(receipt_source_path("/tmp/frama-c-check-ZzZ999/input.c"), "input.c");
+
+    // A real project file keeps its path: that one names something a reader can
+    // go and look at, and two projects with a like-named file are not the same
+    // subject.
+    assert_eq!(receipt_source_path("/home/me/proj/abs.c"), "/home/me/proj/abs.c");
+    assert_eq!(receipt_source_path("/tmp/other-dir/input.c"), "/tmp/other-dir/input.c");
+}
