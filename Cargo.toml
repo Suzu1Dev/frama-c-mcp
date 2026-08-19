@@ -6,7 +6,7 @@ edition = "2021"
 [dependencies]
 # MCP protocol (official Rust SDK).
 # Aligned with fv-core-mcp + mcp-server-fsm (both on 1.x).
-rmcp = { version = "1", features = ["server", "transport-io", "macros"] }
+rmcp = { version = "3", features = ["server", "transport-io", "macros"] }
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }
@@ -62,7 +62,7 @@ tempfile = "3"
 # MCP client side + child-process transport for end-to-end stdio JSON-RPC tests.
 # Used by tests/mcp_stdio_test.rs to spawn the server binary and drive it
 # through the actual MCP wire protocol (no internal-API shortcuts).
-rmcp = { version = "1", features = ["client", "transport-child-process"] }
+rmcp = { version = "3", features = ["client", "transport-child-process"] }
 
 # The clippy gate ran as `cargo clippy --all-targets` with no -D, so a warning
 # left the exit status at 0 and the runner printed "passed". Denying here rather
