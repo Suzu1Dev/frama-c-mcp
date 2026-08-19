@@ -126,6 +126,17 @@ fn tutorial_corpus_filenames_and_local_includes_are_stable() {
 fn cli_check_subcommand_help_exposes_json_shape() {
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_frama-c-mcp"))
         .args(["check", "--help"])
+        // Colour is pinned rather than inherited, because this is the one test
+        // that reads clap's rendering instead of our own JSON. clap colours
+        // through anstream, which honours CLICOLOR_FORCE even when stdout is
+        // not a terminal, and ocaml/setup-ocaml exports CLICOLOR_FORCE=1 into
+        // every step of the job that installs Frama-C. So in CI the usage line
+        // arrives wrapped in SGR escapes, the substring below falls between
+        // them, and the test failed on a machine where nothing about the CLI
+        // had changed. NO_COLOR as well as the removal, so the answer does not
+        // depend on which of the two anstream consults first.
+        .env_remove("CLICOLOR_FORCE")
+        .env("NO_COLOR", "1")
         .output()
         .expect("run check help");
 
@@ -701,15 +712,12 @@ fn tool_registry_count_matches_declared_snapshots() {
         );
     }
 
-    let claude = std::fs::read_to_string(workspace_path("CLAUDE.md")).expect("read CLAUDE.md");
-    assert!(
-        claude
-            .lines()
-            .nth(10)
-            .is_some_and(|line| line.contains(&format!("**{expected} tools**"))),
-        "CLAUDE.md:11 tool count is stale"
-    );
-
+    // The tool count used to be pinned in CLAUDE.md here as well. That file is
+    // not part of the repository, so a checkout has no such line to read and
+    // this panicked before it could assert anything. docs/architecture.md below
+    // and README's tool table, which
+    // tool_router_matches_the_documented_surface compares against the router,
+    // are the copies a reader of this repository actually gets.
     let architecture = std::fs::read_to_string(workspace_path("docs/architecture.md"))
         .expect("read docs/architecture.md");
     assert!(

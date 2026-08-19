@@ -89,6 +89,37 @@ unbound modules in files you did not touch.
 After changing the plugin, run `dune clean && dune build && dune install`.
 Incremental builds may not relink the installed `.cmxs`.
 
+### Prebuilt binaries
+
+Every push to `main` that passes the full test lane replaces a rolling
+[`latest` release][latest], so the download link never moves:
+
+[latest]: https://github.com/sysprog21/frama-c-mcp/releases/tag/latest
+
+```bash
+# Linux x86_64
+curl -sSfL -o frama-c-mcp.tar.gz \
+    https://github.com/sysprog21/frama-c-mcp/releases/download/latest/frama-c-mcp-x86_64-unknown-linux-gnu.tar.gz
+
+# macOS arm64
+curl -sSfL -o frama-c-mcp.tar.gz \
+    https://github.com/sysprog21/frama-c-mcp/releases/download/latest/frama-c-mcp-aarch64-apple-darwin.tar.gz
+
+tar xzf frama-c-mcp.tar.gz
+mkdir -p ~/.local/bin
+install -m 755 frama-c-mcp ~/.local/bin/
+```
+
+There is no Windows build: the transport speaks Unix sockets and Frama-C does
+not target Windows either.
+
+The tarball holds the Rust MCP server and nothing else. It is half the product:
+most tools return `invalid` without the `ast-utils` plugin, and that plugin
+still has to be built from source in the opam switch holding your Frama-C,
+because a `.cmxs` is tied to the exact OCaml and Frama-C that compiled it. So a
+download is `dune build && dune install` under [Build](#build) plus this binary
+in place of `cargo build --release`, not a way to skip the switch.
+
 ### Install
 
 ```bash
@@ -487,9 +518,13 @@ scripts/run-gates.sh unit stdio
 | `test-process-lifecycle` | yes | Lazy spawn, SIGTERM cleanup, zombie reaping, capabilities |
 | `test-reload-project-regression` | yes | In-place reload versus respawn |
 
-CI runs a fast Rust-only job and a full job that installs Frama-C, provers, and
-the `ast-utils` plugin, then runs version smoke tests, the tutorial and
-abs-int fixture gates, and the live suites.
+CI is one workflow, `.github/workflows/ci.yml`. Four jobs run in parallel: a
+fast Rust-only job on Ubuntu and macOS, an artifact scan over the tracked tree,
+a full job that installs Frama-C, provers, and the `ast-utils` plugin before
+running version smoke tests, the tutorial and abs-int fixture gates and the live
+suites, and a job building the binaries above, each run on the platform it was
+built for. A push to `main` that clears all four republishes the `latest`
+release.
 
 ## Technical notes
 

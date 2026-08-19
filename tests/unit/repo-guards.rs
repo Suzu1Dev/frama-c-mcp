@@ -328,6 +328,22 @@ fn a_flip_is_a_goal_that_timed_out_and_then_proved() {
     assert_eq!(flipped[0]["property"], "#p1");
 }
 
+/// The command a workflow step runs, or the line unchanged when it runs none.
+///
+/// A step is either "run: <command>" on one line or a command inside a
+/// "run: |" block, and ci.yml uses both. Three tests parse steps, and each one
+/// learned that separately and the expensive way: ci_named_tests_still_exist
+/// matched only the block form and so skipped a step pinning a test that had
+/// been renamed away, ci_gates dropped the one-line pure-Rust step out of the
+/// gate set entirely, and ci_runs_every_test_target reported test-integration
+/// as run by nobody the moment that step no longer needed a block. Three copies
+/// of one rule is three chances to fix it in two places, and a drift between
+/// them puts the parser gap back without any of the three failing.
+fn step_command(line: &str) -> &str {
+    let command = line.trim().trim_start_matches("- ");
+    command.strip_prefix("run:").unwrap_or(command).trim()
+}
+
 /// Every test CI names by hand still exists, and is really a test.
 ///
 /// "cargo test --test X some_name" exits 0 with "0 passed" when the filter
@@ -391,12 +407,8 @@ fn ci_named_tests_still_exist() {
     let pinned: Vec<(&str, &str)> = workflow
         .lines()
         .filter_map(|line| {
-            // A step is "run: <command>" on one line or a command inside a
-            // "run: |" block, and ci.yml uses both. Matching only the second
-            // skipped the one-line form silently.
-            let command = line.trim().trim_start_matches("- ");
-            let command = command.strip_prefix("run:").unwrap_or(command).trim();
-            let mut words = command.strip_prefix("cargo test ")?.split_whitespace();
+            let mut words =
+                step_command(line).strip_prefix("cargo test ")?.split_whitespace();
 
             // --test need not come first. ci.yml already writes "cargo test
             // --test X --release", and the mirror ordering "cargo test
@@ -635,9 +647,20 @@ fn ci_runs_every_test_target() {
     // comment mentioning the target would satisfy a contains, and so would a
     // longer target name that starts with this one. "any" leaves the iterator
     // just past the flag, so the next word is the target the step names.
+    //
+    // Both spellings of a step, as ci_named_tests_still_exist and ci_gates
+    // already read them: a command inside a "run: |" block, and the one-line
+    // "run: <command>" form. This read only the block form, so when the steps
+    // needing nothing but a test lost their surrounding block, it reported
+    // test-integration as run by nobody. Only that one, because every other
+    // target is still named inside some block, and that is the shape of the
+    // near miss worth recording: a parser gap shows up on one target rather
+    // than obviously on all of them. It fails in the safe direction, reading a
+    // step it cannot see as a target CI skips, but it was refusing the shorter
+    // spelling of a step that does run.
     let run_by_ci = |target: &str| {
         workflow.lines().any(|line| {
-            let Some(rest) = line.trim().strip_prefix("cargo test ") else {
+            let Some(rest) = step_command(line).strip_prefix("cargo test ") else {
                 return false;
             };
             let mut words = rest.split_whitespace();
@@ -670,14 +693,104 @@ fn ci_runs_every_test_target() {
     );
 }
 
+/// Every literal "frama-c-mcp-<target>.tar.gz" in a text.
+///
+/// Literal, so the spelling the build job packages under, which is assembled
+/// from a matrix expression, is skipped: that one cannot go stale and so there
+/// is nothing in it to check. A span that ran past a line ending picked up
+/// whitespace and is discarded for the same reason, since the two halves came
+/// from different lines and never named one file.
+fn tarball_names(text: &str) -> std::collections::BTreeSet<String> {
+    const PREFIX: &str = "frama-c-mcp-";
+    const SUFFIX: &str = ".tar.gz";
+
+    let mut names = std::collections::BTreeSet::new();
+    let mut rest = text;
+    while let Some(start) = rest.find(PREFIX) {
+        rest = &rest[start..];
+        let Some(end) = rest.find(SUFFIX) else { break };
+        let name = &rest[..end + SUFFIX.len()];
+        if !name.contains('$') && !name.contains(char::is_whitespace) {
+            names.insert(name.to_string());
+        }
+        rest = &rest[PREFIX.len()..];
+    }
+    names
+}
+
+/// The released tarballs are named the same in the matrix, the release job and
+/// README.
+///
+/// Three copies of one list. The build matrix decides the targets, the release
+/// job names each asset so a rename fails before anything is published, and
+/// README tells a person which URL to fetch. The release job's copy is checked
+/// against the artifacts at run time, so it cannot ship the wrong set; README's
+/// copy is checked by nothing, and a renamed target would leave it pointing at
+/// a download that 404s while every gate stayed green.
+///
+/// This is the same shape as tool_router_matches_the_documented_surface and
+/// incomplete_codes_match_their_documentation: a contract between code and a
+/// document, pinned rather than trusted.
+///
+/// Both sets are asserted non-empty first. A parse that stops recognising
+/// either file would otherwise compare nothing against nothing and report all
+/// clear.
+#[test]
+fn released_tarball_names_match_the_build_matrix() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let workflow =
+        std::fs::read_to_string(root.join(".github/workflows/ci.yml")).expect("ci.yml");
+    let readme = std::fs::read_to_string(root.join("README.md")).expect("README.md");
+
+    // The matrix rows are the source of truth: a target exists because a row
+    // builds it. Rows written as an expression belong to some other key, such
+    // as the toolchain's target list, and name no artifact.
+    let targets: Vec<&str> = workflow
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix("target: "))
+        .filter(|target| !target.contains("${{"))
+        .collect();
+    assert!(
+        !targets.is_empty(),
+        "no build matrix target parsed from ci.yml, so this guard compared nothing"
+    );
+
+    let expected: std::collections::BTreeSet<String> =
+        targets.iter().map(|target| format!("frama-c-mcp-{target}.tar.gz")).collect();
+
+    let in_workflow = tarball_names(&workflow);
+    assert!(
+        !in_workflow.is_empty(),
+        "no asset name parsed from ci.yml, so this guard compared nothing"
+    );
+    assert_eq!(
+        in_workflow, expected,
+        "the release job stages a different set of assets than the build matrix \
+         produces, so a push to main would fail at Stage assets"
+    );
+
+    let in_readme = tarball_names(&readme);
+    assert!(
+        !in_readme.is_empty(),
+        "no download URL parsed from README.md, so this guard compared nothing"
+    );
+    assert_eq!(
+        in_readme, expected,
+        "README documents a different set of downloads than CI publishes, so a \
+         reader following it would fetch a URL that does not exist"
+    );
+}
+
 /// Every gate CI runs, as the gate name this repository uses for it.
 ///
 /// Split out because two tests need it and they check different halves: one
 /// that the runner covers CI, one that the documents cover the runner.
 fn ci_gates(root: &std::path::Path) -> Vec<String> {
-    // Every workflow, not just ci.yml. artifact-scans.yml runs a gate of its
-    // own on every push, and a version of this that read one file could not see
-    // it: the exact failure this test exists to prevent, one file over.
+    // Every workflow, not just ci.yml. There is one file today, and there were
+    // two: artifact-scans.yml ran a gate of its own, and a version of this that
+    // read a single named file could not see it, which is the exact failure
+    // this test exists to prevent, one file over. Reading the directory is what
+    // makes a second workflow appearing again a non-event.
     let mut workflow = String::new();
     let workflows = root.join(".github/workflows");
     for entry in std::fs::read_dir(&workflows).expect("workflows dir").flatten() {
@@ -694,13 +807,7 @@ fn ci_gates(root: &std::path::Path) -> Vec<String> {
 
     let mut required: Vec<String> = Vec::new();
     for line in workflow.lines() {
-        // A step is either "run: <command>" on one line or a command inside a
-        // "run: |" block. Both forms are gates, and reading only the second
-        // silently dropped the one-line pure-Rust step, which is how this test
-        // came to check the gate list for a command it had never collected.
-        let command = line.trim().trim_start_matches("- ");
-        let command = command.strip_prefix("run:").unwrap_or(command).trim();
-        if let Some(gate) = gate_of(command) {
+        if let Some(gate) = gate_of(step_command(line)) {
             required.push(gate);
         }
     }
@@ -775,7 +882,7 @@ fn run_gates_runs_every_ci_gate() {
     let script = std::fs::read_to_string(root.join("scripts/run-gates.sh")).expect("run-gates.sh");
 
     // The dispatch lines, not the whole file, for the reason
-    // claude_md_lists_every_ci_gate reads a fenced block rather than a
+    // documented_gate_list_covers_ci reads a fenced block rather than a
     // document: a comment naming a gate satisfies a whole-file search while
     // nothing runs it. This file's own comments name shfmt and clippy, so the
     // first version of this test passed on a runner that had dropped both.
@@ -797,7 +904,8 @@ fn run_gates_runs_every_ci_gate() {
     );
 }
 
-/// The gate list in CLAUDE.md covers everything CI runs over a whole suite.
+/// The gate list in the documentation covers everything CI runs over a whole
+/// suite.
 ///
 /// That list is what a person follows before saying a change is green, so a
 /// gate missing from it is one nobody runs by hand. Measured on 2026-08-13:
@@ -808,12 +916,18 @@ fn run_gates_runs_every_ci_gate() {
 /// A document may instead delegate, by naming scripts/run-gates.sh in its test
 /// block. That is only honest because run_gates_runs_every_ci_gate pins the
 /// runner against CI; without that test, delegation would let a document say
-/// nothing and pass.
+/// nothing and pass. README delegates, so that pairing is what carries this
+/// today rather than a list read here.
+///
+/// CLAUDE.md carried the other copy and was read here too, until it stopped
+/// being part of the repository. A checkout has no such file, so this panicked
+/// on a missing path rather than comparing anything, and the panic was
+/// invisible on a machine where the file happens to exist.
 ///
 /// Only whole-suite commands. CI also runs single tests by name as smoke
 /// checks, and those are not gates; ci_named_tests_still_exist covers them.
 #[test]
-fn claude_md_lists_every_ci_gate() {
+fn documented_gate_list_covers_ci() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     let required = ci_gates(root);
 
@@ -822,10 +936,9 @@ fn claude_md_lists_every_ci_gate() {
     // being told to run it, which is how the first version of this passed its
     // own control: the paragraph explaining the gap mentioned "dune runtest".
     //
-    // Both documents, because both carry the list. Reading only CLAUDE.md let
-    // README's copy sit at "cargo test --lib" after the unit tests moved to
-    // their own target, and it took a human noticing rather than a gate.
-    let gate_lists: Vec<(&str, String)> = ["CLAUDE.md", "README.md"]
+    // Every document in this list must exist, so a typo or a renamed file
+    // fails here rather than quietly checking one fewer copy.
+    let gate_lists: Vec<(&str, String)> = ["README.md"]
         .into_iter()
         .map(|name| {
             let text = std::fs::read_to_string(root.join(name)).expect(name);
