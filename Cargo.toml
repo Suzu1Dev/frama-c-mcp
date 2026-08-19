@@ -41,7 +41,7 @@ regex = "1"
 anyhow = "1"
 
 # Hash (for source_hash in snapshots)
-sha2 = "0.10"
+sha2 = "0.11"
 
 # Graph algorithms (verify-program-fsm: Tarjan SCC + Kahn layering)
 petgraph = "0.6"
