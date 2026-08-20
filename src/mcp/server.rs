@@ -2981,9 +2981,16 @@ impl FramaCMcpServer {
         // previous owner died without running Drop.
         let _ = std::fs::remove_file(&socket_path);
 
-        //Log path
-        let log_dir = std::path::Path::new("/tmp/frama-c-mcp-logs");
-        let _ = std::fs::create_dir_all(log_dir);
+        // Logs, under the private root rather than at a fixed shared name. The
+        // old path was /tmp/frama-c-mcp-logs, which anybody could create first,
+        // and the error from creating it was dropped, so a directory they owned
+        // was used as found and File::create followed a symlink planted at the
+        // log name. The error is reported now: no logs is a startup problem
+        // worth hearing about, since the startup failure tail is read from them.
+        let log_dir = crate::mcp::store::ensure_private_root()
+            .map(|root| root.join("logs"))
+            .and_then(|dir| std::fs::create_dir_all(&dir).map(|()| dir))
+            .map_err(|e| McpError::internal_error(format!("create log directory: {e}"), None))?;
         let log_basename = format!("main-{}", std::process::id());
         let stdout_log_path = log_dir.join(format!("{}.stdout.log", log_basename));
         let stdout_log = std::fs::File::create(&stdout_log_path)

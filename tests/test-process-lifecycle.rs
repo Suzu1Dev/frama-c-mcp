@@ -1124,7 +1124,7 @@ fn state_dir_env_var_redirects_persisted_state() {
 
 /// Removes a sandbox temp dir even when an assertion panics. Cleanup written
 /// as a trailing statement runs only on the success path, which leaves
-/// `/tmp/frama-c-sandbox-<owner>-<id>` behind on every failure.
+/// `/tmp/fcmcp-<uid>/sb-<owner>-<id>` behind on every failure.
 struct SandboxDirGuard {
     path: PathBuf,
 }

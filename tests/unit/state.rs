@@ -7,8 +7,8 @@ fn sandbox_metadata_serializes_without_runtime_handles() {
     let metadata = SandboxMetadata {
         experiment_id: "exp01".into(),
         original_function: "f".into(),
-        sandbox_dir: PathBuf::from("/tmp/frama-c-sandbox-exp01"),
-        sandbox_socket: PathBuf::from("/tmp/frama-c-sandbox-exp01/frama-c.sock"),
+        sandbox_dir: PathBuf::from("/tmp/fcmcp-0/sb-abcd1234-exp01"),
+        sandbox_socket: PathBuf::from("/tmp/fcmcp-0/sb-abcd1234-exp01/frama-c.sock"),
         sandbox_pid: 42,
         declaration_marker: "#F1".into(),
         created_at: "2026-08-06T00:00:00Z".into(),
@@ -1119,4 +1119,74 @@ fn receipt_subject_ignores_the_check_scratch_directory() {
     // subject.
     assert_eq!(receipt_source_path("/home/me/proj/abs.c"), "/home/me/proj/abs.c");
     assert_eq!(receipt_source_path("/tmp/other-dir/input.c"), "/tmp/other-dir/input.c");
+}
+
+/// The scratch root is private, and a directory that is not gets refused.
+///
+/// Everything this server writes under /tmp lives inside it: the Frama-C logs,
+/// the sandbox sources and sockets, the self-check probes. /tmp is world
+/// writable, so the parent being unenterable by anyone else is what stops a
+/// pre-created directory full of symlinks from catching those writes. The names
+/// underneath stay deterministic on purpose, because a sandbox left by an
+/// earlier server is found by recomputing its path.
+#[cfg(unix)]
+#[test]
+fn the_scratch_root_is_private_or_refused() {
+    use frama_c_mcp::mcp::store::{ensure_private_dir, private_root_path};
+    use std::os::unix::fs::PermissionsExt;
+
+    let holder = tempfile::tempdir().expect("tempdir");
+
+    // Created fresh: 0700, not the umask.
+    let fresh = holder.path().join("fresh");
+    ensure_private_dir(&fresh).expect("fresh root");
+    let mode = std::fs::metadata(&fresh).expect("stat").permissions().mode() & 0o777;
+    assert_eq!(mode, 0o700, "created at {mode:o} rather than 0700");
+
+    // Called again on its own directory: accepted, unchanged.
+    ensure_private_dir(&fresh).expect("second call");
+
+    // Group or world access: refused rather than repaired, because a directory
+    // someone else can write into is either an attack or a confusing machine,
+    // and silently chmod-ing it is not this program's business.
+    for bad in [0o777, 0o755, 0o750, 0o707] {
+        let loose = holder.path().join(format!("loose{bad:o}"));
+        std::fs::create_dir(&loose).expect("mkdir");
+        std::fs::set_permissions(&loose, std::fs::Permissions::from_mode(bad)).expect("chmod");
+        assert!(
+            ensure_private_dir(&loose).is_err(),
+            "a root at {bad:o} was accepted, so anyone could plant symlinks in it"
+        );
+    }
+
+    // A symlink is seen rather than followed, even when it points somewhere
+    // that would itself pass.
+    let target = holder.path().join("target");
+    ensure_private_dir(&target).expect("target");
+    let link = holder.path().join("link");
+    std::os::unix::fs::symlink(&target, &link).expect("symlink");
+    // Asserted on the message, not just on the failure. lstat makes a symlink
+    // fail the is-a-directory check too, so err-versus-ok cannot tell whether
+    // the symlink was recognised as one; without this, dropping that branch
+    // looks like it changed nothing.
+    let refused = ensure_private_dir(&link).expect_err(
+        "a symlinked root was accepted, so it names a directory chosen by whoever made the link",
+    );
+    assert!(
+        refused.to_string().contains("is a symlink"),
+        "a symlinked root should say so rather than blaming its type: {refused}"
+    );
+
+    // A file where the directory should be.
+    let file = holder.path().join("file");
+    std::fs::write(&file, b"").expect("write");
+    assert!(ensure_private_dir(&file).is_err(), "a file was accepted as the root");
+
+    // The real root is short, because sandbox sockets hang off it and a Unix
+    // socket path is capped near 104 bytes.
+    assert!(
+        private_root_path().to_string_lossy().len() <= 24,
+        "{} leaves too little of the socket budget",
+        private_root_path().display()
+    );
 }

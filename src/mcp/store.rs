@@ -295,7 +295,109 @@ pub fn expected_sandbox_dir(base_dir: &Path, experiment_id: &str) -> PathBuf {
         .components()
         .collect();
     let owner = &sha256_hex(absolute.to_string_lossy().as_bytes())[..8];
-    PathBuf::from(format!("/tmp/frama-c-sandbox-{owner}-{experiment_id}"))
+    private_root_path().join(format!("sb-{owner}-{experiment_id}"))
+}
+
+/// The directory this server keeps its scratch state in, named but not created.
+///
+/// Under /tmp rather than the state directory, and short, because a Unix socket
+/// path is capped near 104 bytes and the sandbox sockets live below this. It is
+/// per user id so two people on one machine do not meet in it, and it is the
+/// only thing here that has to be private: the names underneath stay
+/// deterministic, since a sandbox left by an earlier server is found by
+/// recomputing its path, and a name nobody can enter does not need to be
+/// unguessable as well.
+///
+/// Pure, so expected_sandbox_dir stays a path calculation that cannot fail.
+/// ensure_private_root is what creates and checks it.
+pub fn private_root_path() -> PathBuf {
+    #[cfg(unix)]
+    let user = {
+        // SAFETY: getuid is always successful and touches no memory.
+        unsafe { libc::getuid() }
+    };
+    #[cfg(not(unix))]
+    let user = 0;
+    PathBuf::from(format!("/tmp/fcmcp-{user}"))
+}
+
+/// The scratch root, created 0700 and confirmed to be ours.
+///
+/// Everything this server writes under /tmp goes inside here: the Frama-C logs,
+/// the sandbox directories with their sources and sockets, and the self-check
+/// probes. /tmp is world writable, so any of those at a name someone else can
+/// guess is a directory they can pre-create and fill with symlinks, and the
+/// files landing in them are a compiled executable this server runs, the C the
+/// analysis reads, and a socket it trusts. One private parent closes that for
+/// all of them at once, and keeps closing it for whatever is added next.
+///
+/// Refuses rather than repairs when the directory exists and is not right. A
+/// root owned by someone else, or one they can write into, is either an attack
+/// or a genuinely confusing machine, and quietly chmod-ing somebody else's
+/// directory is not this program's business. lstat, not stat, so a symlink at
+/// the root is seen rather than followed.
+pub fn ensure_private_root() -> std::io::Result<PathBuf> {
+    let root = private_root_path();
+    ensure_private_dir(&root)?;
+    Ok(root)
+}
+
+/// ensure_private_root's rule, against a caller-named directory.
+///
+/// Split out to be testable: the real root is one fixed path per user, so a
+/// test that chmods it to see the refusal would be changing the directory every
+/// other test in the run is using.
+pub fn ensure_private_dir(dir: &Path) -> std::io::Result<()> {
+    #[cfg(not(unix))]
+    {
+        return std::fs::create_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
+
+        // lstat, not stat, so a symlink here is seen rather than followed.
+        match std::fs::symlink_metadata(dir) {
+            Ok(found) => {
+                let refuse = |why: &str| {
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        format!("{} {why}", dir.display()),
+                    ))
+                };
+                if found.file_type().is_symlink() {
+                    return refuse("is a symlink, so it names someone else's directory");
+                }
+                if !found.is_dir() {
+                    return refuse("exists and is not a directory");
+                }
+                // SAFETY: geteuid is always successful and touches no memory.
+                if found.uid() != unsafe { libc::geteuid() } {
+                    return refuse("is owned by another user");
+                }
+                if found.permissions().mode() & 0o077 != 0 {
+                    return refuse("is readable or writable by others");
+                }
+                Ok(())
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                // create() rather than create_dir_all: the mode applies to the
+                // leaf this makes and not to anything above it, and a parent
+                // made as a side effect would get the umask instead. Losing the
+                // race to another process of ours is fine, since the retry
+                // re-checks whatever landed.
+                match std::fs::DirBuilder::new().mode(0o700).create(dir) {
+                    Ok(()) => Ok(()),
+                    Err(again) if again.kind() == std::io::ErrorKind::AlreadyExists => {
+                        ensure_private_dir(dir)
+                    }
+                    Err(again) => Err(again),
+                }
+            }
+            Err(error) => Err(error),
+        }
+    }
 }
 
 pub fn has_expected_sandbox_paths(base_dir: &Path, sandbox: &SandboxMetadata) -> bool {
