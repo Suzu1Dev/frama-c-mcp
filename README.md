@@ -526,6 +526,29 @@ suites, and a job building the binaries above, each run on the platform it was
 built for. A push to `main` that clears all four republishes the `latest`
 release.
 
+Steps whose shell is more than a couple of commands live in `.ci/` and the
+workflow names the path, so those scripts are formatted by the `shfmt` gate and
+runnable by hand. The guards in `tests/unit/repo-guards.rs` read `.ci/` as well
+as `.github/workflows/`, since that is where the commands CI runs now are.
+
+### Rust formatting is by hand
+
+There is no `cargo fmt` gate and no `rustfmt.toml`, and that is a decision
+rather than an oversight. The tree is about 800 hunks away from rustfmt
+defaults across 40 files, because the wrapping is deliberate: payload literals
+are laid out to mirror the JSON they build, and the comments that carry most of
+this repository's reasoning are wrapped to be read rather than to fill a column
+budget.
+
+So do not run `cargo fmt` on this tree. Match the formatting of the code you
+are editing, which is the same rule the shell gate enforces mechanically and
+the one thing a formatter cannot check. Import ordering in particular is not a
+rule here; several modules group by origin instead of alphabetically, and no
+gate has an opinion.
+
+Shell is the exception and is machine-checked, because `shfmt` agrees with what
+the scripts already look like and there is no cost to enforcing it.
+
 ## Technical notes
 
 ### Frama-C server protocol

@@ -454,7 +454,7 @@ fn json_result_relabeled(
 ) -> CallToolResult {
     let mut value = serde_json::to_value(value).unwrap_or(serde_json::Value::Null);
     relabel_origins(&mut value, origin);
-    json_result(&value)
+    json_result(value)
 }
 
 /// The clause arrays one injection call carries, borrowed for planning.
@@ -708,7 +708,7 @@ impl FramaCMcpServer {
         Parameters(params): Parameters<ProposeAnnotationsParams>,
     ) -> Result<CallToolResult, McpError> {
         Ok(json_result(
-            &self.propose_annotations_payload(&params.function).await?,
+            self.propose_annotations_payload(&params.function).await?,
         ))
     }
 
@@ -869,7 +869,7 @@ impl FramaCMcpServer {
                         std::fs::write(&target, &text).map_err(|e| {
                             McpError::internal_error(format!("write failed: {}", e), None)
                         })?;
-                        return Ok(json_result(&json!({
+                        return Ok(json_result(json!({
                             "written": target.display().to_string(),
                             "bytes": text.len(),
                         })));
@@ -879,7 +879,7 @@ impl FramaCMcpServer {
                     // every other one keeps. Wrapping C source in a JSON string
                     // hands every caller escapes instead of code.
                     if single {
-                        return Ok(CallToolResult::success(vec![Content::text(text)]));
+                        return Ok(CallToolResult::success(vec![ContentBlock::text(text)]));
                     }
                     json!(text)
                 }
@@ -918,11 +918,11 @@ impl FramaCMcpServer {
             };
 
             if single {
-                return Ok(json_result(&value));
+                return Ok(json_result(value));
             }
             result.insert(key.to_string(), value);
         }
-        Ok(json_result(&serde_json::Value::Object(result)))
+        Ok(json_result(serde_json::Value::Object(result)))
     }
 
     async fn rte_obligations_payload(&self, function: &str) -> Result<serde_json::Value, McpError> {
@@ -1309,7 +1309,7 @@ impl FramaCMcpServer {
         if let Some(obj) = result_obj.as_object_mut() {
             obj.insert("hash_label".to_string(), json!(hash_label.clone()));
         }
-        Ok((json_result(&result_obj), hash_label))
+        Ok((json_result(result_obj), hash_label))
     }
 
     async fn mark_sandbox_annotation_changed(&self, resolved: &ResolvedClient) {
@@ -1631,7 +1631,7 @@ impl FramaCMcpServer {
                     )
                     .await
                 {
-                    Ok(result) => add_result = json_result(&result),
+                    Ok(result) => add_result = json_result(result),
                     Err(e) => {
                         failures.push(InjectionFailure {
                             failure_type: FailureType::ProposedError,
@@ -1933,12 +1933,12 @@ impl FramaCMcpServer {
         let (ghost_results, ghost_failures) =
             self.apply_ghost_entries(&target, ghosts, dry_run).await;
         if !ghost_failures.is_empty() {
-            return Ok(json_result(&ghost_only_response(
+            return Ok(json_result(json!(ghost_only_response(
                 dry_run,
                 attempted,
                 ghost_results,
                 ghost_failures,
-            )));
+            ))));
         }
 
         self.inject_all_impl(target, params, &origin, equivalence_sandbox, ghost_results)

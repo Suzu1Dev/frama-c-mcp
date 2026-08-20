@@ -7,8 +7,8 @@ fn sandbox_metadata_serializes_without_runtime_handles() {
     let metadata = SandboxMetadata {
         experiment_id: "exp01".into(),
         original_function: "f".into(),
-        sandbox_dir: PathBuf::from("/tmp/frama-c-sandbox-exp01"),
-        sandbox_socket: PathBuf::from("/tmp/frama-c-sandbox-exp01/frama-c.sock"),
+        sandbox_dir: PathBuf::from("/tmp/fcmcp-0/sb-abcd1234-exp01"),
+        sandbox_socket: PathBuf::from("/tmp/fcmcp-0/sb-abcd1234-exp01/frama-c.sock"),
         sandbox_pid: 42,
         declaration_marker: "#F1".into(),
         created_at: "2026-08-06T00:00:00Z".into(),
@@ -1073,4 +1073,120 @@ fn annotation_count_zero_on_empty_specs() {
         ..Default::default()
     }).expect("store_conclusion");
     assert_eq!(state.get_conclusion("f").unwrap().annotation_count, 0);
+}
+
+/// sha256_hex is lower case, two digits per byte, no separator.
+///
+/// Pinned against published vectors rather than against itself, because the
+/// spelling is a compatibility surface and not an implementation detail. Every
+/// proof receipt and stored conclusion already on disk carries a hash written
+/// by the sha2 0.10 GenericArray LowerHex formatter, and a receipt is the whole
+/// basis on which two runs are called comparable. A rewrite emitting upper case
+/// or colon-separated hex would not fail anything, it would quietly stop
+/// matching, and before this test it passed all thirteen gates.
+///
+/// The vectors are themselves 64 lower case unseparated hex characters, so they
+/// pin the length and the alphabet that store.rs and wpclass.rs slice into
+/// without needing a separate assertion for either.
+#[test]
+fn sha256_hex_is_lowercase_unseparated() {
+    assert_eq!(
+        sha256_hex(b""),
+        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    );
+    assert_eq!(
+        sha256_hex(b"abc"),
+        "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+    );
+}
+
+/// Two runs of the same inline source produce the same receipt subject.
+///
+/// A receipt exists so two runs can be compared by their hashes, and the scratch
+/// directory a check writes inline source into is chosen fresh every call, so
+/// digesting its name made every such run incomparable with every other. The old
+/// pid-shaped name hid this by being constant for a session; moving to a random
+/// name is what surfaced it.
+#[test]
+fn receipt_subject_ignores_the_check_scratch_directory() {
+    use frama_c_mcp::mcp::server::receipt::receipt_source_path;
+
+    assert_eq!(receipt_source_path("/tmp/frama-c-check-AbC123/input.c"), "input.c");
+    assert_eq!(receipt_source_path("/tmp/frama-c-check-ZzZ999/input.c"), "input.c");
+
+    // A real project file keeps its path: that one names something a reader can
+    // go and look at, and two projects with a like-named file are not the same
+    // subject.
+    assert_eq!(receipt_source_path("/home/me/proj/abs.c"), "/home/me/proj/abs.c");
+    assert_eq!(receipt_source_path("/tmp/other-dir/input.c"), "/tmp/other-dir/input.c");
+}
+
+/// The scratch root is private, and a directory that is not gets refused.
+///
+/// Everything this server writes under /tmp lives inside it: the Frama-C logs,
+/// the sandbox sources and sockets, the self-check probes. /tmp is world
+/// writable, so the parent being unenterable by anyone else is what stops a
+/// pre-created directory full of symlinks from catching those writes. The names
+/// underneath stay deterministic on purpose, because a sandbox left by an
+/// earlier server is found by recomputing its path.
+#[cfg(unix)]
+#[test]
+fn the_scratch_root_is_private_or_refused() {
+    use frama_c_mcp::mcp::store::{ensure_private_dir, private_root_path};
+    use std::os::unix::fs::PermissionsExt;
+
+    let holder = tempfile::tempdir().expect("tempdir");
+
+    // Created fresh: 0700, not the umask.
+    let fresh = holder.path().join("fresh");
+    ensure_private_dir(&fresh).expect("fresh root");
+    let mode = std::fs::metadata(&fresh).expect("stat").permissions().mode() & 0o777;
+    assert_eq!(mode, 0o700, "created at {mode:o} rather than 0700");
+
+    // Called again on its own directory: accepted, unchanged.
+    ensure_private_dir(&fresh).expect("second call");
+
+    // Group or world access: refused rather than repaired, because a directory
+    // someone else can write into is either an attack or a confusing machine,
+    // and silently chmod-ing it is not this program's business.
+    for bad in [0o777, 0o755, 0o750, 0o707] {
+        let loose = holder.path().join(format!("loose{bad:o}"));
+        std::fs::create_dir(&loose).expect("mkdir");
+        std::fs::set_permissions(&loose, std::fs::Permissions::from_mode(bad)).expect("chmod");
+        assert!(
+            ensure_private_dir(&loose).is_err(),
+            "a root at {bad:o} was accepted, so anyone could plant symlinks in it"
+        );
+    }
+
+    // A symlink is seen rather than followed, even when it points somewhere
+    // that would itself pass.
+    let target = holder.path().join("target");
+    ensure_private_dir(&target).expect("target");
+    let link = holder.path().join("link");
+    std::os::unix::fs::symlink(&target, &link).expect("symlink");
+    // Asserted on the message, not just on the failure. lstat makes a symlink
+    // fail the is-a-directory check too, so err-versus-ok cannot tell whether
+    // the symlink was recognised as one; without this, dropping that branch
+    // looks like it changed nothing.
+    let refused = ensure_private_dir(&link).expect_err(
+        "a symlinked root was accepted, so it names a directory chosen by whoever made the link",
+    );
+    assert!(
+        refused.to_string().contains("is a symlink"),
+        "a symlinked root should say so rather than blaming its type: {refused}"
+    );
+
+    // A file where the directory should be.
+    let file = holder.path().join("file");
+    std::fs::write(&file, b"").expect("write");
+    assert!(ensure_private_dir(&file).is_err(), "a file was accepted as the root");
+
+    // The real root is short, because sandbox sockets hang off it and a Unix
+    // socket path is capped near 104 bytes.
+    assert!(
+        private_root_path().to_string_lossy().len() <= 24,
+        "{} leaves too little of the socket budget",
+        private_root_path().display()
+    );
 }

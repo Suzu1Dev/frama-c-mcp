@@ -1,5 +1,6 @@
 use serde_json::json;
-use sha2::{Digest, Sha256};
+
+use crate::state::sha256_hex;
 
 pub fn classify_wp_goal(goal: &serde_json::Value) -> (String, Option<String>) {
     use std::sync::OnceLock;
@@ -903,11 +904,10 @@ fn stable_goal_id_for(
         "name": stable_goal_name_key(goal),
         "part": stable_goal_part_key(goal),
     });
-    let digest = Sha256::digest(payload.to_string().as_bytes());
-    format!(
-        "sg_{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
-        digest[0], digest[1], digest[2], digest[3], digest[4], digest[5], digest[6], digest[7]
-    )
+
+    // Sixteen characters, which is the first eight bytes: the same id the
+    // eight-way format string produced before this shared a helper.
+    format!("sg_{}", &sha256_hex(payload.to_string().as_bytes())[..16])
 }
 
 /// Whether WP replayed this goal's verdict from its cache instead of proving

@@ -21,6 +21,7 @@ roots = [
     Path("ast-utils"),
     Path("scripts"),
     Path(".github"),
+    Path(".ci"),
 ]
 skip_dirs = {".git", ".frama-c-mcp", "_build", "_opam", "target"}
 skip_files = {Path("scripts/check-artifacts.sh")}

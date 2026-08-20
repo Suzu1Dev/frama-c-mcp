@@ -715,9 +715,9 @@ fn tool_registry_count_matches_declared_snapshots() {
     // The tool count used to be pinned in CLAUDE.md here as well. That file is
     // not part of the repository, so a checkout has no such line to read and
     // this panicked before it could assert anything. docs/architecture.md below
-    // and README's tool table, which
-    // tool_router_matches_the_documented_surface compares against the router,
-    // are the copies a reader of this repository actually gets.
+    // and README's tool table, which tool_router_matches_the_documented_surface
+    // compares against the router, are the copies a reader of this repository
+    // actually gets.
     let architecture = std::fs::read_to_string(workspace_path("docs/architecture.md"))
         .expect("read docs/architecture.md");
     assert!(
@@ -1124,7 +1124,7 @@ fn state_dir_env_var_redirects_persisted_state() {
 
 /// Removes a sandbox temp dir even when an assertion panics. Cleanup written
 /// as a trailing statement runs only on the success path, which leaves
-/// `/tmp/frama-c-sandbox-<owner>-<id>` behind on every failure.
+/// `/tmp/fcmcp-<uid>/sb-<owner>-<id>` behind on every failure.
 struct SandboxDirGuard {
     path: PathBuf,
 }
@@ -2255,4 +2255,47 @@ fn a_missing_header_is_classified_on_the_first_reload() {
         "{response:?}"
     );
     assert_eq!(data["suggestion"]["tool"], "reload_project", "{response:?}");
+}
+
+/// structuredContent goes to the peers whose revision defines it, and no others.
+///
+/// The field arrived in 2025-06-18. This server also agrees to 2024-11-05 and
+/// 2025-03-26, and every tool answering with an object fills it, so those peers
+/// were being handed a key their revision does not define. Most clients ignore
+/// what they do not know; one that validates its input is entitled not to.
+///
+/// Both directions are asserted from one test, because the interesting failure
+/// is not "absent" or "present" on its own but the two disagreeing: a strip that
+/// fires for everybody silently removes the feature, and the suite would not
+/// have said so, since every other reader in this repository parses the text
+/// block.
+#[test]
+fn structured_content_follows_the_negotiated_protocol_version() {
+    let frama_c = std::env::var("FRAMA_C_BIN").unwrap_or_else(|_| "frama-c".into());
+
+    // self_check answers with an object and needs no Frama-C, so this measures
+    // the wire shape rather than the backend.
+    let mut old = McpHandle::spawn_test_binary_speaking(&frama_c, "2024-11-05");
+    let old_result = old.call_tool("self_check", "{}");
+    let old_result = &old_result["result"];
+    assert!(
+        old_result["content"][0]["text"].as_str().is_some(),
+        "a 2024-11-05 peer still gets the text block: {old_result:?}"
+    );
+    assert!(
+        old_result.get("structuredContent").is_none(),
+        "a 2024-11-05 peer was sent a field its revision does not define: {old_result:?}"
+    );
+
+    let mut new = McpHandle::spawn_test_binary_speaking(&frama_c, "2025-11-25");
+    let new_result = new.call_tool("self_check", "{}");
+    let new_result = &new_result["result"];
+    assert!(
+        new_result["structuredContent"].is_object(),
+        "a 2025-11-25 peer should get structuredContent: {new_result:?}"
+    );
+    assert!(
+        new_result["content"][0]["text"].as_str().is_some(),
+        "and the text block as well, which the result schema is written against: {new_result:?}"
+    );
 }

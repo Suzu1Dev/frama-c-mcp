@@ -146,12 +146,22 @@ async fn get_eva_callers(
     }
 }
 
-pub fn tool_result_json(result: &CallToolResult) -> serde_json::Value {
+pub fn tool_result_json(result: CallToolResult) -> serde_json::Value {
+    // structuredContent first, and moved rather than cloned: every caller owns
+    // the result and drops it on the next line. Every tool that returns JSON
+    // sets both halves from one value, so this is a shortcut and not a
+    // different answer. It matters for a result this server did not build,
+    // where reading only the text would report a structured-only result as
+    // empty.
+    if let Some(structured) = result.structured_content {
+        return structured;
+    }
+
     let text = result
         .content
         .iter()
-        .filter_map(|content| match &content.raw {
-            rmcp::model::RawContent::Text(text) => Some(text.text.as_str()),
+        .filter_map(|content| match content {
+            rmcp::model::ContentBlock::Text(text) => Some(text.text.as_str()),
             _ => None,
         })
         .collect::<Vec<_>>()
@@ -1690,27 +1700,56 @@ fn run_wp_target_scope(params: &RunWpParams) -> Result<RunWpScope, McpError> {
 
 /// Write inline C source to a temporary file for one check.
 ///
-/// The directory is per process and removed and recreated on each call, so a
-/// second check cannot analyze the previous one's leftovers, and a partial
-/// write cleans up after itself rather than leaving a file that parses to
-/// something the caller never sent.
-fn materialize_check_source(source: &str) -> Result<(Vec<String>, String), McpError> {
-    let dir = std::env::temp_dir().join(format!("frama-c-check-{}", std::process::id()));
-    if dir.exists() {
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-    std::fs::create_dir_all(&dir).map_err(|error| {
+/// Returns the guard as well as the paths, and the caller holds it for the rest
+/// of the run. That is what bounds the directory's life: it exists while
+/// Frama-C is reading it and is gone when the call that made it returns, so
+/// there is no leftover for a later check to analyze and nothing to clean up by
+/// hand.
+///
+/// An earlier version kept the newest directory in a process-global slot and
+/// deleted the previous one. That was the wrong owner twice over. The slot is
+/// per process while the reader is per server, and lib.rs and the test harness
+/// both build two servers in one process, so one server's check could delete
+/// the directory the other was still reading; and two concurrent checks on one
+/// server raced the same way, because the Frama-C client mutex is taken after
+/// this runs. Nothing has to arbitrate if the guard simply lives on the stack
+/// of the call that owns it.
+///
+/// The name is random rather than the process id. It used to be
+/// "frama-c-check-<pid>", which is fixed for the life of the server and
+/// guessable by anyone who can enumerate pids, in a world-writable directory.
+/// remove_dir_all refuses to descend a symlink so the delete was safe, but
+/// create_dir_all succeeds against a directory that already exists and
+/// fs::write follows a symlink at input.c, so a local attacker who won the
+/// window between the two got an arbitrary file overwrite as this user, and
+/// could retry it on every call because the path never moved. private_temp_dir
+/// creates with O_EXCL at a random name and mode 0700, which closes the class
+/// instead of narrowing the window.
+/// The prefix of the scratch directory a check writes inline source into.
+///
+/// Shared with receipt_source_path, which has to recognise the directory to
+/// keep it out of the receipt.
+pub const CHECK_SCRATCH_PREFIX: &str = "frama-c-check-";
+
+fn materialize_check_source(
+    source: &str,
+) -> Result<(Vec<String>, String, tempfile::TempDir), McpError> {
+    let dir = private_temp_dir("frama-c-check-").map_err(|error| {
         McpError::internal_error(
             format!("failed to create temporary C source directory: {error}"),
             None,
         )
     })?;
-    let path = dir.join("input.c");
+
+    let path = dir.path().join("input.c");
     std::fs::write(&path, source).map_err(|error| {
-        let _ = std::fs::remove_dir_all(&dir);
         McpError::internal_error(format!("failed to write temporary C source: {error}"), None)
     })?;
-    Ok((vec![path.display().to_string()], dir.display().to_string()))
+    Ok((
+        vec![path.display().to_string()],
+        dir.path().display().to_string(),
+        dir,
+    ))
 }
 
 /// The proofread report for a main-instance run: what the goals say, plus what
@@ -2033,7 +2072,7 @@ impl FramaCMcpServer {
 
         // Return the VO + scc_groups of server seed (the agent is no longer
         // built, and the results are read-only for display/reporting)
-        Ok(json_result(&serde_json::json!({
+        Ok(json_result(serde_json::json!({
             "verification_order": verification_order,
             "scc_groups": scc_groups,
         })))
@@ -2052,7 +2091,7 @@ impl FramaCMcpServer {
         let ready =
             crate::topo::compute_ready_functions(&vertices, &edges, &p.done, &p.in_progress);
 
-        Ok(json_result(&ready))
+        Ok(json_result(json!(ready)))
     }
 
     #[tool(
@@ -2086,12 +2125,34 @@ impl FramaCMcpServer {
         // E-ACSL instruments whatever paths it is handed, and these are the
         // paths the project was loaded from. Annotations injected this session
         // live in the AST only, so reaching them means printing the AST to a
-        // file first; no request instruments in place.
+        // file first; no request instruments in place. The printed AST outlives
+        // this call on purpose: it is reported as `instrumented` and callers
+        // read it back to see what E-ACSL was given, which is the only thing
+        // that still means anything where e-acsl-gcc cannot run. Parking the
+        // guard on the server keeps it alive and drops the previous one, so a
+        // session holds one of these rather than one per call.
+        //
+        // Held locally until the run below is over, and parked only after.
+        // Parking it before means a second concurrent run_e_acsl replaces the
+        // entry, drops this call's guard, and deletes the directory that
+        // e-acsl-gcc is compiling from; nothing serializes the two, since the
+        // Frama-C client lock is released before the wrapper is spawned.
+        //
+        // One slot, so the contract on the reported path is that it is readable
+        // until the next use_current_ast call, not forever. Two overlapping
+        // calls still end with one directory, and the caller that returned
+        // first can find its path gone. That is the contract this always had,
+        // when the path was one fixed name rewritten on every call, and it is
+        // strictly better now, since the file is no longer replaced underneath
+        // a reader by a run for a different session. Keeping every outstanding
+        // response's directory alive instead would be unbounded, and the path
+        // exists to be read back once, not held.
         let use_current_ast = params.use_current_ast.unwrap_or(false);
-        let files = if use_current_ast {
-            vec![self.write_current_ast_source().await?]
+        let (files, ast_dir_guard) = if use_current_ast {
+            let (path, guard) = self.write_current_ast_source().await?;
+            (vec![path], Some(guard))
         } else {
-            files
+            (files, None)
         };
 
         let mut result = run_e_acsl_counterexample(
@@ -2106,7 +2167,10 @@ impl FramaCMcpServer {
         .await;
         result["instrumented"] = json!(files);
         result["use_current_ast"] = json!(use_current_ast);
-        Ok(json_result(&result))
+        if let Some(guard) = ast_dir_guard {
+            *self.current_ast_dir.lock().await = Some(guard);
+        }
+        Ok(json_result(result))
     }
 
     /// Write the loaded AST, annotations and all, to a file E-ACSL can read.
@@ -2116,7 +2180,7 @@ impl FramaCMcpServer {
     /// serves, so
     /// its output is the whole project as one translation unit that round-trips
     /// through the C front end.
-    async fn write_current_ast_source(&self) -> Result<String, McpError> {
+    async fn write_current_ast_source(&self) -> Result<(String, tempfile::TempDir), McpError> {
         let client = self.require_client().await?;
         let printed = client
             .get("plugins.ast-utils.printSource", json!(""))
@@ -2130,19 +2194,24 @@ impl FramaCMcpServer {
             ));
         }
 
-        // One path per process, rewritten each call, so repeated runs do not
-        // leak a directory apiece. The caller reports it as `instrumented`, so
-        // it has to outlive the run.
-        let dir = std::env::temp_dir()
-            .join(format!("frama-c-mcp-e-acsl-ast-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).map_err(|error| {
-            McpError::internal_error(format!("failed to create {}: {error}", dir.display()), None)
+        // A random O_EXCL name, for the reason materialize_check_source gives
+        // at length. This site was the worse of the two: it created the
+        // directory and never removed it, so there was no race to win. An
+        // attacker planted a symlink at current-ast.c once and every later call
+        // wrote through it, and what lands here is then compiled and run by
+        // run_e_acsl.
+        //
+        // The guard is returned to the caller, which holds it for the whole run
+        // and only then parks it on the server, so the file outlives the run and
+        // the reported path stays readable.
+        let dir = private_temp_dir("frama-c-mcp-e-acsl-ast-").map_err(|error| {
+            McpError::internal_error(format!("failed to create a temp dir: {error}"), None)
         })?;
-        let path = dir.join("current-ast.c");
+        let path = dir.path().join("current-ast.c");
         std::fs::write(&path, source).map_err(|error| {
             McpError::internal_error(format!("failed to write {}: {error}", path.display()), None)
         })?;
-        Ok(path.display().to_string())
+        Ok((path.display().to_string(), dir))
     }
 
     /// The EVA half of one check: the run, then the alarms it left.
@@ -2176,7 +2245,7 @@ impl FramaCMcpServer {
         function: Option<&str>,
     ) -> (serde_json::Value, serde_json::Value) {
         let wp = match self.run_wp(Parameters(wp_params)).await {
-            Ok(result) => tool_result_json(&result),
+            Ok(result) => tool_result_json(result),
             Err(error) => check_step_error(&error),
         };
         let goals = match self.wp_goals_payload(function, None, None).await {
@@ -2273,9 +2342,17 @@ impl FramaCMcpServer {
     pub async fn check_payload(&self, params: CheckParams) -> Result<serde_json::Value, McpError> {
         let wanted = WantedAnalyses::from_want(params.want.as_deref());
 
+        // The guard goes on the server rather than on this stack frame. The
+        // reload below records these paths as the session's loaded files, and
+        // run_wp, run_e_acsl and the goal detail path all re-read that list from
+        // disk long after check has returned, so removing the directory here
+        // left the session pointing at a file that was gone. Parking it keeps
+        // one alive per session and replaces it when the next inline check
+        // loads a different one.
         let (files, temporary_source_dir) = match params.source {
             Some(source) => {
-                let (files, dir) = materialize_check_source(&source)?;
+                let (files, dir, guard) = materialize_check_source(&source)?;
+                *self.current_check_source_dir.lock().await = Some(guard);
                 (Some(files), Some(dir))
             }
             None => (params.files, None),
@@ -2294,7 +2371,7 @@ impl FramaCMcpServer {
             }))
             .await
         {
-            Ok(result) => tool_result_json(&result),
+            Ok(result) => tool_result_json(result),
             Err(error) => {
                 return Ok(self
                     .check_reload_failed_payload(
@@ -2480,7 +2557,7 @@ impl FramaCMcpServer {
         &self,
         Parameters(params): Parameters<CheckParams>,
     ) -> Result<CallToolResult, McpError> {
-        Ok(json_result(&self.check_payload(params).await?))
+        Ok(json_result(self.check_payload(params).await?))
     }
 
     async fn eva_alarms_payload(
@@ -2735,7 +2812,7 @@ impl FramaCMcpServer {
             .get("plugins.wp.getScheduledTasks", json!(null))
             .await
             .map_err(McpError::from)?;
-        Ok(json_result(&json!({
+        Ok(json_result(json!({
             "cancelled": true,
             "scheduled_tasks": tasks,
             "note": "WP's queue was emptied. Goals already proved keep their verdicts; \
@@ -3059,7 +3136,7 @@ impl FramaCMcpServer {
             report_function,
         )
         .await?;
-        Ok(json_result(&response))
+        Ok(json_result(response))
     }
 
     /// Prove the goals that timed out a second time, at double the timeout, so
@@ -3372,11 +3449,11 @@ impl FramaCMcpServer {
                 }
             };
             if single {
-                return Ok(json_result(&value));
+                return Ok(json_result(value));
             }
             result.insert(kind.name().to_string(), value);
         }
-        Ok(json_result(&serde_json::Value::Object(result)))
+        Ok(json_result(serde_json::Value::Object(result)))
     }
 
     /// The WP goal list, which is what this tool answered before it took a
@@ -3935,7 +4012,7 @@ impl FramaCMcpServer {
             (state.project_loaded, order_missing)
         };
         if !project_loaded {
-            return Ok(json_result(&json!({
+            return Ok(json_result(json!({
                 "status": "needs_project",
                 "project_locked": *self.project_locked.read().await,
                 "next_action": {
@@ -3950,7 +4027,7 @@ impl FramaCMcpServer {
 
         if order_missing {
             let _ = tool_result_json(
-                &self
+                self
                     .compute_topological_order(Parameters(ComputeTopologicalOrderParams {}))
                     .await?,
             );
@@ -4035,7 +4112,7 @@ impl FramaCMcpServer {
         };
 
         let ready_functions = tool_result_json(
-            &self
+            self
                 .get_ready_functions(Parameters(GetReadyFunctionsParams {
                     done: done.clone(),
                     in_progress: in_progress.clone(),
@@ -4144,7 +4221,7 @@ impl FramaCMcpServer {
             "project_state_persisted": project_state_persisted,
             "next_action": next_action,
         }));
-        Ok(json_result(&response))
+        Ok(json_result(response))
     }
 
     /// The three payloads that only a separate Frama-C process can produce.

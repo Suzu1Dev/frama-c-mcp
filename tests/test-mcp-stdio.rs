@@ -34,7 +34,7 @@ mod harness;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use rmcp::model::{CallToolRequestParams, CallToolResult, RawContent};
+use rmcp::model::{CallToolRequestParams, CallToolResult, ContentBlock};
 use rmcp::service::ServiceExt;
 use rmcp::transport::TokioChildProcess;
 use serde_json::{json, Value};
@@ -352,8 +352,8 @@ async fn print_source(
 fn payload_text(r: &CallToolResult) -> String {
     r.content
         .iter()
-        .filter_map(|c| match &c.raw {
-            RawContent::Text(t) => Some(t.text.clone()),
+        .filter_map(|c| match c {
+            ContentBlock::Text(t) => Some(t.text.clone()),
             _ => None,
         })
         .collect::<Vec<_>>()
@@ -7988,6 +7988,64 @@ async fn unconstrained_assigns_compares_the_written_field_not_the_object() {
     assert!(
         !unconstrained.iter().any(|target| target.contains("off")),
         "the constrained field must not be reported: {checked:?}"
+    );
+
+    let _ = client.cancel().await;
+}
+
+/// A call after an inline-source check still finds the source it loaded.
+///
+/// `check {source: ...}` writes the program to a scratch directory and loads it,
+/// so the session's file list names a path under that directory, and run_wp,
+/// run_e_acsl and the WP goal detail path all re-read that list from disk. When
+/// the scratch directory was removed as `check` returned, every one of those
+/// answered against a file that no longer existed, and `check` recommends them
+/// as the next call, so the broken sequence was the documented one.
+///
+/// The whole suite stayed green through that, because no test called anything
+/// after an inline check. This is that test.
+#[tokio::test]
+async fn work_after_an_inline_source_check_still_finds_the_source() {
+    let client = spawn_mcp_client_in_dir("", None).await;
+
+    let checked = call_tool_json(&client, "check", json!({
+        "source": "int id(int x) { return x; }\nint main(void) { return id(0); }",
+        "function": "id",
+        "timeout": 1,
+    }))
+    .await
+    .unwrap();
+    let loaded = checked["temporary_source_dir"].as_str().expect("temp dir").to_string();
+
+    // The path the session is holding, still readable after the call that made
+    // it has returned. Asserted directly as well as through a tool, so a
+    // failure says which of the two broke.
+    let source_path = std::path::Path::new(&loaded).join("input.c");
+    assert!(
+        source_path.exists(),
+        "the loaded source went away when check returned: {}",
+        source_path.display()
+    );
+
+    // And through a tool that re-reads the session's file list from disk, which
+    // is the way a caller would actually meet this.
+    let goals = call_tool_json(&client, "get_wp_goals", json!({"want": ["counts"]}))
+        .await
+        .unwrap();
+    assert!(
+        goals["total_properties"].as_u64().is_some(),
+        "get_wp_goals after an inline check: {:?}",
+        goals
+    );
+    assert_eq!(goals["session"]["project_loaded"], true, "{:?}", goals);
+
+    let rerun = call_tool_json(&client, "run_wp", json!({"function": "id", "timeout": 1}))
+        .await
+        .unwrap();
+    assert!(
+        rerun.get("error").is_none(),
+        "run_wp after an inline check: {:?}",
+        rerun
     );
 
     let _ = client.cancel().await;

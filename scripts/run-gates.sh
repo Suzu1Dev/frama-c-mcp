@@ -70,7 +70,7 @@ want() {
 
 # Unaligned on purpose. The columns used to line up, and that is exactly what
 # the shfmt gate below rejects, so this file failed the gate it exists to run.
-want shfmt && run shfmt bash -c "git ls-files '*.sh' '*.hook' | xargs shfmt -i 4 -d"
+want shfmt && run shfmt bash -c "git ls-files -z '*.sh' '*.hook' | xargs -0 shfmt -i 4 -d"
 want clippy && run clippy cargo clippy --all-targets
 want unit && run unit cargo test --test unit
 want release && run release cargo build --release --tests

@@ -185,6 +185,12 @@ impl FramaCMcpServer {
                 );
             }
         }
+        // The root first, and checked, because create_dir_all would otherwise
+        // make it as a side effect with whatever the umask says, which is the
+        // 0755 the check below exists to refuse. What lands in here is the C the
+        // analysis reads and the socket this server then trusts.
+        crate::mcp::store::ensure_private_root()
+            .map_err(|e| McpError::internal_error(format!("scratch root unusable: {e}"), None))?;
         std::fs::create_dir_all(&sandbox_dir)
             .map_err(|e| McpError::internal_error(format!("mkdir failed: {}", e), None))?;
         let sandbox_file = sandbox_dir.join("sandbox.c");
@@ -286,7 +292,7 @@ impl FramaCMcpServer {
             }
         }
 
-        Ok(json_result(&json!({
+        Ok(json_result(json!({
             "sandbox_name": sandbox_name,
             "experiment_id": experiment_id,
             "ast_stmt_count": ast_stmt_count,
@@ -335,9 +341,7 @@ impl FramaCMcpServer {
             self.mark_sandbox_deleted(&func).await;
         }
 
-        Ok(CallToolResult::success(vec![Content::text(
-            json!({"success": true}).to_string(),
-        )]))
+        Ok(json_result(json!({"success": true})))
     }
 
 }

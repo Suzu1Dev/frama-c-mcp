@@ -5,7 +5,10 @@ edition = "2021"
 
 [dependencies]
 # MCP protocol (official Rust SDK).
-# Aligned with fv-core-mcp + mcp-server-fsm (both on 1.x).
+# The range is "3" rather than an exact version: Cargo.lock is tracked and the
+# build job passes --locked, so the published binaries are already a function of
+# the commit that names them, and a minimum-version bump with no API behind it
+# only makes this file disagree with every other entry.
 rmcp = { version = "3", features = ["server", "transport-io", "macros"] }
 
 # Async runtime
@@ -43,6 +46,10 @@ anyhow = "1"
 # Hash (for source_hash in snapshots)
 sha2 = "0.11"
 
+# Temp dirs with a name that cannot be pre-created, and RAII cleanup for the
+# scratch directories the analyses write into. Also used by the test fixtures.
+tempfile = "3"
+
 # Graph algorithms (verify-program-fsm: Tarjan SCC + Kahn layering)
 petgraph = "0.8"
 
@@ -56,9 +63,6 @@ chrono = { version = "0.4", features = ["serde"] }
 libc = "0.2"
 
 [dev-dependencies]
-# Temp dirs for test fixtures (state dir, project files).
-tempfile = "3"
-
 # MCP client side + child-process transport for end-to-end stdio JSON-RPC tests.
 # Used by tests/mcp_stdio_test.rs to spawn the server binary and drive it
 # through the actual MCP wire protocol (no internal-API shortcuts).

@@ -313,7 +313,7 @@ impl FramaCMcpServer {
             }))
             .await
             .ok()?;
-        let payload = tool_result_json(&result);
+        let payload = tool_result_json(result);
         let clauses = payload.get("clauses")?.as_array()?.clone();
 
         // Paired on the clause text, not on position. The planner emits by

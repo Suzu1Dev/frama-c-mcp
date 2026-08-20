@@ -328,6 +328,49 @@ fn a_flip_is_a_goal_that_timed_out_and_then_proved() {
     assert_eq!(flipped[0]["property"], "#p1");
 }
 
+/// Every command CI runs, as one text: the workflows plus the scripts in .ci/.
+///
+/// The guards below read the commands CI runs, and those commands live in two
+/// places now. The long shell blocks moved out of ci.yml into .ci/ so they
+/// could be formatted, shellcheck-able and runnable by hand, which left the
+/// step that runs them saying nothing but a path. A parser reading only the
+/// YAML would then see a release job that stages no assets and a lane that
+/// pins no test by name, and would report all clear having compared nothing.
+///
+/// The same lesson as ci_gates learned one directory over, when the artifact
+/// scan lived in a second workflow file: read the directory, so a script
+/// appearing in it is a non-event rather than a hole.
+fn ci_command_text(root: &std::path::Path) -> String {
+    let mut text = String::new();
+    for dir in [".github/workflows", ".ci"] {
+        let dir = root.join(dir);
+        let mut paths: Vec<std::path::PathBuf> = std::fs::read_dir(&dir)
+            .unwrap_or_else(|error| panic!("{}: {error}", dir.display()))
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.extension()
+                    .is_some_and(|ext| ext == "yml" || ext == "yaml" || ext == "sh")
+            })
+            .collect();
+
+        // read_dir order is arbitrary, and a guard that reports what it found
+        // is read by a human.
+        paths.sort();
+        for path in paths {
+            text.push_str(&std::fs::read_to_string(&path).unwrap_or_default());
+            text.push('\n');
+        }
+    }
+
+    assert!(
+        text.contains("cargo test"),
+        "no workflow or .ci script was read, so every guard reading this would \
+         pass on an empty requirement set"
+    );
+    text
+}
+
 /// The command a workflow step runs, or the line unchanged when it runs none.
 ///
 /// A step is either "run: <command>" on one line or a command inside a
@@ -362,8 +405,7 @@ fn step_command(line: &str) -> &str {
 #[test]
 fn ci_named_tests_still_exist() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-    let workflow =
-        std::fs::read_to_string(root.join(".github/workflows/ci.yml")).expect("ci.yml");
+    let workflow = ci_command_text(root);
 
     /// Every .rs file under a directory, read whole.
     fn rust_sources(dir: &std::path::Path) -> Vec<String> {
@@ -595,7 +637,14 @@ fn ci_frama_c_version_matches_supported_minimum() {
     // they disagree: a matrix the scripts refuse means CI installs a Frama-C
     // its own gates will not run against, and the floor above cannot see it
     // because the floor is satisfied.
-    for script in ["scripts/check-tutorial-corpus.sh", "scripts/check-abs-int-fixtures.sh"] {
+    for script in [
+        "scripts/check-tutorial-corpus.sh",
+        "scripts/check-abs-int-fixtures.sh",
+
+        // Refuses an unsupported matrix value before ten minutes of opam
+        // install, and so pins the same version the two gates above do.
+        ".ci/check-frama-c-matrix-version.sh",
+    ] {
         let text = std::fs::read_to_string(root.join(script)).expect(script);
 
         // Whole version strings on both sides, not majors. Comparing majors let
@@ -640,8 +689,7 @@ fn ci_frama_c_version_matches_supported_minimum() {
 #[test]
 fn ci_runs_every_test_target() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-    let workflow =
-        std::fs::read_to_string(root.join(".github/workflows/ci.yml")).expect("ci.yml");
+    let workflow = ci_command_text(root);
 
     // Word by word off the command lines, not a substring of the file: a
     // comment mentioning the target would satisfy a contains, and so would a
@@ -738,8 +786,10 @@ fn tarball_names(text: &str) -> std::collections::BTreeSet<String> {
 #[test]
 fn released_tarball_names_match_the_build_matrix() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-    let workflow =
-        std::fs::read_to_string(root.join(".github/workflows/ci.yml")).expect("ci.yml");
+
+    // The matrix is in the YAML and the staged names are in
+    // .ci/stage-release-assets.sh, so this needs both halves.
+    let workflow = ci_command_text(root);
     let readme = std::fs::read_to_string(root.join("README.md")).expect("README.md");
 
     // The matrix rows are the source of truth: a target exists because a row
@@ -786,24 +836,7 @@ fn released_tarball_names_match_the_build_matrix() {
 /// Split out because two tests need it and they check different halves: one
 /// that the runner covers CI, one that the documents cover the runner.
 fn ci_gates(root: &std::path::Path) -> Vec<String> {
-    // Every workflow, not just ci.yml. There is one file today, and there were
-    // two: artifact-scans.yml ran a gate of its own, and a version of this that
-    // read a single named file could not see it, which is the exact failure
-    // this test exists to prevent, one file over. Reading the directory is what
-    // makes a second workflow appearing again a non-event.
-    let mut workflow = String::new();
-    let workflows = root.join(".github/workflows");
-    for entry in std::fs::read_dir(&workflows).expect("workflows dir").flatten() {
-        let path = entry.path();
-        if path.extension().is_some_and(|ext| ext == "yml" || ext == "yaml") {
-            workflow.push_str(&std::fs::read_to_string(&path).unwrap_or_default());
-            workflow.push('\n');
-        }
-    }
-    assert!(
-        workflow.contains("cargo test"),
-        "no workflow was read, so this test would pass on an empty requirement set"
-    );
+    let workflow = ci_command_text(root);
 
     let mut required: Vec<String> = Vec::new();
     for line in workflow.lines() {
@@ -823,6 +856,22 @@ fn ci_gates(root: &std::path::Path) -> Vec<String> {
         suites >= 3 && required.iter().any(|gate| gate == "--test unit"),
         "the workflow parser stopped recognising cargo test lines: {required:?}"
     );
+
+    // The two lint gates by name, because they are the two that can leave the
+    // set without any suite count moving. Measured: extracting the shell block
+    // into .ci/check-shell-formatting.sh and writing the binary as "$bin"
+    // removed the literal gate_of matches on, so shfmt silently left this set
+    // and the two tests built on it went from checking it to not. Nothing went
+    // red. A gate that disappears has to fail here rather than be discovered by
+    // reading the file it used to be in.
+    for lint in ["shfmt", "cargo clippy"] {
+        assert!(
+            required.iter().any(|gate| gate == lint),
+            "{lint} is in no workflow or .ci script, so nothing can fail a push \
+             on it: {required:?}"
+        );
+    }
+
     required
 }
 
@@ -936,8 +985,8 @@ fn documented_gate_list_covers_ci() {
     // being told to run it, which is how the first version of this passed its
     // own control: the paragraph explaining the gap mentioned "dune runtest".
     //
-    // Every document in this list must exist, so a typo or a renamed file
-    // fails here rather than quietly checking one fewer copy.
+    // Every document in this list must exist, so a typo or a renamed file fails
+    // here rather than quietly checking one fewer copy.
     let gate_lists: Vec<(&str, String)> = ["README.md"]
         .into_iter()
         .map(|name| {
@@ -1028,3 +1077,99 @@ fn tool_router_matches_the_documented_surface() {
     assert_eq!(registered, documented);
 }
 
+
+/// A job that runs a script out of the tree checks the tree out first.
+///
+/// This exists because moving shell out of ci.yml into .ci/ turned steps that
+/// needed nothing into steps that need the repository, and the release job had
+/// no checkout: its comment said "No checkout: nothing here reads the tree",
+/// which was true when it was written and false the moment its shell became two
+/// files. Nothing caught it. It is not reachable from a pull request either,
+/// since the job is gated on a push to main, so the first evidence would have
+/// been a release that did not happen.
+///
+/// The checkout also has to be the job's first step, not merely somewhere
+/// before the script. actions/checkout cleans the workspace by default, so a
+/// checkout after actions/download-artifact deletes the artifacts the release
+/// is assembled from, and a job that fails that way still has a checkout and
+/// still runs its scripts. All five jobs already put it first, so this pins a
+/// convention rather than imposing one.
+#[test]
+fn jobs_running_repo_scripts_check_out_the_repo() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+
+    let mut offenders = Vec::new();
+    let mut checked = 0;
+    for entry in std::fs::read_dir(root.join(".github/workflows"))
+        .expect("workflows dir")
+        .flatten()
+    {
+        let path = entry.path();
+        if !path.extension().is_some_and(|ext| ext == "yml" || ext == "yaml") {
+            continue;
+        }
+        let workflow = std::fs::read_to_string(&path).unwrap_or_default();
+
+        // Jobs are the keys at one indent level under "jobs:", and steps run in
+        // file order, so a linear scan is enough to know whether the checkout
+        // came first. A YAML parser would be better and is not worth a
+        // dependency for five jobs.
+        let mut job = String::new();
+        let mut checkout_at = None;
+        let mut runs_repo_script = false;
+        let mut step = 0usize;
+        let mut finish = |job: &str, checkout: Option<usize>, runs: bool| {
+            if !runs {
+                return;
+            }
+            checked += 1;
+            match checkout {
+                Some(1) => {}
+                Some(at) => offenders.push(format!(
+                    "{job}: checks out at step {at} rather than first, so an earlier \
+                     step's workspace writes are cleaned away"
+                )),
+                None => offenders.push(format!("{job}: runs a repo script with no checkout")),
+            }
+        };
+
+        for line in workflow.lines() {
+            let indent = line.len() - line.trim_start().len();
+            let trimmed = line.trim();
+
+            // A key at two spaces, inside jobs, is a new job.
+            if indent == 2 && trimmed.ends_with(':') && !trimmed.starts_with('#') {
+                finish(&job, checkout_at, runs_repo_script);
+                job = trimmed.trim_end_matches(':').to_string();
+                (checkout_at, runs_repo_script, step) = (None, false, 0);
+                continue;
+            }
+
+            // Steps sit at six spaces. Counting every "- " would also count the
+            // build matrix's include entries, which are not steps.
+            if indent == 6 && trimmed.starts_with("- ") {
+                step += 1;
+            }
+            if trimmed.contains("actions/checkout") && checkout_at.is_none() {
+                checkout_at = Some(step);
+            }
+            if (trimmed.contains(".ci/") || trimmed.contains("scripts/"))
+                && !trimmed.starts_with('#')
+            {
+                runs_repo_script = true;
+            }
+        }
+        finish(&job, checkout_at, runs_repo_script);
+    }
+
+    assert!(
+        checked >= 3,
+        "no job was found running a repo script, so this guard compared nothing: \
+         the workflow moved and the parser did not"
+    );
+    assert!(
+        offenders.is_empty(),
+        "these jobs run a script out of the tree without checking it out first, \
+         so the step fails with no such file: {offenders:?}"
+    );
+}

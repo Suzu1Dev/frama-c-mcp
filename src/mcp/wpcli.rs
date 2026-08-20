@@ -208,7 +208,7 @@ impl FramaCMcpServer {
             })
             .await;
         response["proof_receipt"] = receipt;
-        Ok(json_result(&response))
+        Ok(json_result(response))
     }
 }
 
@@ -290,17 +290,26 @@ pub async fn run_why3_dump(
             "reason": "no source files available",
         });
     }
-    let nonce = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| duration.as_nanos())
-        .unwrap_or_default();
-    let out_dir = std::env::temp_dir().join(format!(
-        "frama-c-why3-dump-{}-{}-{}",
-        std::process::id(),
-        function.replace(':', "-"),
-        nonce
-    ));
-    let _ = std::fs::create_dir_all(&out_dir);
+
+    // A random O_EXCL name, and a guard that removes it when this call returns.
+    // The old spelling was pid plus a clock reading and was never removed at
+    // all, so every why3 dump leaked a directory for the life of the machine.
+    //
+    // The dump contents come back inside the payload, so wp_out below names a
+    // directory that no longer exists by the time a caller reads it: it is
+    // there to say which -wp-out the run used, not as somewhere to go looking.
+    // The one thing this gives up is a file over the size cap, which reports
+    // "truncated": true with no content and was previously still on disk
+    // because nothing cleaned it up. That was a leak rather than a promise.
+    let Ok(out_dir_guard) =
+        private_temp_dir(&format!("frama-c-why3-dump-{}-", function.replace(':', "-")))
+    else {
+        return json!({
+            "status": "error",
+            "reason": "could not create a temporary directory for the why3 dump",
+        });
+    };
+    let out_dir = out_dir_guard.path().to_path_buf();
 
     let mut args = project_cli_args(project_options);
     args.extend(files.iter().cloned());

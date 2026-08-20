@@ -627,14 +627,24 @@ impl FramaCMcpServer {
             }
         }
 
-        // /tmp with a short name, not `std::env::temp_dir()`: a Unix socket
-        // path is capped near 104 bytes, and on macOS `temp_dir()` is
-        // `/var/folders/<32>/<8>/T/`, half the budget before this directory is
-        // even named. The probe server died with ENAMETOOLONG, so every request
-        // came back `not_probed` and self_check looked clean having checked
-        // nothing. /tmp is where the main server already puts its socket.
-        let base = PathBuf::from(format!(
-            "/tmp/frama-c-mcp-selfcheck-{}-{}",
+        // Under the private root, which is in /tmp and short for the reason
+        // that matters here: a Unix socket path is capped near 104 bytes, and on
+        // macOS `temp_dir()` is `/var/folders/<32>/<8>/T/`, half the budget
+        // before this directory is even named. The probe server died with
+        // ENAMETOOLONG, so every request came back `not_probed` and self_check
+        // looked clean having checked nothing. The root is shorter than the
+        // name this used to build, so the budget improved.
+        let root = match crate::mcp::store::ensure_private_root() {
+            Ok(root) => root,
+            Err(error) => {
+                return json!({
+                    "status": "error",
+                    "reason": format!("scratch root unusable: {error}"),
+                });
+            }
+        };
+        let base = root.join(format!(
+            "sc-{}-{}",
             std::process::id(),
             SELF_CHECK_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         ));

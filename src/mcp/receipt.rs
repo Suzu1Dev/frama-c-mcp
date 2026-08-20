@@ -9,12 +9,33 @@
 //! are comparable exactly when their hashes match.
 
 use super::*;
+use crate::state::sha256_hex;
+
+/// What a receipt calls a source file.
+///
+/// Its own path, except for the scratch copy of an inline `source`, which is
+/// recorded as its bare name. The directory that holds it is chosen fresh on
+/// every call and is not part of what was proved, so digesting it would make
+/// two runs of the same source incomparable, and comparing two runs is the only
+/// thing a receipt is for. The old pid-shaped directory hid this by being
+/// constant within a session; a random name does not, which is what surfaced
+/// it. The content hash beside this is what tells two different sources apart.
+pub fn receipt_source_path(file: &str) -> String {
+    let path = std::path::Path::new(file);
+    let in_scratch = path.parent().and_then(|dir| dir.file_name()).is_some_and(|dir| {
+        dir.to_string_lossy().starts_with(super::analysis::CHECK_SCRATCH_PREFIX)
+    });
+    match path.file_name().filter(|_| in_scratch) {
+        Some(name) => name.to_string_lossy().into_owned(),
+        None => file.to_string(),
+    }
+}
 
 fn proof_receipt_source_files(files: &[String]) -> Vec<serde_json::Value> {
     let mut entries = files
         .iter()
         .map(|file| {
-            let path = file.to_string();
+            let path = receipt_source_path(file);
             match std::fs::read(file) {
                 Ok(bytes) => json!({
                     "path": path,
