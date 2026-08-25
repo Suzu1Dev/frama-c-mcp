@@ -4017,36 +4017,37 @@ impl FramaCMcpServer {
         &self,
         function: &str,
     ) -> Result<serde_json::Value, McpError> {
-        if let FunctionScope::Sandbox { .. } = scope_for_function(function) {
-            let resolved = self.resolve_client(function).await?;
-            let exp_id = resolved
-                .experiment_id
-                .as_ref()
-                .expect("invariant: a sandbox scope resolves to a sandbox client");
-            let decl_marker = {
-                let sandboxes = self.sandboxes.read().await;
-                sandboxes
-                    .metadata(exp_id.as_str())
-                    .map(|state| state.declaration_marker.clone())
-            };
-            let properties = fetch_properties(&resolved.client).await?;
-            let mut annotations: Vec<_> = properties
-                .into_iter()
-                .filter(|p| {
-                    decl_marker
-                        .as_ref()
-                        .is_none_or(|m| p["scope"].as_str() == Some(m.as_str()))
-                })
-                .collect();
-            self.mark_clause_origin(&resolved.client, &resolved.function, None, &mut annotations)
-                .await;
-            return Ok(json!(annotations));
-        }
-
-        let info = match scope_for_function(function) {
-            FunctionScope::Main(function) => self.resolve_function_or_refresh(function).await?,
-            FunctionScope::Sandbox { .. } => unreachable!("sandbox handled above"),
+        // One match, not two calls to scope_for_function. Asking twice meant the
+        // sandbox arm had to assert an experiment id the first call already
+        // carried, and the main arm had to declare a sandbox unreachable
+        // because the branch above had returned. Binding both arms here says
+        // the same thing without either claim.
+        let main_function = match scope_for_function(function) {
+            FunctionScope::Sandbox { experiment_id, .. } => {
+                let resolved = self.resolve_client(function).await?;
+                let decl_marker = {
+                    let sandboxes = self.sandboxes.read().await;
+                    sandboxes
+                        .metadata(experiment_id)
+                        .map(|state| state.declaration_marker.clone())
+                };
+                let properties = fetch_properties(&resolved.client).await?;
+                let mut annotations: Vec<_> = properties
+                    .into_iter()
+                    .filter(|p| {
+                        decl_marker
+                            .as_ref()
+                            .is_none_or(|m| p["scope"].as_str() == Some(m.as_str()))
+                    })
+                    .collect();
+                self.mark_clause_origin(&resolved.client, &resolved.function, None, &mut annotations)
+                    .await;
+                return Ok(json!(annotations));
+            }
+            FunctionScope::Main(function) => function,
         };
+
+        let info = self.resolve_function_or_refresh(main_function).await?;
         let client = self.require_client().await?;
         let properties = fetch_properties(&client).await?;
         let mut annotations: Vec<_> = properties
