@@ -7057,6 +7057,18 @@ async fn check_returns_one_field_set_on_both_paths() {
         assert_eq!(fields, expected, "{label} path field set moved");
         assert_eq!(payload["schema"], "frama-c-mcp.check.v2", "{label}");
 
+        if label == "reload failed" {
+            assert!(
+                payload["proof_receipt"]["subject"]["ast_digest"].is_null(),
+                "a failed reload must not reuse the prior project's AST: {payload:?}"
+            );
+            assert_eq!(
+                payload["proof_receipt"]["subject"]["ast_digest_unavailable_reason"],
+                "reload_failed",
+                "{payload:?}"
+            );
+        }
+
         // The frozen enum has two values and no third.
         let verdict = payload["verdict"].as_str().unwrap_or_default();
         assert!(
@@ -7117,7 +7129,7 @@ async fn the_receipt_records_the_contract_it_proved_under() {
     inject("x >= 0 && x <= 1").await.unwrap();
     let narrow = prove().await.unwrap()["proof_receipt"].clone();
 
-    assert_eq!(narrow["schema"], "frama-c-mcp.proof-receipt.v3", "{narrow:?}");
+    assert_eq!(narrow["schema"], "frama-c-mcp.proof-receipt.v4", "{narrow:?}");
 
     // The file never moved, and the receipt is right to say so. That is exactly
     // why the file hashes cannot carry this.

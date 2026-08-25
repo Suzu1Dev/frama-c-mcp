@@ -129,11 +129,45 @@ none.
 - `reason` strings anywhere.
 - `recommended_next_call.args`, which names tool parameters and moves when a
   tool does. Four of these changed in one day when five tools were folded.
-- The proof receipt's interior, which `frama-c-mcp.proof-receipt.v3` covers.
+- The proof receipt's interior, which `frama-c-mcp.proof-receipt.v4` covers.
+
+## A second shape: `check {variants: [...]}`
+
+`check` returns a different top-level payload when the call carries `variants`,
+and it says so in the same place: `schema` is `frama-c-mcp.check-variants.v1`
+rather than `frama-c-mcp.check.v2`. Nothing above applies to it. The rule at the
+top of this page already covers the case, since a consumer that does not
+recognise the schema string is told to stop rather than guess, and a caller only
+reaches this shape by asking for it.
+
+| Field | Type | Meaning |
+|---|---|---|
+| `schema` | string | `frama-c-mcp.check-variants.v1` |
+| `verdict` | string | `proved` only when every variant proved, no two shared an AST, and every variant had a digest to compare. `incomplete` otherwise |
+| `variant_count` | number | Configurations run |
+| `distinct_asts` | number | Distinct AST digests established, which is not `variant_count` minus `duplicate_ast_count` when a digest was unavailable |
+| `duplicate_ast_count` | number | Variants that asked for different code and got an AST byte-identical to an earlier one. Entries differing only in `model` are exempt, since no WP option changes the AST |
+| `ast_digest_unavailable_count` | number | Variants with no digest, so they were compared to nothing. Non-zero forces `incomplete`, because a comparison that did not happen must not read as one that found nothing |
+| `reason` | string or null | Why the verdict is not `proved`, naming the duplicate case or the unavailable-digest case |
+| `variants[]` | array | One entry per configuration |
+
+Each `variants[]` entry carries `label`, the effective `defines`, `machdep` and
+`model`, its own `verdict`, its `incomplete[]` codes as bare strings, its
+`ast_digest`, its `wp_backend_diagnosis`, and the `proof_receipt_sha256` of the
+run. An entry that collided with an earlier one, having asked for different
+code, gains `duplicate_ast`, holding that earlier entry's label. Collisions are
+reported once per set of AST-relevant inputs rather than once per entry, so a
+model sweep over an already-reported group does not repeat the finding. Labels are unique: a repeated one is suffixed with
+its index, so `duplicate_ast` always names exactly one entry.
+
+The digests are the point. Two configurations that select the same code produce
+identical goal counts and identical verdicts, so nothing but the normalised AST
+separates a matrix that was really checked from one configuration checked twice.
 
 ## Compatibility history
 
 | Version | Date | Change |
 |---|---|---|
+| `frama-c-mcp.check-variants.v1` | 2026-08-24 | First frozen. The payload `check {variants: [...]}` returns, described above. Does not change `frama-c-mcp.check.v2`, which is still what a call without `variants` returns |
 | `frama-c-mcp.check.v2` | 2026-08-12 | `want` selects the analyses, so `eva`, `eva_alarms`, `wp` and `wp_goals` are null for a second reason and two codes tell it from a failure. `run_eva` folded in and removed |
 | `frama-c-mcp.check.v1` | 2026-08-12 | First frozen. Thirteen `incomplete[]` codes. `detail` added to the reload-failure payload so both paths carry one field set |

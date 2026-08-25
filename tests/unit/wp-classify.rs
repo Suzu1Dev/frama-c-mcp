@@ -558,6 +558,8 @@ fn proof_receipt_hash_is_stable_and_status_sensitive() {
     let first = proof_receipt_with_hash(proof_receipt_body(ProofReceiptBody {
         tool: "run_wp",
         source_files: vec![json!({"path": "a.c", "sha256": "abc"})],
+        ast_digest: json!("ast0"),
+        ast_digest_unavailable_reason: serde_json::Value::Null,
         contracts: json!({}),
         environment: environment.clone(),
         wp_config: wp.clone(),
@@ -568,6 +570,8 @@ fn proof_receipt_hash_is_stable_and_status_sensitive() {
     let second = proof_receipt_with_hash(proof_receipt_body(ProofReceiptBody {
         tool: "run_wp",
         source_files: vec![json!({"path": "a.c", "sha256": "abc"})],
+        ast_digest: json!("ast0"),
+        ast_digest_unavailable_reason: serde_json::Value::Null,
         contracts: json!({}),
         environment: environment.clone(),
         wp_config: wp.clone(),
@@ -580,6 +584,8 @@ fn proof_receipt_hash_is_stable_and_status_sensitive() {
     let changed = proof_receipt_with_hash(proof_receipt_body(ProofReceiptBody {
         tool: "run_wp",
         source_files: vec![json!({"path": "a.c", "sha256": "abc"})],
+        ast_digest: json!("ast0"),
+        ast_digest_unavailable_reason: serde_json::Value::Null,
         contracts: json!({}),
         environment,
         wp_config: wp,
@@ -1381,4 +1387,197 @@ fn stable_goal_id_is_sixteen_hex_characters_of_the_payload_digest() {
     let mut labelled = json!({"hash_label": "re_0badf00d", "fct": "abs"});
     enrich_goal_stable_id(&mut labelled, "spec", None);
     assert_eq!(labelled["stable_goal_id"], "re_0badf00d");
+}
+
+/// The message stream, not the goal, is where a Why3 abort is reported. These
+/// three cases are what an agent must be able to tell apart: a crashed backend
+/// under a model that refuses the cast in the code, a crashed backend for some
+/// other reason, and a clean run.
+#[test]
+fn backend_diagnosis_routes_a_cast_anomaly_to_the_other_model() {
+    let messages = vec![
+        json!({
+            "plugin": "wp",
+            "kind": "WARNING",
+            "source": {"line": 21},
+            "message": "Cast with incompatible pointers types (source: blk*) (target: sint8*)"
+        }),
+        json!({
+            "plugin": "wp",
+            "kind": "WARNING",
+            "message": "Goal Property:\n  running prover Alt-Ergo:2.6.3 failed ([Why3 Error] anomaly: Invalid_argument(\"unbound variable in of_term\"))"
+        }),
+    ];
+    let diagnosis = wp_backend_diagnosis(&messages, Some("Typed+nocast"));
+    assert_eq!(diagnosis["kind"], "why3_anomaly_with_pointer_cast");
+    assert_eq!(diagnosis["anomaly_count"], 1);
+    assert_eq!(diagnosis["cast_warning_lines"], json!([21]));
+    assert_eq!(diagnosis["next_action"]["tool"], "run_wp");
+    assert_eq!(diagnosis["next_action"]["args"]["model"], "Typed+cast");
+}
+
+#[test]
+fn backend_diagnosis_without_a_cast_asks_for_the_versions_instead() {
+    let messages = vec![json!({
+        "plugin": "wp",
+        "kind": "WARNING",
+        "message": "running prover Z3 failed ([Why3 Error] anomaly: Not_found)"
+    })];
+    let diagnosis = wp_backend_diagnosis(&messages, Some("Typed+nocast"));
+    assert_eq!(diagnosis["kind"], "why3_anomaly");
+    assert_eq!(diagnosis["next_action"]["tool"], "self_check");
+}
+
+#[test]
+fn backend_diagnosis_is_null_when_the_provers_answered() {
+    let messages = vec![json!({
+        "plugin": "wp",
+        "kind": "WARNING",
+        "source": {"line": 21},
+        "message": "Cast with incompatible pointers types (source: blk*) (target: sint8*)"
+    })];
+    assert!(wp_backend_diagnosis(&messages, Some("Typed+nocast")).is_null());
+    assert!(wp_backend_diagnosis(&[], Some("Typed+cast")).is_null());
+}
+
+#[test]
+fn backend_diagnosis_ignores_non_why3_fatal_errors() {
+    let messages = vec![json!({
+        "plugin": "wp",
+        "kind": "ERROR",
+        "message": "Frama_c_kernel.Log.AbortFatal(\"wp\")"
+    })];
+    assert!(wp_backend_diagnosis(&messages, Some("Typed+cast")).is_null());
+}
+
+/// WP interleaves the warnings of several goals, so the same source line comes
+/// back non-adjacently. Vec::dedup only collapses adjacent repeats and left the
+/// duplicate in the payload.
+#[test]
+fn backend_diagnosis_reports_each_cast_line_once() {
+    let cast = |line: u64| {
+        json!({
+            "plugin": "wp",
+            "kind": "WARNING",
+            "source": {"line": line},
+            "message": "Cast with incompatible pointers types (source: blk*) (target: sint8*)"
+        })
+    };
+    let messages = vec![
+        cast(21),
+        cast(30),
+        cast(21),
+        json!({
+            "plugin": "wp",
+            "kind": "WARNING",
+            "message": "running prover Alt-Ergo failed ([Why3 Error] anomaly: Invalid_argument(\"unbound variable in of_term\"))"
+        }),
+    ];
+    let diagnosis = wp_backend_diagnosis(&messages, Some("Typed+nocast"));
+    assert_eq!(diagnosis["cast_warning_lines"], json!([21, 30]));
+}
+
+/// The abort is reported once per goal and per prover, and the same text is
+/// already in messages[]. The sample is bounded; the count is not.
+#[test]
+fn backend_diagnosis_counts_every_anomaly_but_samples_the_text() {
+    let messages: Vec<serde_json::Value> = (0..40)
+        .map(|goal| {
+            json!({
+                "plugin": "wp",
+                "kind": "WARNING",
+                "message": format!("Goal g{goal}: running prover Z3 failed ([Why3 Error] anomaly: Not_found)")
+            })
+        })
+        .collect();
+    let diagnosis = wp_backend_diagnosis(&messages, Some("Typed+nocast"));
+    assert_eq!(diagnosis["anomaly_count"], 40);
+    assert_eq!(diagnosis["anomalies"].as_array().unwrap().len(), 5);
+    assert_eq!(diagnosis["anomalies_truncated"], true);
+}
+
+/// The two readers that see real abort text agree on what it reads like.
+///
+/// They used to be three keyword lists and they had drifted, but the third was
+/// never a reader of anything: it searched the goal record, which carries no
+/// abort text. The two left are the WP message stream and the protocol-error
+/// classifier, and both are fed the genuine wording here.
+#[test]
+fn both_readers_of_abort_text_agree_on_what_an_abort_reads_like() {
+    for phrase in [
+        "anomaly: Invalid_argument(\"unbound variable in of_term\")",
+        "anomaly: Not_found",
+        "internal error",
+        "fatal error",
+    ] {
+        let text = format!("running prover Z3 failed ([Why3 Error] {phrase})");
+        let diagnosis = wp_backend_diagnosis(
+            &[json!({"plugin": "wp", "kind": "WARNING", "message": text.clone()})],
+            Some("Typed+cast"),
+        );
+        assert_eq!(diagnosis["kind"], "why3_anomaly", "{text}");
+        assert!(why3_aborted(&text.to_ascii_lowercase()), "{text}");
+    }
+
+    // The overlap that made the shared predicate necessary. "anomaly:
+    // Not_found" satisfies the missing-Why3-configuration keywords too, and
+    // losing the race there sends the caller to fix a toolchain that is
+    // working.
+    let not_found = "running prover Z3 failed ([Why3 Error] anomaly: Not_found)";
+    let (kind, _, _) = frama_c_mcp::error::classify_server_error(not_found);
+    assert_eq!(kind, "Why3Anomaly", "{not_found}");
+    assert_eq!(
+        frama_c_mcp::error::failure_kind_for_error_kind(kind),
+        "frama_c_internal"
+    );
+}
+
+/// The digest has to reach the receipt hash, or it is decoration.
+///
+/// This is the regression for a real miss: a verify target ran two passes it
+/// believed were different bit-scan configurations, both green, for several
+/// rounds. The passes analysed identical code, because Frama-C does not
+/// predefine __GNUC__ and the file selected its portable fallbacks either way.
+/// Goal counts were equal and correct; nothing in the receipt disagreed.
+#[test]
+fn ast_digest_separates_runs_that_goal_counts_cannot() {
+    let environment = json!({"frama_c_version": {"stdout": "33.0"}});
+    let build = |digest: serde_json::Value| {
+        proof_receipt_with_hash(proof_receipt_body(ProofReceiptBody {
+            tool: "run_wp",
+            source_files: vec![json!({"path": "a.c", "sha256": "abc"})],
+            ast_digest: digest.clone(),
+            ast_digest_unavailable_reason: if digest.is_null() {
+                json!("no_client")
+            } else {
+                serde_json::Value::Null
+            },
+            contracts: json!({}),
+            environment: environment.clone(),
+            wp_config: json!({"model": "Typed+cast"}),
+            goals: vec![json!({"stable_goal_id": "sg_1", "status": "valid"})],
+            goals_status_source: "wp_fetch_goals",
+            reported: json!({}),
+        }))
+    };
+
+    let portable = build(json!("digest_portable"));
+    let intrinsic = build(json!("digest_intrinsic"));
+    let same = build(json!("digest_portable"));
+
+    assert_eq!(portable["subject"]["ast_digest"], "digest_portable");
+    assert_eq!(
+        portable["sha256"], same["sha256"],
+        "same AST and same goals must give one receipt hash"
+    );
+    assert_ne!(
+        portable["sha256"], intrinsic["sha256"],
+        "two ASTs with identical goal sets must not share a receipt hash"
+    );
+
+    // Null is "not established", so it must never read as two runs agreeing.
+    let unknown_a = build(serde_json::Value::Null);
+    let unknown_b = build(serde_json::Value::Null);
+    assert!(unknown_a["subject"]["ast_digest"].is_null());
+    assert_ne!(unknown_a["sha256"], unknown_b["sha256"]);
 }

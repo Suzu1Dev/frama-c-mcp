@@ -423,9 +423,66 @@ uncontracted callee is announced there and nowhere else, and it weakens every
 proof above it.
 
 `check`, `run_wp`, and stored conclusions carry a `proof_receipt`
-(`frama-c-mcp.proof-receipt.v3`): the source-file hash, the Frama-C and prover
-environment, the effective WP configuration, per-goal statuses, and a sha256
-over all of it. Two runs are comparable exactly when their receipts match.
+(`frama-c-mcp.proof-receipt.v4`): the source-file hash, an `ast_digest`, the
+Frama-C and prover environment, the effective WP configuration, per-goal
+statuses, and a sha256 over all of it. Two runs are comparable exactly when
+their receipts match.
+
+`ast_digest` is a hash of the normalised AST, and it answers a question the
+source-file hash cannot: what was actually analysed. Different `defines`,
+include paths, or machdep over identical files produce different digests; and,
+more usefully, `defines` that select nothing different produce the *same*
+digest. That second case is the dangerous one, because it reads as
+configuration coverage that was never there. A real instance: a project's
+verify target ran a default pass and a `-DTLSF_NO_INTRINSICS` pass, reported
+both green, and analysed identical code both times, because Frama-C does not
+predefine `__GNUC__` and the source selected its portable fallbacks either way.
+Equal goal counts cannot show that. Equal digests can. `null` means the digest
+could not be established, so two nulls never count as agreement: the receipt
+carries a random `ast_digest_unavailable_nonce` in that case, which makes two
+such receipts differ by construction. `ast_digest_unavailable_reason` says why, because the
+nonce that enforces the non-equality would otherwise erase the distinction. It
+is `no_client` when nothing is attached, `reload_failed` when the input did not
+parse and the resident AST is a previous project's, `request_answered_empty`
+when the print came back with nothing, and `request_failed: <message>`
+otherwise. That last one covers both an absent `ast-utils` and a print that
+outran its budget: the client reports the two the same way, and separating them
+would mean parsing the error text. The isolated CLI retry is not one of those
+cases and gets the same `unavailable_isolated_cli_retry` marker the contracts
+field already uses: it proves the files on disk in another process, so the live
+AST does not describe it.
+
+### Checking several configurations at once
+
+`check {variants: [...]}` runs the same check over a list of configurations and
+reports them together. Each entry may carry `defines`, `machdep`, `model` and a
+`label`, overriding the top-level value; `files` and `function` are shared.
+
+This exists because the questions worth asking about a real project are
+comparative: portable path against compiler intrinsics, 32-bit against 64-bit,
+one memory model against another. Answering them one `check` at a time makes
+the comparison the caller's job, and the comparison is where the mistakes are.
+
+The result carries `ast_digest` per variant and reports `duplicate_ast` when two
+entries asked for different code and analysed byte-identical ASTs, which no goal
+count can show. Entries differing only in `model` are exempt, since no WP option
+changes the AST and a memory-model sweep is meant to share one. A real
+instance, and the reason this is here: a project's verify target ran a default
+pass alongside a `-DTLSF_NO_INTRINSICS` pass and reported both green for
+several rounds. Frama-C does not predefine `__GNUC__`, so the source selected
+its portable fallbacks either way and the two passes analysed the same code.
+Equal goal counts, equal verdicts, nothing disagreeing. A duplicate makes the
+overall verdict `incomplete`, because coverage that was never there should not
+read as a clean run.
+
+So does a missing digest. `ast_digest_unavailable_count` reports variants that
+had none, which happens when the ast-utils plug-in is absent or printing the AST
+outran its budget, and a non-zero count also forces `incomplete`: those variants
+were compared to nothing, and a comparison that did not happen must not read as
+one that happened and found nothing. Field list in
+[docs/reference/result-schema.md](docs/reference/result-schema.md), under the
+`frama-c-mcp.check-variants.v1` schema this call returns instead of the usual
+one.
 
 ### Proof evidence
 

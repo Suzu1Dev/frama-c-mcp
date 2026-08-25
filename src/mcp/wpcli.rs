@@ -191,7 +191,7 @@ impl FramaCMcpServer {
             ),
         });
         let receipt = self
-            .proof_receipt(ProofReceiptRequest {
+            .proof_receipt(None, ProofReceiptRequest {
                 tool: "run_wp",
                 source_files: files,
                 wp_config: response["effective_wp_config"].clone(),

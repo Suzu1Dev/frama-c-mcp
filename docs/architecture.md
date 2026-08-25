@@ -83,7 +83,7 @@ hands back subtly wrong C is the failure mode with the highest cost.
 
 Verdict and completeness are separate axes. `check` reports `verdict: "proved"` only when `incomplete[]` is empty, so a step that did not run cannot read as a clean result; the CLI's `--require-complete` turns any `incomplete[]` entry into a non-zero exit.
 
-Evidence travels with the result. `check`, `run_wp`, and stored conclusions carry a `proof_receipt` (`frama-c-mcp.proof-receipt.v3`) holding the source hash, environment, effective WP configuration, per-goal statuses, and a sha256 over all of it, so two runs are comparable exactly when their receipts match. `run_wp` additionally flags callees whose contracts it assumed rather than proved, and conclusions record `stale_dependencies` and `stale_proof_environment` when a callee conclusion or the prover environment moves under them.
+Evidence travels with the result. `check`, `run_wp`, and stored conclusions carry a `proof_receipt` (`frama-c-mcp.proof-receipt.v4`) holding the source hash, AST digest, environment, effective WP configuration, per-goal statuses, and a sha256 over all of it, so two runs are comparable exactly when their receipts match. `run_wp` additionally flags callees whose contracts it assumed rather than proved, and conclusions record `stale_dependencies` and `stale_proof_environment` when a callee conclusion or the prover environment moves under them.
 
 ## Design Decisions
 

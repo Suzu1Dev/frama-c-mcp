@@ -124,6 +124,50 @@ pub fn proof_receipt_with_hash(mut body: serde_json::Value) -> serde_json::Value
     body
 }
 
+/// The printed AST with generated labels canonicalized, ready to hash.
+///
+/// Injection stamps every clause with a fresh label, "an_ffed752e_Req0: x >=
+/// 0",
+/// so printing the AST after re-injecting an identical contract yields
+/// different bytes and therefore a different digest. That is the opposite of
+/// what the digest is for: it exists so two runs over the same analysed code
+/// compare equal. proof_receipt_contracts already strips these from clause text
+/// for the same reason; this is the same fact applied to the whole source.
+///
+/// The prefixes are the ones generate_hash_label emits and the hex run is its
+/// eight characters, but neither is enough on its own. Two things pin this
+/// down.
+///
+/// The trailing name admits underscores, because full_label appends a caller's
+/// label verbatim: without it "an_deadbeef_requires_behaviors" matched nothing
+/// at all, so the one shape most likely to be re-injected stayed unstable,
+/// which is the whole defect this exists to fix.
+///
+/// And the match must be followed by a colon, which is where ACSL puts a label
+/// and nowhere else. Unanchored, this rewrote any identifier that merely looked
+/// like one: "int an_deadbeef = 3;" and "x = as_12345678 + 1;" were both
+/// canonicalized, so two genuinely different ASTs could hash equal. That is a
+/// worse failure than the instability, because an unstable digest reports a
+/// difference that is not there while a colliding one hides one that is.
+pub fn canonical_ast_for_digest(source: &str) -> std::borrow::Cow<'_, str> {
+    static GENERATED_LABEL: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let re = GENERATED_LABEL.get_or_init(|| {
+        // The colon is captured and re-emitted rather than matched by
+        // lookahead: this crate has no lookahead, and a pattern using one is a
+        // runtime parse error, not a compile error. The first build of that
+        // mistake panicked on every check.
+        //
+        // "\w*" rather than a structured suffix, because full_label appends a
+        // caller's label verbatim and those carry underscores: acsl.rs builds
+        // "<keyword>_behaviors", and the plugin appends "__spec". A pattern
+        // that stops at the first underscore left every one of those alone,
+        // which is the shape most likely to be re-injected.
+        regex::Regex::new(r"\b(?:re|en|as|li|la|lv|at|an)_[0-9a-f]{8}\w*(\s*:)")
+            .expect("generated-label pattern is a literal")
+    });
+    re.replace_all(source, "an_00000000$1")
+}
+
 /// Drop a generated hash label from a clause's text.
 ///
 /// An injected clause reads "an_ffed752e_Req0: x >= 0". The label is fresh per
@@ -172,6 +216,8 @@ pub struct ProofReceiptRequest<'a> {
 pub struct ProofReceiptBody<'a> {
     pub tool: &'a str,
     pub source_files: Vec<serde_json::Value>,
+    pub ast_digest: serde_json::Value,
+    pub ast_digest_unavailable_reason: serde_json::Value,
     pub contracts: serde_json::Value,
     pub environment: serde_json::Value,
     pub wp_config: serde_json::Value,
@@ -180,10 +226,15 @@ pub struct ProofReceiptBody<'a> {
     pub reported: serde_json::Value,
 }
 
+/// Not a pure function of its input: a null ast_digest draws a fresh nonce, so
+/// two calls on identical bodies differ by design. Every other input is
+/// deterministic.
 pub fn proof_receipt_body(body: ProofReceiptBody<'_>) -> serde_json::Value {
     let ProofReceiptBody {
         tool,
         source_files,
+        ast_digest,
+        ast_digest_unavailable_reason,
         contracts,
         environment,
         wp_config,
@@ -193,11 +244,42 @@ pub fn proof_receipt_body(body: ProofReceiptBody<'_>) -> serde_json::Value {
     } = body;
     let source_hash = sha256_hex(&serde_json::to_vec(&source_files).unwrap_or_default());
     json!({
-        "schema": "frama-c-mcp.proof-receipt.v3",
+        "schema": "frama-c-mcp.proof-receipt.v4",
         "subject": {
             "tool": tool,
             "source_hash": source_hash,
             "files": source_files,
+
+            // What was actually analysed, which the file hashes above cannot
+            // show. Two runs over identical files still analyse different code
+            // whenever the defines, include paths, or machdep differ, and the
+            // reverse also happens: defines that select nothing different
+            // produce byte-identical ASTs. Only the second case is dangerous,
+            // because it reads as configuration coverage that was never there.
+            //
+            // Measured on a real allocator: a verify target ran a default pass
+            // and a -DTLSF_NO_INTRINSICS pass and reported both green for
+            // several rounds. Frama-C does not predefine __GNUC__, so the file
+            // selected its portable fallbacks either way and the two passes
+            // analysed the same code. Goal counts cannot show that; equal
+            // digests can.
+            "ast_digest": ast_digest,
+
+            // Null is the one value here that must never compare equal to
+            // itself: two runs that both failed to establish a digest agree
+            // about nothing, and a receipt that let them match would report
+            // that agreement as coverage. The nonce makes proof_receipt_body
+            // impure on exactly that input and on no other, which is the point
+            // rather than an oversight.
+            //
+            // The reason beside it is what keeps the nondeterminism legible. A
+            // digest can go unestablished because no client is attached,
+            // because ast-utils is not installed, or because printing the AST
+            // outran its budget on a large project, and collapsing all three
+            // into a fresh random hash leaves a receipt that never matches and
+            // never says why.
+            "ast_digest_unavailable_nonce": ast_digest.is_null().then(|| random_hex(16)),
+            "ast_digest_unavailable_reason": ast_digest_unavailable_reason,
 
             // What WP actually proved under, which the file hashes above do not
             // cover for anything injected this session.
@@ -335,7 +417,88 @@ impl FramaCMcpServer {
         serde_json::Value::Object(contracts)
     }
 
-    pub async fn proof_receipt(&self, request: ProofReceiptRequest<'_>) -> serde_json::Value {
+    /// A digest of the normalised AST, as the analysis actually sees it, and
+    /// the reason when there is none.
+    ///
+    /// Best effort: a run whose client is gone, whose plug-in does not answer,
+    /// or whose AST is too large to print inside the budget gets null rather
+    /// than a failed receipt. Null means "not established", so two null digests
+    /// never compare equal and cannot be read as two runs agreeing. The reason
+    /// beside it is what tells a reader which of those happened, since the
+    /// nonce that enforces the non-equality erases the distinction.
+    ///
+    /// The isolated CLI retry is not one of those cases and does not get a
+    /// nonce. It proves the files on disk in a separate process while the live
+    /// AST here carries whatever was injected this session, so the honest
+    /// answer is the same marker proof_receipt_contracts already returns: this
+    /// field does not describe that run.
+    ///
+    /// The budget is its own rather than the default GET budget, because
+    /// printSource runs the printer over the whole AST and ships the result
+    /// back over the socket. On a large project ten seconds expires, and the
+    /// failure is silent: every receipt from then on carries a fresh nonce.
+    pub async fn proof_receipt_ast_digest(
+        &self,
+        client: Option<&FramaCClient>,
+        goals_status_source: &str,
+    ) -> (serde_json::Value, serde_json::Value) {
+        if goals_status_source == "unavailable_isolated_cli_retry" {
+            return (
+                json!("unavailable_isolated_cli_retry"),
+                serde_json::Value::Null,
+            );
+        }
+
+        // A failed reload leaves Frama-C's previous project resident. Its AST
+        // cannot describe the input that failed to load.
+        if goals_status_source == "not_run_reload_failed" {
+            return (serde_json::Value::Null, json!("reload_failed"));
+        }
+
+        // Resolved first, so the request is issued once rather than once per
+        // arm. run_wp passes the client it already holds because a sandbox run
+        // holds the sandbox's, and require_client answers with the main
+        // project's: taking that path for a sandbox would digest the wrong AST.
+        let owned;
+        let client = match client {
+            Some(client) => client,
+            None => match self.require_client().await {
+                Ok(client) => {
+                    owned = client;
+                    &*owned
+                }
+                Err(_) => return (serde_json::Value::Null, json!("no_client")),
+            },
+        };
+        match client.print_source().await {
+            Ok(text) if !text.is_empty() => (
+                json!(sha256_hex(canonical_ast_for_digest(&text).as_bytes())),
+                serde_json::Value::Null,
+            ),
+
+            // Empty covers both a request that answered with something other
+            // than a string, which print_source reports as "", and a project
+            // with nothing in it. Neither is a digest, and telling them apart
+            // would mean print_source returning the raw Value, which no other
+            // caller wants.
+            Ok(_) => (serde_json::Value::Null, json!("request_answered_empty")),
+
+            // One reason covers the plug-in being absent and the print
+            // outrunning its budget, because the client reports both as a
+            // failed GET and telling them apart would mean parsing the error
+            // text. The message is carried verbatim so a reader can.
+            Err(error) => (
+                serde_json::Value::Null,
+                json!(format!("request_failed: {error}")),
+            ),
+        }
+    }
+
+    pub async fn proof_receipt(
+        &self,
+        client: Option<&FramaCClient>,
+        request: ProofReceiptRequest<'_>,
+    ) -> serde_json::Value {
         let ProofReceiptRequest {
             tool,
             source_files,
@@ -347,9 +510,16 @@ impl FramaCMcpServer {
             properties,
         } = request;
 
-        // Three independent probes, so they run together rather than in
-        // sequence. Every check builds two receipts, one for itself and one for
-        // the run_wp it calls, and the why3 probe is the slow one.
+        // Probed per receipt, deliberately, and not cached across them. Doing
+        // so cuts six process spawns per check to three and saves the 0.79s
+        // that "opam var switch" costs, which is real but small, and it buys
+        // that by making the receipt describe the environment at server start
+        // rather than at proof time. "why3 config list-provers" can change
+        // under a live process, self_check would go on reporting the live
+        // answer, and the two would disagree inside one session. A receipt
+        // exists so a reader can tell what actually produced a verdict, so it
+        // is the wrong field to make cheap. The wall clock this was reaching
+        // for is in the serial test lane, not here.
         let (frama_c_version, why3_provers, opam_switch) = tokio::join!(
             run_command_json(&self.frama_c_path, &["-version"], TOOL_PROBE_BUDGET),
             run_command_json("why3", &["config", "list-provers"], TOOL_PROBE_BUDGET),
@@ -360,12 +530,20 @@ impl FramaCMcpServer {
             "why3_provers": why3_provers,
             "opam_switch": opam_switch,
         });
+
+        // Sequential rather than joined: both go through FramaCClient::get,
+        // which takes the connection lock, so a join here serializes on the
+        // mutex anyway and only reads as an optimization.
         let contracts = self
             .proof_receipt_contracts(&wp_config, goals_status_source)
             .await;
+        let (ast_digest, ast_digest_unavailable_reason) =
+            self.proof_receipt_ast_digest(client, goals_status_source).await;
         let receipt = proof_receipt_with_hash(proof_receipt_body(ProofReceiptBody {
             tool,
             source_files: proof_receipt_source_files(&source_files),
+            ast_digest,
+            ast_digest_unavailable_reason,
             contracts,
             environment,
             wp_config,

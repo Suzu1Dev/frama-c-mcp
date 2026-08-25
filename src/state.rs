@@ -839,14 +839,17 @@ impl SessionState {
             return Err(format!("cannot store verified conclusion for '{}': missing proof_receipt", entry.function));
         };
 
-        // v2 stays accepted. Conclusions stored before v3 added the contract
-        // snapshot are not wrong, they just cannot be byte-compared with a v3
-        // receipt, which is what a version bump is for. Rejecting them would
-        // invalidate stored work to gain nothing.
+        // Older receipts stay accepted. v3 added the contract snapshot and v4
+        // added the AST digest, so neither compares byte-for-byte with newer
+        // receipts. Rejecting stored work would gain nothing.
         let schema = receipt.get("schema").and_then(|v| v.as_str());
         if !matches!(
             schema,
-            Some("frama-c-mcp.proof-receipt.v2" | "frama-c-mcp.proof-receipt.v3")
+            Some(
+                "frama-c-mcp.proof-receipt.v2"
+                    | "frama-c-mcp.proof-receipt.v3"
+                    | "frama-c-mcp.proof-receipt.v4"
+            )
         ) {
             return Err(format!("cannot store verified conclusion for '{}': invalid proof_receipt schema", entry.function));
         }

@@ -6,6 +6,7 @@ use super::codec::{self, FramaCCommand, FramaCResponse};
 use super::transport::Transport;
 use crate::error::{FramaCError, FramaCRequestDiagnostics};
 use crate::state::SessionState;
+use serde_json::json;
 
 struct ClientInner {
     transport: Transport,
@@ -430,6 +431,49 @@ impl FramaCClient {
         request: &str,
         data: serde_json::Value,
     ) -> Result<serde_json::Value, FramaCError> {
+        self.get_with_timeout(request, data, Duration::from_secs(10))
+            .await
+    }
+
+    /// The whole loaded AST as one translation unit, printed by ast-utils.
+    ///
+    /// A method rather than a shared constant, because what the five callers
+    /// were duplicating was the call, not the budget: the request name, the
+    /// empty argument, and the timeout were written out at each one, and three
+    /// of them then repeated the same as_str().unwrap_or_default(). A sixth
+    /// caller can forget a shared const; it cannot forget this.
+    ///
+    /// Empty is returned rather than refused. A caller that treats an empty
+    /// AST as an error says so itself, which write_current_ast_source does.
+    pub async fn print_source(&self) -> Result<String, FramaCError> {
+        let value = self
+            .get_with_timeout("plugins.ast-utils.printSource", json!(""), Self::AST_PRINT_BUDGET)
+            .await?;
+        Ok(value.as_str().unwrap_or_default().to_string())
+    }
+
+    /// What printing the whole AST is given, wherever it is asked for.
+    ///
+    /// plugins.ast-utils.printSource runs Frama-C's printer over every global
+    /// and ships the result back over the socket, which is not a small query
+    /// however small the default budget assumes queries are. Shared because the
+    /// four callers ask the identical request: giving the receipt sixty seconds
+    /// and leaving context {want: ["source"]} at ten meant the same project
+    /// could produce a receipt digest and an error, from one AST, in one run.
+    const AST_PRINT_BUDGET: Duration = Duration::from_secs(60);
+
+    /// A GET whose caller knows the request is slower than the default budget.
+    ///
+    /// Ten seconds is right for the small queries every tool makes, and wrong
+    /// for one that serializes the whole normalised AST back over the socket.
+    /// A budget that expires there is not reported as slowness: the caller sees
+    /// Err and, if it is best-effort, records the answer as unavailable.
+    pub async fn get_with_timeout(
+        &self,
+        request: &str,
+        data: serde_json::Value,
+        timeout: Duration,
+    ) -> Result<serde_json::Value, FramaCError> {
         let mut inner = self.inner.lock().await;
         let id = inner.next_id();
         let payload_bytes = data.to_string().len();
@@ -448,9 +492,7 @@ impl FramaCClient {
                 data,
             })
             .await?;
-        inner
-            .wait_for_id(request, &id, Duration::from_secs(10))
-            .await
+        inner.wait_for_id(request, &id, timeout).await
     }
 
     pub async fn set(

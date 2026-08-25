@@ -2213,17 +2213,12 @@ impl FramaCMcpServer {
     /// Write the loaded AST, annotations and all, to a file E-ACSL can read.
     ///
     /// `plugins.ast-utils.printSource` is the request `context {want:
-    /// ["source"]}`
-    /// serves, so
-    /// its output is the whole project as one translation unit that round-trips
-    /// through the C front end.
+    /// ["source"]}` serves, so its output is the whole project as one
+    /// translation unit that round-trips through the C front end.
     async fn write_current_ast_source(&self) -> Result<(String, tempfile::TempDir), McpError> {
         let client = self.require_client().await?;
-        let printed = client
-            .get("plugins.ast-utils.printSource", json!(""))
-            .await
-            .map_err(McpError::from)?;
-        let source = printed.as_str().unwrap_or_default();
+        let source = client.print_source().await.map_err(McpError::from)?;
+        let source = source.as_str();
         if source.trim().is_empty() {
             return Err(McpError::internal_error(
                 "printSource returned nothing, so there is no AST to instrument",
@@ -2363,7 +2358,7 @@ impl FramaCMcpServer {
             "temporary_source_dir": temporary_source_dir,
         });
         let receipt = self
-            .proof_receipt(ProofReceiptRequest {
+            .proof_receipt(None, ProofReceiptRequest {
                 tool: "check",
                 source_files: receipt_files,
                 wp_config: serde_json::Value::Null,
@@ -2644,7 +2639,7 @@ impl FramaCMcpServer {
             "temporary_source_dir": temporary_source_dir,
         });
         let receipt = self
-            .proof_receipt(ProofReceiptRequest {
+            .proof_receipt(None, ProofReceiptRequest {
                 tool: "check",
                 source_files: receipt_files,
                 wp_config: wp
