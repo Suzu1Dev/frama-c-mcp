@@ -610,6 +610,60 @@ fn verified_requires_auditable_proof_evidence() {
     });
     assert!(mismatched_summary.unwrap_err().contains("goal count"));
     assert!(state.get_conclusion("F").is_none());
+
+    // Every version the accept list names. A receipt whose body changed shape
+    // hashes differently, which is what the bump exists to signal, and older
+    // stored work stays readable rather than being invalidated to gain nothing.
+    for version in [
+        "frama-c-mcp.proof-receipt.v2",
+        "frama-c-mcp.proof-receipt.v3",
+        "frama-c-mcp.proof-receipt.v4",
+    ] {
+        let mut receipt = proof_receipt("env-a");
+        receipt["schema"] = serde_json::json!(version);
+        state
+            .store_conclusion(FunctionConclusionUpdate {
+                function: "F".into(),
+                status: Some(VerificationStatus::Verified),
+                wp_summary: Some(valid_wp_summary(1)),
+                proof_receipt: Some(receipt),
+                ..Default::default()
+            })
+            .unwrap_or_else(|e| panic!("{version} should be accepted: {e}"));
+    }
+
+    // And the half that was not covered. Accepting the known versions passes
+    // just as well with no guard at all, which is exactly what happened:
+    // deleting the whole schema check left all 366 tests green. A receipt this
+    // server never wrote must not be storable as evidence.
+    for version in [
+        serde_json::json!("frama-c-mcp.proof-receipt.v5"),
+        serde_json::json!("frama-c-mcp.proof-receipt.v1"),
+        serde_json::json!("something-else.v1"),
+        serde_json::json!(""),
+        serde_json::json!(null),
+    ] {
+        let mut receipt = proof_receipt("env-a");
+        receipt["schema"] = version.clone();
+        let stored = state.store_conclusion(FunctionConclusionUpdate {
+            function: "G".into(),
+            status: Some(VerificationStatus::Verified),
+            wp_summary: Some(valid_wp_summary(1)),
+            proof_receipt: Some(receipt),
+            ..Default::default()
+        });
+        assert!(
+            stored
+                .as_ref()
+                .err()
+                .is_some_and(|e| e.contains("invalid proof_receipt schema")),
+            "schema {version} must be refused, got {stored:?}"
+        );
+    }
+    assert!(
+        state.get_conclusion("G").is_none(),
+        "a refused receipt must leave nothing stored"
+    );
 }
 
 #[test]
@@ -1102,11 +1156,11 @@ fn sha256_hex_is_lowercase_unseparated() {
 
 /// Two runs of the same inline source produce the same receipt subject.
 ///
-/// A receipt exists so two runs can be compared by their hashes, and the scratch
-/// directory a check writes inline source into is chosen fresh every call, so
-/// digesting its name made every such run incomparable with every other. The old
-/// pid-shaped name hid this by being constant for a session; moving to a random
-/// name is what surfaced it.
+/// A receipt exists so two runs can be compared by their hashes, and the
+/// scratch directory a check writes inline source into is chosen fresh every
+/// call, so digesting its name made every such run incomparable with every
+/// other. The old pid-shaped name hid this by being constant for a session;
+/// moving to a random name is what surfaced it.
 #[test]
 fn receipt_subject_ignores_the_check_scratch_directory() {
     use frama_c_mcp::mcp::server::receipt::receipt_source_path;
@@ -1165,6 +1219,7 @@ fn the_scratch_root_is_private_or_refused() {
     ensure_private_dir(&target).expect("target");
     let link = holder.path().join("link");
     std::os::unix::fs::symlink(&target, &link).expect("symlink");
+
     // Asserted on the message, not just on the failure. lstat makes a symlink
     // fail the is-a-directory check too, so err-versus-ok cannot tell whether
     // the symlink was recognised as one; without this, dropping that branch
@@ -1189,4 +1244,51 @@ fn the_scratch_root_is_private_or_refused() {
         "{} leaves too little of the socket budget",
         private_root_path().display()
     );
+}
+
+/// The stale-marker map is ordered, so the capped sample reload_project reports
+/// is the same sample on the next run.
+///
+/// This used to be a sorting helper plus a fifty-line test that rebuilt a
+/// HashMap to prove the sort held. The container carries the property now, so
+/// what is worth pinning is the container: a change back to HashMap makes the
+/// twenty reported markers depend on a per-process hash seed, and nothing else
+/// in the tree would notice.
+#[test]
+fn the_stale_marker_map_iterates_in_marker_order() {
+    let location = |line: u64| frama_c_mcp::state::MarkerLocation {
+        marker_kind: "property".to_string(),
+        marker: format!("#p{line:03}"),
+        function_marker: None,
+        function_name: None,
+        kinstr_marker: None,
+        source_file: Some("a.c".to_string()),
+        source_line: Some(line),
+    };
+    let markers: std::collections::BTreeMap<String, frama_c_mcp::state::StaleMarker> = (0..50)
+        .rev()
+        .map(|i| {
+            (
+                format!("#p{i:03}"),
+                frama_c_mcp::state::StaleMarker {
+                    previous: location(i),
+                    current: location(i + 1000),
+                },
+            )
+        })
+        .collect();
+
+    // Inserted in reverse; read back in order regardless.
+    let first: Vec<&str> = markers
+        .values()
+        .take(20)
+        .map(|m| m.previous.marker.as_str())
+        .collect();
+    assert_eq!(first.first(), Some(&"#p000"), "{first:?}");
+    assert_eq!(first.last(), Some(&"#p019"), "{first:?}");
+
+    let mut state = SessionState::default();
+    state.set_stale_markers(markers);
+    assert!(state.stale_marker("#p007").is_some(), "lookup still works");
+    assert!(state.stale_marker("#p099").is_none());
 }

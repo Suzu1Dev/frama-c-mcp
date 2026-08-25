@@ -123,21 +123,32 @@ in place of `cargo build --release`, not a way to skip the switch.
 ### Install
 
 ```bash
-./scripts/install.sh          # to ~/.local/bin
-BINDIR=/usr/local/bin ./scripts/install.sh
+make install                     # to ~/.local/bin
+make install BINDIR=/usr/local/bin
 ```
 
-The script builds and installs both the Rust binary and the `ast-utils` plugin.
-It runs `dune` through `opam exec`, so the plugin lands in the active switch;
-select the switch holding Frama-C before running it. The install fails if the
-resulting plugin is not loadable by that switch's `frama-c`. `BINDIR` must be
-writable without `sudo`, which would discard the opam environment.
+`make install` builds and installs both the Rust binary and the `ast-utils`
+plugin. It runs `dune` through `opam exec`, so the plugin lands in the active
+switch; select the switch holding Frama-C before running it. The install fails
+if the resulting plugin is not loadable by that switch's `frama-c`. `BINDIR`
+must be writable without `sudo`, which would discard the opam environment.
 
-Use the script instead of copying over an existing binary. On macOS, replacing
-an executed binary in place can leave a stale code-signature blob and cause
-every subsequent execution to fail with `SIGKILL (Code Signature Invalid)`.
-The script installs through a temporary file, ad-hoc signs it, runs it once,
-and then renames it into place.
+It finishes by pointing whichever agents are installed at the binary it just
+placed: Claude Code through `claude mcp add`, and codex by adding an
+`[mcp_servers.frama-c]` section to `~/.codex/config.toml` when that file exists
+and has no such section. An agent that is not installed is skipped rather than
+failing the install, and an existing codex section is left alone rather than
+rewritten. Run `make register` on its own to redo just that step.
+
+Use it instead of copying over an existing binary. On macOS, replacing an
+executed binary in place can leave a stale code-signature blob and cause every
+subsequent execution to fail with `SIGKILL (Code Signature Invalid)`. The
+install goes through a temporary file, ad-hoc signs it, runs it once, and then
+renames it into place.
+
+The other targets: `make` builds the release binary, `make indent` runs `shfmt`
+over the shell scripts and `commentflow` over the sources that carry comments,
+and `make clean` removes `target/` and the plugin's `_build/`.
 
 ### Connect an agent
 
@@ -411,6 +422,7 @@ payload contract and the change rule. The full set:
 | `VALID_UNDER_HYP` | WP proved the goal, but Frama-C consolidated its property as valid only under hypotheses nothing has established |
 | `EVA_NOT_REQUESTED` | `want` excluded EVA, so nothing here excludes the alarms it finds |
 | `WP_NOT_REQUESTED` | `want` excluded WP, so nothing here is a proof |
+| `WP_BACKEND_ANOMALY` | Why3 aborted, so the FAILED goals of this run were never judged by a prover |
 
 Treat the set as additive: codes are added as gaps are found, and three were
 added in one day. Branch on the ones you handle and surface the rest rather
@@ -422,9 +434,66 @@ uncontracted callee is announced there and nowhere else, and it weakens every
 proof above it.
 
 `check`, `run_wp`, and stored conclusions carry a `proof_receipt`
-(`frama-c-mcp.proof-receipt.v3`): the source-file hash, the Frama-C and prover
-environment, the effective WP configuration, per-goal statuses, and a sha256
-over all of it. Two runs are comparable exactly when their receipts match.
+(`frama-c-mcp.proof-receipt.v4`): the source-file hash, an `ast_digest`, the
+Frama-C and prover environment, the effective WP configuration, per-goal
+statuses, and a sha256 over all of it. Two runs are comparable exactly when
+their receipts match.
+
+`ast_digest` is a hash of the normalised AST, and it answers a question the
+source-file hash cannot: what was actually analysed. Different `defines`,
+include paths, or machdep over identical files produce different digests; and,
+more usefully, `defines` that select nothing different produce the *same*
+digest. That second case is the dangerous one, because it reads as
+configuration coverage that was never there. A real instance: a project's
+verify target ran a default pass and a `-DTLSF_NO_INTRINSICS` pass, reported
+both green, and analysed identical code both times, because Frama-C does not
+predefine `__GNUC__` and the source selected its portable fallbacks either way.
+Equal goal counts cannot show that. Equal digests can. `null` means the digest
+could not be established, so two nulls never count as agreement: the receipt
+carries a random `ast_digest_unavailable_nonce` in that case, which makes two
+such receipts differ by construction. `ast_digest_unavailable_reason` says why, because the
+nonce that enforces the non-equality would otherwise erase the distinction. It
+is `no_client` when nothing is attached, `reload_failed` when the input did not
+parse and the resident AST is a previous project's, `request_answered_empty`
+when the print came back with nothing, and `request_failed: <message>`
+otherwise. That last one covers both an absent `ast-utils` and a print that
+outran its budget: the client reports the two the same way, and separating them
+would mean parsing the error text. The isolated CLI retry is not one of those
+cases and gets the same `unavailable_isolated_cli_retry` marker the contracts
+field already uses: it proves the files on disk in another process, so the live
+AST does not describe it.
+
+### Checking several configurations at once
+
+`check {variants: [...]}` runs the same check over a list of configurations and
+reports them together. Each entry may carry `defines`, `machdep`, `model` and a
+`label`, overriding the top-level value; `files` and `function` are shared.
+
+This exists because the questions worth asking about a real project are
+comparative: portable path against compiler intrinsics, 32-bit against 64-bit,
+one memory model against another. Answering them one `check` at a time makes
+the comparison the caller's job, and the comparison is where the mistakes are.
+
+The result carries `ast_digest` per variant and reports `duplicate_ast` when two
+entries asked for different code and analysed byte-identical ASTs, which no goal
+count can show. Entries differing only in `model` are exempt, since no WP option
+changes the AST and a memory-model sweep is meant to share one. A real
+instance, and the reason this is here: a project's verify target ran a default
+pass alongside a `-DTLSF_NO_INTRINSICS` pass and reported both green for
+several rounds. Frama-C does not predefine `__GNUC__`, so the source selected
+its portable fallbacks either way and the two passes analysed the same code.
+Equal goal counts, equal verdicts, nothing disagreeing. A duplicate makes the
+overall verdict `incomplete`, because coverage that was never there should not
+read as a clean run.
+
+So does a missing digest. `ast_digest_unavailable_count` reports variants that
+had none, which happens when the ast-utils plug-in is absent or printing the AST
+outran its budget, and a non-zero count also forces `incomplete`: those variants
+were compared to nothing, and a comparison that did not happen must not read as
+one that happened and found nothing. Field list in
+[docs/reference/result-schema.md](docs/reference/result-schema.md), under the
+`frama-c-mcp.check-variants.v1` schema this call returns instead of the usual
+one.
 
 ### Proof evidence
 
@@ -462,6 +531,16 @@ check {files or source, function?, detail?}
 # plus the first few entries that need attention. Pass detail: "full" for every
 # goal and alarm, which runs to hundreds of kilobytes on a real file. The
 # verdict and incomplete[] are computed from the complete data either way.
+
+# reload_project takes a detail of its own, with the same two words and a
+# different subject: its own function list, not goals and alarms. Summary gives
+# each function's name and whether it is defined, which is what picking a target
+# needs; full adds the signature, source location, declaration marker and filter
+# flags, and turns 65 functions into 58KB. The two never interact, and a check
+# never passes its value down: the reload embedded in a check payload is always
+# summarised, so check {detail: "full"} returns a document whose nested
+# reload.detail reads "summary". That is deliberate, because the function list
+# is not what a check was asked about.
 
 # Or step-by-step:
 check {files, want: ["eva"]} -> get_wp_goals {want: ["alarms"]}
@@ -509,7 +588,7 @@ scripts/run-gates.sh unit stdio
 
 | Suite | Needs Frama-C? | Coverage |
 |-------|----------------|----------|
-| `shfmt -i 4 -d` | no | Every tracked shell script is 4-space formatted |
+| `shfmt -d` | no | Every tracked shell script matches `.editorconfig` |
 | `cargo clippy --all-targets` | no | Lint checks for all targets, denied via `[lints.clippy]` |
 | `cargo test --test unit` | no | Codec, state, callgraph, topological order, tool payload shapes |
 | `test-store-conclusion` | no | Conclusion persistence and the on-disk long-text layout |
@@ -570,8 +649,21 @@ return deltas.
 
 ### WP memory model
 
-The server uses `Typed+nocast`, so casts fail safely instead of being silently
-assumed away.
+The server uses `Typed+nocast`, so a cast makes the relevant VC fail instead of
+being silently assumed away. That failure is not always safe. Measured on
+Frama-C 33 with Why3 1.8.2, a cast that reaches the goal rather than only the
+code aborts Why3 with `Invalid_argument("unbound variable in of_term")`, and WP
+then stamps the goals `FAILED` with no prover having answered; the same contract
+proves under `Typed+cast`. `check` reports that case as `wp_backend_diagnosis`
+plus the `WP_BACKEND_ANOMALY` code, because the goal records alone cannot show
+it: the anomaly is on the message stream, so a per-goal classifier reads a
+crashed backend as a wrong specification.
+
+Which goals the abort cost is read off their `FAILED` status rather than off the
+message. WP words the abort as `Goal <kind>:`, where the kind comes from a fixed
+table (`Property`, `Invariant`, `Preservation`, and a dozen more), so the text
+names a kind and never a goal. A goal left `FAILED` is one no prover answered,
+and that is the only link the two have.
 
 ### Callee contracts
 

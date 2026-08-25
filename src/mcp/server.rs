@@ -615,7 +615,7 @@ async fn marker_location_snapshot(
 pub fn stale_marker_locations(
     previous: &HashMap<String, MarkerLocation>,
     current: &HashMap<String, MarkerLocation>,
-) -> HashMap<String, StaleMarker> {
+) -> BTreeMap<String, StaleMarker> {
     previous
         .iter()
         .filter_map(|(marker, old_location)| {
@@ -2017,7 +2017,8 @@ fn json_result(value: serde_json::Value) -> CallToolResult {
     result
 }
 
-/// A temporary directory only this user can enter, removed when the guard drops.
+/// A temporary directory only this user can enter, removed when the guard
+/// drops.
 ///
 /// tempfile picks the random O_EXCL name, which is what closes the pre-created
 /// symlink class. It does not pick the mode: Builder::tempdir creates the
@@ -2368,7 +2369,7 @@ impl FramaCMcpServer {
             .await?,
         );
         response["proof_receipt"] = self
-            .proof_receipt(ProofReceiptRequest {
+            .proof_receipt(Some(client), ProofReceiptRequest {
                 tool: "run_wp",
                 source_files,
                 wp_config: response["effective_wp_config"].clone(),
@@ -2986,7 +2987,8 @@ impl FramaCMcpServer {
         // and the error from creating it was dropped, so a directory they owned
         // was used as found and File::create followed a symlink planted at the
         // log name. The error is reported now: no logs is a startup problem
-        // worth hearing about, since the startup failure tail is read from them.
+        // worth hearing about, since the startup failure tail is read from
+        // them.
         let log_dir = crate::mcp::store::ensure_private_root()
             .map(|root| root.join("logs"))
             .and_then(|dir| std::fs::create_dir_all(&dir).map(|()| dir))
@@ -3910,12 +3912,7 @@ async fn fetch_extracted_annotations(resolved: &ResolvedClient) -> Result<Vec<St
 }
 
 async fn fetch_printed_source(resolved: &ResolvedClient) -> Result<String, McpError> {
-    let value = resolved
-        .client
-        .get("plugins.ast-utils.printSource", json!(""))
-        .await
-        .map_err(McpError::from)?;
-    Ok(value.as_str().unwrap_or_default().to_string())
+    resolved.client.print_source().await.map_err(McpError::from)
 }
 
 fn source_excerpt(source: &str) -> String {
@@ -3942,10 +3939,10 @@ impl ServerHandler for FramaCMcpServer {
     /// protocol revision predates the field.
     ///
     /// structuredContent arrived in 2025-06-18. This server also agrees to
-    /// 2024-11-05 and 2025-03-26, and json_result fills the field for every tool
-    /// that answers with an object, so those peers were being sent a key their
-    /// revision does not define. Most clients ignore what they do not know; one
-    /// that validates its input is entitled not to.
+    /// 2024-11-05 and 2025-03-26, and json_result fills the field for every
+    /// tool that answers with an object, so those peers were being sent a key
+    /// their revision does not define. Most clients ignore what they do not
+    /// know; one that validates its input is entitled not to.
     ///
     /// Done here rather than at the twenty-seven call sites because this is the
     /// one place a response leaves the server, and because the negotiated

@@ -6,14 +6,21 @@ framaC="${FRAMA_C_BIN:-$(command -v frama-c || true)}"
 eacsl="${EACSL_BIN:-$(command -v e-acsl-gcc.sh || command -v e-acsl-gcc || true)}"
 failed=0
 
-pass() { printf 'PASS: %s\n' "$1"; }
-fail() {
+pass()
+{
+    printf 'PASS: %s\n' "$1"
+}
+fail()
+{
     printf 'FAIL: %s\n' "$1" >&2
     failed=1
 }
-skip() { printf 'SKIP: %s\n' "$1"; }
+skip()
+{
+    printf 'SKIP: %s\n' "$1"
+}
 
-if command -v npx >/dev/null 2>&1; then
+if command -v npx > /dev/null 2>&1; then
     npx --yes skills-ref validate "$skillDir"
 else
     skip "npx not found; skill shape validation skipped"
@@ -24,8 +31,8 @@ if [ -z "$framaC" ]; then
 else
     "$framaC" -version
     buggyOut="$("$framaC" -wp -wp-rte "$skillDir/examples/abs-int/abs-buggy.c" 2>&1 || true)"
-    if printf '%s\n' "$buggyOut" | grep -q 'typed_abs_int_assert_rte_signed_overflow' &&
-        printf '%s\n' "$buggyOut" | grep -qE 'Proved goals:[[:space:]]*9[[:space:]]*/[[:space:]]*10'; then
+    if printf '%s\n' "$buggyOut" | grep -q 'typed_abs_int_assert_rte_signed_overflow' \
+        && printf '%s\n' "$buggyOut" | grep -qE 'Proved goals:[[:space:]]*9[[:space:]]*/[[:space:]]*10'; then
         pass "WP reports abs-buggy signed-overflow proof gap"
     else
         printf '%s\n' "$buggyOut" >&2

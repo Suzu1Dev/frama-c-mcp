@@ -83,7 +83,7 @@ hands back subtly wrong C is the failure mode with the highest cost.
 
 Verdict and completeness are separate axes. `check` reports `verdict: "proved"` only when `incomplete[]` is empty, so a step that did not run cannot read as a clean result; the CLI's `--require-complete` turns any `incomplete[]` entry into a non-zero exit.
 
-Evidence travels with the result. `check`, `run_wp`, and stored conclusions carry a `proof_receipt` (`frama-c-mcp.proof-receipt.v3`) holding the source hash, environment, effective WP configuration, per-goal statuses, and a sha256 over all of it, so two runs are comparable exactly when their receipts match. `run_wp` additionally flags callees whose contracts it assumed rather than proved, and conclusions record `stale_dependencies` and `stale_proof_environment` when a callee conclusion or the prover environment moves under them.
+Evidence travels with the result. `check`, `run_wp`, and stored conclusions carry a `proof_receipt` (`frama-c-mcp.proof-receipt.v4`) holding the source hash, AST digest, environment, effective WP configuration, per-goal statuses, and a sha256 over all of it, so two runs are comparable exactly when their receipts match. `run_wp` additionally flags callees whose contracts it assumed rather than proved, and conclusions record `stale_dependencies` and `stale_proof_environment` when a callee conclusion or the prover environment moves under them.
 
 ## Design Decisions
 
@@ -136,7 +136,7 @@ for the full list and how to regenerate it.
 
 **fetch API is incremental**: `fetchFunctions` only returns the full amount for the first time, and only changes after that; `reloadFunctions` resets the cursor before the full amount is needed.
 
-**WP Configuration**: Memory model `Typed+nocast` - VC fails safely when there is a cast instead of silently letting it go. The default `assigns \nothing` of an uncontracted callee is unsound (WP Manual §2.1), so sandbox extraction generates an empty stub for a callee that lacks explicit `assigns`.
+**WP Configuration**: Memory model `Typed+nocast` - a cast makes the VC fail instead of silently letting it go, except when the cast reaches the goal: on Frama-C 33 with Why3 1.8.2 that aborts Why3 and WP stamps the goals `FAILED` without any prover having answered, and the same contract proves under `Typed+cast`. `check` reports that through `wp_backend_diagnosis` and the `WP_BACKEND_ANOMALY` code, read off the message stream rather than off the goals, and attributed to goals by their `FAILED` status because the abort text names a goal kind and never a goal. The default `assigns \nothing` of an uncontracted callee is unsound (WP Manual §2.1), so sandbox extraction generates an empty stub for a callee that lacks explicit `assigns`.
 
 **Published schema versus accepted input**: `tools/list` carries only what the
 JSON schema declares, and `#[schemars(skip)]` removes a field from that schema

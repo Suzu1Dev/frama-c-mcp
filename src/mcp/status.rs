@@ -114,6 +114,25 @@ pub fn normalize_frama_c_status(raw: &str) -> String {
     .to_string()
 }
 
+/// Whether an already-read status says the prover run failed rather than
+/// answered.
+///
+/// The sibling of is_proved, and case-insensitive for the same reason: a row
+/// straight off the wire carries Frama-C's own spelling, which normalize folds
+/// to "failed" but which reaches some readers unfolded.
+///
+/// Two callers arrived at this predicate independently in one change and
+/// spelled it differently, one case-insensitive over the goal's own status and
+/// one exact over the consolidated one, which is two answers to the single
+/// question both exist to ask. They are wp_backend_anomaly_left_goal_unjudged,
+/// which asks what WP decided about this goal, and
+/// wp_tasks_contain_failed_goal,
+/// which asks what the property it hangs off consolidated to. Which status to
+/// read is the call site's decision; the comparison itself lives here.
+pub fn status_is_failed(status: &str) -> bool {
+    status.eq_ignore_ascii_case("failed")
+}
+
 /// The derived flags every status-bearing payload carries next to its
 /// normalized status.
 pub fn insert_status_flags(

@@ -124,11 +124,17 @@ fn classify_failure_reason(
             .iter()
             .any(|needle| text.contains(needle))
     {
+        // Where a Why3 abort lands, and the reason there is no branch above
+        // matching the abort text: the goal record does not carry it. WP words
+        // the abort as a warning on the message stream, and the record it
+        // leaves behind is a bare FAILED, so the status is the whole signal a
+        // per-goal classifier gets. A text matcher here would read the goal's
+        // own serialization, find no anomaly in it, and never fire.
         push_evidence("normalized_status", json!(normalized_status));
         (
             "internal_error",
             "high",
-            "Inspect Frama-C/WP diagnostics before changing annotations.",
+            "No prover returned a verdict, so this is not evidence that the C code or ACSL is wrong. A goal record says only FAILED; the reason is on the message stream, which check reports as wp_backend_diagnosis and context {want: [\"messages\"]} returns directly. If that names a Why3 anomaly, try the other memory model before touching the annotation: on Frama-C 33 a pointer cast reaching the goal aborts Why3 under Typed+nocast and proves under Typed+cast.",
         )
     } else if goal_kind.starts_with("rte_") {
         push_evidence("goal_kind", json!(goal_kind));
@@ -325,26 +331,21 @@ pub fn classify_wp_failure_from_goal(
     let semantic_verdict = semantic_wp_verdict(category, &runtime_check_suggestion);
 
     let next_tool = match failure_kind {
-        "missing_prover" => json!({
-            "tool": "self_check",
-            "args": {},
-            "reason": action_reason,
-        }),
-        "missing_why3_config" | "request_rejected" => json!({
-            "tool": "self_check",
-            "args": {},
-            "reason": action_reason,
-        }),
-        _ => match category {
-            "rte" | "missing_requires" | "callee_requires_too_strict" => function.map_or_else(
-                || json!({"tool": "get_wp_goals", "args": {}, "reason": action_reason}),
-                |function| json!({"tool": "get_wp_goals", "args": {"want": ["vc"], "function": function}, "reason": action_reason}),
-            ),
-            _ => function.map_or_else(
-                || json!({"tool": "get_wp_goals", "args": {}, "reason": action_reason}),
-                |function| json!({"tool": "get_wp_goals", "args": {"want": ["vc"], "function": function}, "reason": action_reason}),
-            ),
-        },
+        // Nothing about the toolchain is answered by reading a VC, so all four
+        // go to self_check. The category split that used to sit under the
+        // fallback is gone with them: both of its arms built the same
+        // get_wp_goals call.
+        "missing_prover" | "missing_why3_config" | "request_rejected" | "frama_c_internal" => {
+            json!({
+                "tool": "self_check",
+                "args": {},
+                "reason": action_reason,
+            })
+        }
+        _ => function.map_or_else(
+            || json!({"tool": "get_wp_goals", "args": {}, "reason": action_reason}),
+            |function| json!({"tool": "get_wp_goals", "args": {"want": ["vc"], "function": function}, "reason": action_reason}),
+        ),
     };
     let mut next_action = next_tool;
     if let Some(obj) = next_action.as_object_mut() {
@@ -381,10 +382,21 @@ fn semantic_wp_verdict(
     runtime_check_suggestion: &serde_json::Value,
 ) -> serde_json::Value {
     let (kind, plain_language, next_tool) = match category {
-        "missing_prover" | "missing_why3_config" | "request_rejected" | "internal_error"
-        | "timeout" => (
-            "specification_too_weak",
-            "WP was blocked by prover, request, timeout, or Frama-C setup; no code verdict is available until that is fixed.",
+        // Not "specification_too_weak", which is what this arm used to answer
+        // and is the conclusion these categories exist to prevent. Every one of
+        // them means no prover reached a verdict, so an agent branching on
+        // "kind" was being sent to strengthen an annotation that nothing had
+        // judged. The plain language below always said as much; only the
+        // machine-readable field disagreed with it. "timeout" is deliberately
+        // not here, though it used to be. The routing match above sends a
+        // timeout to get_wp_goals, because its failure kind is prover_timeout
+        // rather than one of the four toolchain kinds, so naming it
+        // backend_unavailable put next_tool: self_check beside next_action:
+        // get_wp_goals in one payload. A prover that ran out of time did run;
+        // self_check has nothing to tell you about it.
+        "missing_prover" | "missing_why3_config" | "request_rejected" | "internal_error" => (
+            "backend_unavailable",
+            "WP was blocked by prover, request, or Frama-C setup; no code verdict is available until that is fixed.",
             "self_check",
         ),
         _ if !runtime_check_suggestion.is_null() => (
@@ -1097,6 +1109,161 @@ pub fn wp_timeout_triage_from_tasks(tasks: &serde_json::Value) -> serde_json::Va
     wp_timeout_triage_none()
 }
 
+/// Whether already-lowercased text reports Why3 giving up rather than judging.
+///
+/// One predicate for the two readers that see real diagnostic text: the WP
+/// message stream, and the protocol-error classifier in error.rs, whose own
+/// keyword list would otherwise file an abort reading "anomaly: Not_found" as
+/// a missing Why3 configuration and send the caller to fix a toolchain that is
+/// fine. Only those two ever hold text an abort was written into. A goal record
+/// does not, which is why nothing in the per-goal classifier calls this: there
+/// the status is the signal, and the FAILED branch of classify_failure_reason
+/// is what reads it.
+///
+/// Callers lowercase before calling; the needles here are lowercase.
+pub fn why3_aborted(text: &str) -> bool {
+    text.contains("why3")
+        && (text.contains("anomaly")
+            || text.contains("invalid_argument")
+            || text.contains("internal error")
+            || text.contains("fatal error"))
+}
+
+/// What the WP message stream says about the backend rather than about the
+/// code.
+///
+/// A goal record cannot carry this. When Why3 aborts, the goal is stamped
+/// FAILED and nothing in it names the abort: the anomaly is reported on the
+/// message stream instead, and every per-goal classifier downstream reads only
+/// the goal. So three obligations that no prover ever answered come back as
+/// three generic internal errors, and an agent reading them concludes the
+/// annotation is unprovable. It concluded nothing of the kind; no prover ran.
+///
+/// The pointer-cast case is the one worth naming separately. This server
+/// defaults to Typed+nocast so that a cast makes the relevant VC fail rather
+/// than pass silently, but on Frama-C 33 with Why3 1.8 a cast reaching the
+/// goal does not fail safely: it crashes the Why3 driver with
+/// Invalid_argument("unbound variable in of_term"). The same annotation under
+/// Typed+cast proves. So when the anomaly arrives alongside WP's own
+/// "Cast with incompatible pointers types" warnings, the next step is the
+/// model, not the ACSL, and not a bug report.
+///
+/// Null when the stream shows no anomaly. It reads a drained stream, so only a
+/// tool that drains can compute it, and "check" is the one that both drains and
+/// owns a verdict; run_wp leaves the stream for a later
+/// context {want: ["messages"]} call rather than flushing it.
+pub fn wp_backend_diagnosis(
+    messages: &[serde_json::Value],
+    model: Option<&str>,
+) -> serde_json::Value {
+    // The same text is already in "messages", so this field only has to be
+    // enough to recognise the failure. WP reports the abort once per goal and
+    // per prover, and a drain returns up to two thousand of them, so echoing
+    // every one would double a payload that has a summary mode precisely to
+    // stop that. The count below is the untruncated total.
+    const ANOMALY_SAMPLE: usize = 5;
+
+    let mut anomalies = Vec::new();
+    let mut anomaly_count = 0usize;
+    let mut cast_lines = Vec::new();
+    let mut cast_warned = false;
+    for message in messages {
+        let text = message
+            .get("message")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        if why3_aborted(&text) {
+            anomaly_count += 1;
+            if anomalies.len() < ANOMALY_SAMPLE {
+                anomalies.push(
+                    message
+                        .get("message")
+                        .cloned()
+                        .unwrap_or_else(|| json!(null)),
+                );
+            }
+        }
+        if text.contains("cast with incompatible pointer") {
+            // Recorded from the text, not from the line list below. WP does not
+            // always attach a source location to this warning, and when it does
+            // not, deriving "a cast was involved" from a non-empty line list
+            // sends a Typed+nocast anomaly to self_check instead of the
+            // Typed+cast retry that is the whole remedy. The lines are context.
+            cast_warned = true;
+
+            // Deduplicated by membership rather than by Vec::dedup, which drops
+            // only adjacent repeats: WP interleaves the warnings of several
+            // goals, so the same line comes back non-adjacently. Reported in
+            // the order WP first warned about it.
+            //
+            // A sample of the offending lines, not the set of them. WP logs
+            // this warning with Warning.kprintf ~once:true and renders only the
+            // source and target types, so two casts of the same type pair at
+            // different lines produce identical text and Frama-C suppresses the
+            // second. The routing decision only asks whether the list is
+            // non-empty, which is unaffected; a reader chasing every cast wants
+            // the source, not this field.
+            if let Some(line) = message.pointer("/source/line") {
+                if !cast_lines.contains(line) {
+                    cast_lines.push(line.clone());
+                }
+            }
+        }
+    }
+    if anomaly_count == 0 {
+        return json!(null);
+    }
+
+    let nocast = model.is_some_and(|model| model.to_ascii_lowercase().contains("nocast"));
+    let cast_involved = cast_warned;
+
+    let (kind, reason, next_action) = if nocast && cast_involved {
+        (
+            "why3_anomaly_with_pointer_cast",
+            "Why3 aborted, so no prover answered these goals and their FAILED status is not a \
+             verdict on the C code or the ACSL. WP also warned about casts between incompatible \
+             pointer types at the lines below, and the model in force refuses casts. Re-run under \
+             Typed+cast before changing an annotation: an anomaly is not an unprovable goal.",
+            json!({
+                "tool": "run_wp",
+                "args": {"model": "Typed+cast", "cache": "None"},
+                "reason": "Prove the same obligations under a model that admits the pointer casts \
+                           this code performs. If they prove there, the nocast run said nothing \
+                           about them. The goal list then holds both models: a goal named \
+                           typed_nocast_... is the crashed run's record, not a second failure, and \
+                           only the typed_cast_... rows are this verdict.",
+            }),
+        )
+    } else {
+        (
+            "why3_anomaly",
+            "Why3 aborted, so no prover answered these goals and their FAILED status is not a \
+             verdict on the C code or the ACSL. Establish the toolchain versions before changing \
+             an annotation.",
+            json!({
+                "tool": "self_check",
+                "args": {},
+                "reason": "Record the Frama-C, Why3, and prover versions the anomaly came from \
+                           before touching the specification.",
+            }),
+        )
+    };
+
+    json!({
+        "kind": kind,
+        "confidence": "high",
+        "model": model,
+        "reason": reason,
+        "anomaly_count": anomaly_count,
+        "anomalies": anomalies,
+        "anomalies_truncated": anomaly_count > ANOMALY_SAMPLE,
+        "cast_warning_lines": cast_lines,
+        "cast_warning_lines_are_a_sample": true,
+        "next_action": next_action,
+    })
+}
+
 pub fn wp_failure_kind_from_tasks(tasks: &serde_json::Value, triage: &serde_json::Value) -> &'static str {
     let triage_kind = triage
         .get("kind")
@@ -1106,7 +1273,17 @@ pub fn wp_failure_kind_from_tasks(tasks: &serde_json::Value, triage: &serde_json
         return wp_failure_kind("prover_unknown", triage_kind);
     }
     let text = tasks.to_string().to_ascii_lowercase();
-    if text.contains("prover")
+
+    // Structural, and ahead of the text branches below, because the tasks
+    // payload carries goal records and no log text at all: a goal a prover
+    // failed to run comes back as a bare FAILED, and matching the abort's
+    // wording against a serialized goal finds nothing. Ahead of
+    // wp_tasks_contain_unproved_goal too, which counts "failed" among the
+    // statuses it calls unproved and would file a crashed backend as one more
+    // proof obligation to go and read.
+    if wp_tasks_contain_failed_goal(tasks) {
+        "frama_c_internal"
+    } else if text.contains("prover")
         && (text.contains("not found")
             || text.contains("unknown")
             || text.contains("missing")
@@ -1128,21 +1305,50 @@ pub fn wp_failure_kind_from_tasks(tasks: &serde_json::Value, triage: &serde_json
     }
 }
 
-fn wp_tasks_contain_unproved_goal(value: &serde_json::Value) -> bool {
+/// Whether the payload holds a goal whose consolidated status the caller cares
+/// about, anywhere in it.
+///
+/// One walk, because the goal-shape test is the part worth stating once: a new
+/// goal-identifying key added in one copy and missed in the other splits "is
+/// this a proof obligation" from "did the backend crash on it" silently, since
+/// a walk that recognises nothing just answers false.
+fn wp_tasks_contain_goal_with_status(
+    value: &serde_json::Value,
+    accept: &dyn Fn(&str) -> bool,
+) -> bool {
     match value {
-        serde_json::Value::Array(values) => values.iter().any(wp_tasks_contain_unproved_goal),
+        serde_json::Value::Array(values) => values
+            .iter()
+            .any(|value| wp_tasks_contain_goal_with_status(value, accept)),
         serde_json::Value::Object(object) => {
-            let status = crate::mcp::status::consolidated_status(value);
             let has_goal_id = object.contains_key("stable_goal_id")
                 || object.contains_key("goal_kind")
                 || object.contains_key("property_marker");
-            if has_goal_id && matches!(status, Some("unknown" | "invalid" | "failed")) {
+            if has_goal_id
+                && crate::mcp::status::consolidated_status(value).is_some_and(accept)
+            {
                 return true;
             }
-            object.values().any(wp_tasks_contain_unproved_goal)
+            object
+                .values()
+                .any(|value| wp_tasks_contain_goal_with_status(value, accept))
         }
         _ => false,
     }
+}
+
+/// A goal whose prover run failed. WP stamps FAILED when the prover process
+/// itself failed, a crashed Why3 driver included, so this is the attribution
+/// the message text cannot give: the abort names a goal kind from a fixed
+/// table, never a goal.
+fn wp_tasks_contain_failed_goal(value: &serde_json::Value) -> bool {
+    wp_tasks_contain_goal_with_status(value, &crate::mcp::status::status_is_failed)
+}
+
+fn wp_tasks_contain_unproved_goal(value: &serde_json::Value) -> bool {
+    wp_tasks_contain_goal_with_status(value, &|status| {
+        matches!(status, "unknown" | "invalid" | "failed")
+    })
 }
 
 pub fn wp_prover_result(goal: &serde_json::Value) -> serde_json::Value {

@@ -855,11 +855,7 @@ impl FramaCMcpServer {
                         Some(function) => self.resolve_client(function).await?.client,
                         None => self.require_client().await?,
                     };
-                    let source = client
-                        .get("plugins.ast-utils.printSource", json!(""))
-                        .await
-                        .map_err(McpError::from)?;
-                    let text = source.as_str().unwrap_or_default().to_string();
+                    let text = client.print_source().await.map_err(McpError::from)?;
 
                     if let Some(path) = params.output.as_deref() {
                         let target = resolve_output_path(path)?;

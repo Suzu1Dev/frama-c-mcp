@@ -5,7 +5,7 @@ set -euo pipefail
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$root"
 
-python3 - <<'PY'
+python3 - << 'PY'
 from pathlib import Path
 import os
 import re

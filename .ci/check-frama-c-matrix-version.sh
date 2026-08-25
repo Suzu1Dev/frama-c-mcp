@@ -8,10 +8,10 @@ set -eu
 version=${1:?expected a Frama-C version}
 
 case "$version" in
-33.0) ;;
-*)
-    echo "Unsupported Frama-C CI version: $version" >&2
-    echo "Supported smoke-test version is 33.0." >&2
-    exit 1
-    ;;
+    33.0) ;;
+    *)
+        echo "Unsupported Frama-C CI version: $version" >&2
+        echo "Supported smoke-test version is 33.0." >&2
+        exit 1
+        ;;
 esac

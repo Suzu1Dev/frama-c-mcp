@@ -37,7 +37,7 @@ for src in "$HERE"/*.c; do
     rm -f "$WORK/batch_print_source.json"
     cp "$HERE/batch_print_source.json" "$WORK/"
     (cd "$WORK" && "$FC" -server-batch batch_print_source.json \
-        -server-batch-output-dir . "$(basename "$src")" >/dev/null 2>&1)
+        -server-batch-output-dir . "$(basename "$src")" > /dev/null 2>&1)
 
     # Step 2: extract the printSource output text
     python3 -c "
@@ -47,10 +47,10 @@ with open('$WORK/batch_print_source.out.json') as f:
 # expect one entry with id='ps' and data=<source text>
 text = next(e['data'] for e in data if e['id'] == 'ps')
 sys.stdout.write(text)
-" >"$WORK/roundtrip_$name.c"
+" > "$WORK/roundtrip_$name.c"
 
     # Step 3: round-trip — frama-c must parse the output without error
-    if ! "$FC" "$WORK/roundtrip_$name.c" >"$WORK/rt_$name.log" 2>&1; then
+    if ! "$FC" "$WORK/roundtrip_$name.c" > "$WORK/rt_$name.log" 2>&1; then
         echo "  FAIL: $name — frama-c rejected printSource output"
         echo "  --- log (last 15 lines) ---"
         tail -15 "$WORK/rt_$name.log" | sed 's/^/    /'
@@ -70,7 +70,7 @@ cp "$HERE/extract_spec_deps.c" "$WORK/"
 rm -f "$WORK/batch_extract_spec_deps.json"
 cp "$HERE/batch_extract_spec_deps.json" "$WORK/"
 (cd "$WORK" && "$FC" -server-batch batch_extract_spec_deps.json \
-    -server-batch-output-dir . extract_spec_deps.c >/dev/null 2>&1)
+    -server-batch-output-dir . extract_spec_deps.c > /dev/null 2>&1)
 
 python3 -c "
 import json, sys
@@ -80,9 +80,9 @@ payload = next(e['data'] for e in data if e['id'] == 'extract_wrapper')
 if not payload.get('success'):
     raise SystemExit(payload.get('error', 'extract failed'))
 sys.stdout.write(payload['source'])
-" >"$WORK/extract_spec_deps_wrapper.c"
+" > "$WORK/extract_spec_deps_wrapper.c"
 
-if ! "$FC" "$WORK/extract_spec_deps_wrapper.c" >"$WORK/rt_extract_spec_deps.log" 2>&1; then
+if ! "$FC" "$WORK/extract_spec_deps_wrapper.c" > "$WORK/rt_extract_spec_deps.log" 2>&1; then
     echo "  FAIL: extract_spec_deps - frama-c rejected extracted sandbox"
     echo "  --- log (last 15 lines) ---"
     tail -15 "$WORK/rt_extract_spec_deps.log" | sed 's/^/    /'
@@ -99,7 +99,7 @@ cp "$HERE/extract_acsl_dependency_closure.c" "$WORK/"
 rm -f "$WORK/batch_extract_acsl_dependency_closure.json"
 cp "$HERE/batch_extract_acsl_dependency_closure.json" "$WORK/"
 (cd "$WORK" && "$FC" -server-batch batch_extract_acsl_dependency_closure.json \
-    -server-batch-output-dir . extract_acsl_dependency_closure.c >/dev/null 2>&1)
+    -server-batch-output-dir . extract_acsl_dependency_closure.c > /dev/null 2>&1)
 
 python3 -c "
 import json, sys
@@ -109,9 +109,9 @@ payload = next(e['data'] for e in data if e['id'] == 'extract_wrapper')
 if not payload.get('success'):
     raise SystemExit(payload.get('error', 'extract failed'))
 sys.stdout.write(payload['source'])
-" >"$WORK/extract_acsl_dependency_closure_wrapper.c"
+" > "$WORK/extract_acsl_dependency_closure_wrapper.c"
 
-if ! "$FC" "$WORK/extract_acsl_dependency_closure_wrapper.c" >"$WORK/rt_extract_acsl_dependency_closure.log" 2>&1; then
+if ! "$FC" "$WORK/extract_acsl_dependency_closure_wrapper.c" > "$WORK/rt_extract_acsl_dependency_closure.log" 2>&1; then
     echo "  FAIL: extract_acsl_dependency_closure - frama-c rejected extracted sandbox"
     echo "  --- log (last 15 lines) ---"
     tail -15 "$WORK/rt_extract_acsl_dependency_closure.log" | sed 's/^/    /'
@@ -160,7 +160,7 @@ cp "$HERE/extract_consinit_callee.c" "$WORK/"
 rm -f "$WORK/batch_extract_consinit.json"
 cp "$HERE/batch_extract_consinit.json" "$WORK/"
 (cd "$WORK" && "$FC" -server-batch batch_extract_consinit.json \
-    -server-batch-output-dir . extract_consinit_callee.c >/dev/null 2>&1)
+    -server-batch-output-dir . extract_consinit_callee.c > /dev/null 2>&1)
 
 python3 -c "
 import json, sys
@@ -170,9 +170,9 @@ payload = next(e['data'] for e in data if e['id'] == 'extract_wrapper')
 if not payload.get('success'):
     raise SystemExit(payload.get('error', 'extract failed'))
 sys.stdout.write(payload['source'])
-" >"$WORK/extract_consinit_callee_wrapper.c"
+" > "$WORK/extract_consinit_callee_wrapper.c"
 
-if ! "$FC" "$WORK/extract_consinit_callee_wrapper.c" >"$WORK/rt_extract_consinit_callee.log" 2>&1; then
+if ! "$FC" "$WORK/extract_consinit_callee_wrapper.c" > "$WORK/rt_extract_consinit_callee.log" 2>&1; then
     echo "  FAIL: extract_consinit_callee - frama-c rejected extracted sandbox"
     echo "  --- log (last 15 lines) ---"
     tail -15 "$WORK/rt_extract_consinit_callee.log" | sed 's/^/    /'
@@ -201,7 +201,7 @@ cp "$HERE/extract_uncontracted_callee.c" "$WORK/"
 rm -f "$WORK/batch_extract_uncontracted.json"
 cp "$HERE/batch_extract_uncontracted.json" "$WORK/"
 (cd "$WORK" && "$FC" -server-batch batch_extract_uncontracted.json \
-    -server-batch-output-dir . extract_uncontracted_callee.c >/dev/null 2>&1)
+    -server-batch-output-dir . extract_uncontracted_callee.c > /dev/null 2>&1)
 
 python3 -c "
 import json, sys
@@ -211,10 +211,10 @@ payload = next(e['data'] for e in data if e['id'] == 'extract_wrapper')
 if not payload.get('success'):
     raise SystemExit(payload.get('error', 'extract failed'))
 sys.stdout.write(payload['source'])
-" >"$WORK/extract_uncontracted_callee_wrapper.c"
+" > "$WORK/extract_uncontracted_callee_wrapper.c"
 
 if ! "$FC" "$WORK/extract_uncontracted_callee_wrapper.c" \
-    >"$WORK/rt_extract_uncontracted_callee.log" 2>&1; then
+    > "$WORK/rt_extract_uncontracted_callee.log" 2>&1; then
     echo "  FAIL: extractFunctionWithDeps_uncontracted_callee - frama-c rejected extracted sandbox"
     echo "  --- log (last 15 lines) ---"
     tail -15 "$WORK/rt_extract_uncontracted_callee.log" | sed 's/^/    /'

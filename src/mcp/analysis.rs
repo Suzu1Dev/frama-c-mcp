@@ -756,6 +756,41 @@ pub fn goal_needs_failure_classification(goal: &serde_json::Value) -> bool {
     !proved || (vacuous && !property_is_dead(goal))
 }
 
+/// Whether a backend abort left a goal in this run without a verdict.
+///
+/// Attribution by message text was tried first and cannot work. WP emits the
+/// abort in one place, as "Goal <label>: running prover <p> failed (...)",
+/// where the label comes from a fixed table of goal kinds: Property,
+/// Invariant, Preservation, Terminates, and a dozen more. It names a kind, not
+/// a goal. Two of the fields a matcher would compare against, stable_goal_id
+/// and hash_label, are minted by this server and cannot occur in Frama-C output
+/// at all, and matching the generic label instead marks every goal of that kind
+/// rather than the one that aborted. So the text gate was false on every real
+/// run and true for the wrong goals on the one shape that overlapped.
+///
+/// WP does the attribution structurally instead. A prover run that failed
+/// leaves the goal FAILED, which is the same status the per-goal classifier
+/// reads, so a FAILED goal alongside an abort on the message stream is a goal
+/// no prover answered. That is coarser than naming the goal, and it is the
+/// resolution WP actually offers: an abort with every goal otherwise decided
+/// costs nothing and is reported without touching the verdict.
+pub fn wp_backend_anomaly_left_goal_unjudged(
+    diagnosis: &serde_json::Value,
+    goals: &serde_json::Value,
+) -> bool {
+    if !diagnosis.is_object() {
+        return false;
+    }
+    goals
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|goal| goal_needs_failure_classification(goal))
+        .any(|goal| {
+            crate::mcp::status::own_status(goal).is_some_and(crate::mcp::status::status_is_failed)
+        })
+}
+
 fn check_goal_counts_as_progress(goal: &serde_json::Value) -> bool {
     if let Some(counts) = goal
         .get("counts_as_progress")
@@ -832,6 +867,7 @@ pub mod incomplete_code {
     pub const VALID_UNDER_HYP: &str = "VALID_UNDER_HYP";
     pub const EVA_NOT_REQUESTED: &str = "EVA_NOT_REQUESTED";
     pub const WP_NOT_REQUESTED: &str = "WP_NOT_REQUESTED";
+    pub const WP_BACKEND_ANOMALY: &str = "WP_BACKEND_ANOMALY";
 
     // Only the doc comparison reads the list as a list; the emit sites name
     // codes one at a time. It used to be cfg(test) gated, which stopped meaning
@@ -857,6 +893,7 @@ pub mod incomplete_code {
         VALID_UNDER_HYP,
         EVA_NOT_REQUESTED,
         WP_NOT_REQUESTED,
+        WP_BACKEND_ANOMALY,
     ];
 }
 
@@ -1313,6 +1350,88 @@ fn proofread_finding_gaps(
             }));
         }
     }
+}
+
+/// What a variant varied that could change the analysed code. `model` is not
+/// in it: no WP option reaches the AST.
+type AstInputs = (Vec<String>, Option<String>);
+
+/// Per AST digest, the variants that produced it, one entry per distinct set of
+/// AST-relevant inputs. A second entry under one digest is the finding: two
+/// configurations asked for different code and got the same. Repeats within a
+/// group are a model sweep and are not.
+type DigestGroups = std::collections::HashMap<String, Vec<(String, AstInputs)>>;
+
+/// The verdict over a finished set of variant entries.
+///
+/// Free-standing so the decision can be tested without a Frama-C instance: the
+/// case that matters most is the one no integration test can stage, a run where
+/// every variant proved and no digest was ever established.
+pub fn check_variants_summary(results: Vec<serde_json::Value>) -> serde_json::Value {
+    let digest_of = |entry: &serde_json::Value| {
+        entry
+            .get("ast_digest")
+            .and_then(|value| value.as_str())
+            .map(str::to_string)
+    };
+
+    let duplicate_count = results
+        .iter()
+        .filter(|entry| entry.get("duplicate_ast").is_some())
+        .count();
+    let all_proved = results
+        .iter()
+        .all(|entry| entry.get("verdict").and_then(|v| v.as_str()) == Some("proved"));
+    let distinct_asts = results
+        .iter()
+        .filter_map(digest_of)
+        .collect::<std::collections::HashSet<_>>()
+        .len();
+
+    // A digest that could not be established compares equal to nothing, so a
+    // variant carrying one was never compared to anything. Counted and
+    // reported, because the alternative is the failure this tool exists to
+    // catch, one level up: with no digests at all the summary would read
+    // distinct_asts 0, duplicate_ast_count 0, verdict proved, which is
+    // indistinguishable from a matrix that really was checked and really was
+    // clean. A comparison that did not happen must not read as one that
+    // happened and found nothing.
+    let unestablished = results.iter().filter(|entry| digest_of(entry).is_none()).count();
+
+    let reason = if duplicate_count > 0 {
+        json!("Two or more variants asked for different code and analysed byte-identical \
+               ASTs, so they are one configuration checked twice rather than several \
+               checked once. Equal goal counts cannot show this; the digests can. \
+               Variants that differ only in the WP model are not counted here: no proof \
+               option changes the AST, so sharing one is expected.")
+    } else if unestablished > 0 {
+        json!("At least one variant has no AST digest, so it was compared to nothing and this \
+               run cannot say whether the configurations differ. Read \
+               proof_receipt.subject.ast_digest_unavailable_reason on that variant: the usual \
+               causes are the ast-utils plug-in not being installed and printSource outrunning \
+               its budget on a large project.")
+    } else {
+        serde_json::Value::Null
+    };
+
+    json!({
+        "schema": "frama-c-mcp.check-variants.v1",
+
+        // Not "proved" unless every variant proved AND every pair was actually
+        // comparable. Both gaps mean the same thing: the question this tool was
+        // asked has not been answered.
+        "verdict": if duplicate_count == 0 && unestablished == 0 && all_proved {
+            "proved"
+        } else {
+            "incomplete"
+        },
+        "variant_count": results.len(),
+        "distinct_asts": distinct_asts,
+        "duplicate_ast_count": duplicate_count,
+        "ast_digest_unavailable_count": unestablished,
+        "reason": reason,
+        "variants": results,
+    })
 }
 
 pub fn check_incomplete_items(
@@ -2176,17 +2295,12 @@ impl FramaCMcpServer {
     /// Write the loaded AST, annotations and all, to a file E-ACSL can read.
     ///
     /// `plugins.ast-utils.printSource` is the request `context {want:
-    /// ["source"]}`
-    /// serves, so
-    /// its output is the whole project as one translation unit that round-trips
-    /// through the C front end.
+    /// ["source"]}` serves, so its output is the whole project as one
+    /// translation unit that round-trips through the C front end.
     async fn write_current_ast_source(&self) -> Result<(String, tempfile::TempDir), McpError> {
         let client = self.require_client().await?;
-        let printed = client
-            .get("plugins.ast-utils.printSource", json!(""))
-            .await
-            .map_err(McpError::from)?;
-        let source = printed.as_str().unwrap_or_default();
+        let source = client.print_source().await.map_err(McpError::from)?;
+        let source = source.as_str();
         if source.trim().is_empty() {
             return Err(McpError::internal_error(
                 "printSource returned nothing, so there is no AST to instrument",
@@ -2202,8 +2316,8 @@ impl FramaCMcpServer {
         // run_e_acsl.
         //
         // The guard is returned to the caller, which holds it for the whole run
-        // and only then parks it on the server, so the file outlives the run and
-        // the reported path stays readable.
+        // and only then parks it on the server, so the file outlives the run
+        // and the reported path stays readable.
         let dir = private_temp_dir("frama-c-mcp-e-acsl-ast-").map_err(|error| {
             McpError::internal_error(format!("failed to create a temp dir: {error}"), None)
         })?;
@@ -2310,6 +2424,12 @@ impl FramaCMcpServer {
             "eva_alarms": eva_alarms,
             "wp": wp,
             "wp_goals": wp_goals,
+
+            // Null for the same reason as "detail" above: WP never ran, so
+            // there is no message stream to have found an anomaly in. The field
+            // is present because the two build sites carry one field set, which
+            // check_returns_one_field_set_on_both_paths freezes.
+            "wp_backend_diagnosis": null,
             "messages": messages,
             "messages_truncated": messages_truncated,
             "recommended_next_call": {
@@ -2320,7 +2440,7 @@ impl FramaCMcpServer {
             "temporary_source_dir": temporary_source_dir,
         });
         let receipt = self
-            .proof_receipt(ProofReceiptRequest {
+            .proof_receipt(None, ProofReceiptRequest {
                 tool: "check",
                 source_files: receipt_files,
                 wp_config: serde_json::Value::Null,
@@ -2344,11 +2464,11 @@ impl FramaCMcpServer {
 
         // The guard goes on the server rather than on this stack frame. The
         // reload below records these paths as the session's loaded files, and
-        // run_wp, run_e_acsl and the goal detail path all re-read that list from
-        // disk long after check has returned, so removing the directory here
-        // left the session pointing at a file that was gone. Parking it keeps
-        // one alive per session and replaces it when the next inline check
-        // loads a different one.
+        // run_wp, run_e_acsl and the goal detail path all re-read that list
+        // from disk long after check has returned, so removing the directory
+        // here left the session pointing at a file that was gone. Parking it
+        // keeps one alive per session and replaces it when the next inline
+        // check loads a different one.
         let (files, temporary_source_dir) = match params.source {
             Some(source) => {
                 let (files, dir, guard) = materialize_check_source(&source)?;
@@ -2368,6 +2488,11 @@ impl FramaCMcpServer {
                 machdep: params.machdep,
                 compilation_database: params.compilation_database,
                 rte: Some(params.rte.unwrap_or(true)),
+
+                // check's own detail governs goals and alarms; the function
+                // list it embeds is never the point of the call, and at full
+                // size it dominates the payload.
+                detail: None,
             }))
             .await
         {
@@ -2446,7 +2571,7 @@ impl FramaCMcpServer {
             Err(_) => (Vec::new(), true),
         };
 
-        let incomplete = check_incomplete_items(
+        let mut incomplete = check_incomplete_items(
             params.rte,
             &reload,
             &eva,
@@ -2456,11 +2581,59 @@ impl FramaCMcpServer {
             wanted,
         );
 
+        // Read from the drain above, because no goal carries it. A Why3 abort
+        // stamps every affected goal FAILED and says why on the message stream
+        // rather than in the record, so a run that only reads goals reports a
+        // crashed backend as a wrong specification.
+        let backend_diagnosis = wp_backend_diagnosis(
+            &messages,
+            wp.pointer("/effective_wp_config/model").and_then(|value| value.as_str()),
+        );
+
+        // An abort is only a gap when it left something unjudged. WP runs
+        // Alt-Ergo, CVC5 and Z3 by default and keeps the first success, so one
+        // prover's Why3 driver can crash on a goal another prover then proves.
+        // Counting that as incomplete turns a fully proved run into
+        // "incomplete" over a backend hiccup no goal is waiting on, which is
+        // the same wrong answer in the other direction. The diagnosis is still
+        // reported; only the verdict is left alone.
+        let anomaly_left_goals_unjudged = wp_backend_anomaly_left_goal_unjudged(
+            &backend_diagnosis,
+            &wp_goals,
+        );
+        if anomaly_left_goals_unjudged {
+            let field = |name: &str| {
+                backend_diagnosis
+                    .get(name)
+                    .cloned()
+                    .unwrap_or_else(|| json!(null))
+            };
+            incomplete.push(json!({
+                "code": incomplete_code::WP_BACKEND_ANOMALY,
+                "reason": field("reason"),
+                "kind": field("kind"),
+                "model": field("model"),
+                "anomaly_count": field("anomaly_count"),
+            }));
+        }
+
         // Ordered after "incomplete" so the fallback can name the gaps it
         // found. Not every gap has an alarm or a goal to point at: an axiom
         // leaves every one of them valid, and a fallback that cannot name it
         // reads as all clear next to a verdict of incomplete.
-        let recommended_next_call = first_unproved_lemma_next_call(&eva_alarms, &wp_goals)
+        //
+        // The backend diagnosis comes first for the same reason a timeout is
+        // read before a goal's text: reading a VC no prover ever received sends
+        // the caller to rewrite an annotation that was never judged.
+        //
+        // Gated on the same condition as the incomplete entry above: an abort
+        // that cost no goal its verdict should not displace the call that
+        // targets a goal which is still open.
+        let recommended_next_call = backend_diagnosis
+            .get("next_action")
+            .filter(|value| anomaly_left_goals_unjudged && value.is_object())
+            .cloned()
+            .or_else(|| first_unproved_lemma_next_call(&eva_alarms, &wp_goals))
             .or_else(|| first_alarm_next_call(&eva_alarms))
             .or_else(|| first_wp_goal_next_call(&wp_goals, params.function.as_deref()))
             .unwrap_or_else(|| {
@@ -2473,10 +2646,34 @@ impl FramaCMcpServer {
                 } else {
                     ("check", json!({"want": ["eva", "wp"]}))
                 };
+
+                // A clean run is exactly when vacuity is worth testing, and
+                // exactly when nothing else prompts for it. check runs no smoke
+                // tests, so it cannot see a contract that proves by excluding
+                // its own branch: the goals are valid, the verdict is proved,
+                // and an over-strong requires has quietly removed the case the
+                // function exists to handle.
+                //
+                // Carried in the reason rather than by redirecting the call.
+                // Two stronger versions were tried and both were wrong: as an
+                // incomplete[] code it gated the verdict, so "proved" became
+                // unreachable and the abs-int canary went red; as a replacement
+                // tool it broke the recommendation this payload has always made
+                // on a clean run.
+                let reason = if incomplete.is_empty() {
+                    "Every goal is valid, which says the code matches the contract, not that \
+                     the contract was worth matching. check runs no vacuity tests: run_wp \
+                     {smoke: true, provers: [...]} is the only check that sees an over-strong \
+                     requires, which proves everything and silently excludes the branch it \
+                     forbids."
+                        .to_string()
+                } else {
+                    check_blocked_reason(&incomplete)
+                };
                 json!({
                     "tool": tool,
                     "args": args,
-                    "reason": check_blocked_reason(&incomplete),
+                    "reason": reason,
                 })
             });
         let verdict = if incomplete.is_empty() {
@@ -2494,7 +2691,8 @@ impl FramaCMcpServer {
         // Everything above this line reads the complete arrays, so summarizing
         // cannot change the verdict, incomplete[], or the recommended call.
         let goals = wp_goals.as_array().cloned().unwrap_or_default();
-        let summarize = params.detail.as_deref() != Some("full");
+        let detail = params.detail.unwrap_or_default();
+        let summarize = !detail.is_full();
         let (reported_goals, reported_alarms) = if summarize {
             (
                 summarize_unless_skipped(
@@ -2522,13 +2720,14 @@ impl FramaCMcpServer {
             "eva_alarms": reported_alarms,
             "wp": wp,
             "wp_goals": reported_goals,
+            "wp_backend_diagnosis": backend_diagnosis,
             "messages": messages,
             "messages_truncated": messages_truncated,
             "recommended_next_call": recommended_next_call,
             "temporary_source_dir": temporary_source_dir,
         });
         let receipt = self
-            .proof_receipt(ProofReceiptRequest {
+            .proof_receipt(None, ProofReceiptRequest {
                 tool: "check",
                 source_files: receipt_files,
                 wp_config: wp
@@ -2557,7 +2756,139 @@ impl FramaCMcpServer {
         &self,
         Parameters(params): Parameters<CheckParams>,
     ) -> Result<CallToolResult, McpError> {
+        if let Some(variants) = params.variants.clone().filter(|v| !v.is_empty()) {
+            return Ok(json_result(self.check_variants(params, variants).await?));
+        }
         Ok(json_result(self.check_payload(params).await?))
+    }
+
+    /// Run the same check over several configurations and report them together.
+    ///
+    /// Sequential on purpose: each variant reloads the one Frama-C instance,
+    /// so running them concurrently would have them overwrite each other's AST.
+    ///
+    /// The digest comparison is the part that earns this tool. Two variants
+    /// whose defines select the same code produce identical goal counts and
+    /// identical verdicts, and read as coverage that was never there; the only
+    /// signal that separates them is the normalised AST. Reported as
+    /// `duplicate_ast` against the first variant with that digest and the same
+    /// AST-relevant inputs.
+    async fn check_variants(
+        &self,
+        base: CheckParams,
+        variants: Vec<CheckVariant>,
+    ) -> Result<serde_json::Value, McpError> {
+        let mut results = Vec::new();
+
+        // Keyed by digest, holding every AST-relevant input group seen with it.
+        // This stops a model sweep reading as a mistake: the digest hashes the
+        // printed source, which no WP option changes.
+        let mut digests: DigestGroups = DigestGroups::new();
+
+        let mut labels_seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+        for (index, variant) in variants.iter().enumerate() {
+            // Disambiguated rather than rejected. Labels are how duplicate_ast
+            // points at the variant it collided with, so two variants sharing
+            // one make that pointer name nothing; suffixing the index keeps the
+            // caller's chosen name readable and the reference exact.
+            let mut label = variant
+                .label
+                .clone()
+                .unwrap_or_else(|| format!("variant{index}"));
+
+            // Looped, not suffixed once: a caller who passes "a" twice and also
+            // passes "a#1" would otherwise get two variants called "a#1", and
+            // duplicate_ast names a label, so it would point at whichever of
+            // them landed first.
+            if !labels_seen.insert(label.clone()) {
+                let base = label.clone();
+                let mut suffix = index;
+                loop {
+                    label = format!("{base}#{suffix}");
+                    if labels_seen.insert(label.clone()) {
+                        break;
+                    }
+                    suffix += 1;
+                }
+            }
+
+            // params starts as base, so Option::or is the override: the
+            // variant's value when it set one, the base's otherwise. One
+            // expression per field, rather than an if-block here and an or_else
+            // in the report below, which is how the two came to disagree about
+            // what "effective" meant.
+            let mut params = base.clone();
+            params.variants = None;
+            params.defines = variant.defines.clone().or(params.defines);
+            params.machdep = variant.machdep.clone().or(params.machdep);
+            params.model = variant.model.clone().or(params.model);
+
+            // Captured before check_payload takes ownership, so the report
+            // names what this variant actually ran with.
+            let effective_defines = params.defines.clone().unwrap_or_default();
+            let effective_machdep = params.machdep.clone();
+
+            let payload = self.check_payload(params).await?;
+            let digest = payload
+                .pointer("/proof_receipt/subject/ast_digest")
+                .and_then(|value| value.as_str())
+                .map(str::to_string);
+
+            // What the caller varied that could have changed the code. model is
+            // deliberately not in it.
+            let ast_inputs = (effective_defines.clone(), effective_machdep.clone());
+            let duplicate_of = digest.as_ref().and_then(|d| {
+                digests
+                    .get(d)
+                    .and_then(|groups| {
+                        (!groups.iter().any(|(_, seen_inputs)| seen_inputs == &ast_inputs))
+                            .then(|| groups[0].0.clone())
+                    })
+            });
+            if let Some(d) = digest.clone() {
+                let groups = digests.entry(d).or_default();
+                if !groups
+                    .iter()
+                    .any(|(_, seen_inputs)| seen_inputs == &ast_inputs)
+                {
+                    groups.push((label.clone(), ast_inputs));
+                }
+            }
+
+            let mut entry = json!({
+                "label": label,
+                "defines": effective_defines,
+                "machdep": effective_machdep,
+                "model": payload.pointer("/wp/effective_wp_config/model").cloned(),
+                "verdict": payload.get("verdict").cloned().unwrap_or(serde_json::Value::Null),
+                "incomplete": payload
+                    .get("incomplete")
+                    .and_then(|v| v.as_array())
+                    .map(|items| {
+                        items
+                            .iter()
+                            .filter_map(|i| i.get("code").and_then(|c| c.as_str()))
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default(),
+                "ast_digest": digest,
+                "wp_backend_diagnosis": payload
+                    .get("wp_backend_diagnosis")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null),
+                "proof_receipt_sha256": payload
+                    .pointer("/proof_receipt/sha256")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null),
+            });
+            if let (Some(obj), Some(first)) = (entry.as_object_mut(), duplicate_of) {
+                obj.insert("duplicate_ast".to_string(), json!(first));
+            }
+            results.push(entry);
+        }
+
+        Ok(check_variants_summary(results))
     }
 
     async fn eva_alarms_payload(

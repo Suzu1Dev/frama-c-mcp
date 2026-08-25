@@ -6,8 +6,10 @@ use frama_c_mcp::mcp::server::*;
 use frama_c_mcp::mcp::server::analysis::{
     check_blocked_reason,
     check_incomplete_items,
+    check_variants_summary,
     goal_needs_failure_classification,
     property_is_dead, render_sequent, WantedAnalyses,
+    wp_backend_anomaly_left_goal_unjudged,
 };
 use frama_c_mcp::mcp::server::selfcheck::{
     buggy_fixture_reason, fixed_fixture_reason,
@@ -56,6 +58,47 @@ fn undischarged_rte_alarm_makes_check_incomplete() {
     );
     let flagged: Vec<&serde_json::Value> = alarms.iter().map(|a| &a["property"]).collect();
     assert_eq!(flagged, vec![&json!("#p4"), &json!("#p5")]);
+}
+
+/// An abort is a gap only when it cost a goal its verdict.
+///
+/// The anomaly text below is verbatim from Frama-C 33 on
+/// tests/fixtures/pointer-cast-anomaly.c under Typed+nocast. Read it before
+/// changing this: WP names a goal *kind* there, "Goal Property:", drawn from a
+/// fixed table. It names no goal, so there is nothing in the message to match a
+/// goal against, and an earlier gate that tried scored false on every real run.
+/// The link from the abort to the obligation it cost is the goal's own FAILED
+/// status, which is what this reads.
+#[test]
+fn backend_anomaly_counts_only_when_a_goal_went_unjudged() {
+    let diagnosis = json!({
+        "kind": "why3_anomaly_with_pointer_cast",
+        "anomalies": ["Goal Property:\n  running prover Alt-Ergo:2.6.3 failed \
+                       ([Why3 Error] anomaly: Invalid_argument(\"unbound variable in of_term\"))"],
+    });
+
+    // WP runs several provers and keeps the first that answers, so one driver
+    // crashing on a goal another proved costs nothing. Reporting that as
+    // incomplete turns a fully proved run into a gap over a hiccup.
+    let all_decided = json!([
+        {"name": "Post-condition", "normalized_status": "valid"},
+        {"name": "Assertion", "normalized_status": "timeout"}
+    ]);
+    assert!(!wp_backend_anomaly_left_goal_unjudged(&diagnosis, &all_decided));
+
+    // A FAILED goal is one no prover answered.
+    let unjudged = json!([
+        {"name": "Post-condition", "wpo": "typed_nocast_nextblk_ensures", "normalized_status": "failed"},
+        {"name": "Assertion", "normalized_status": "valid"}
+    ]);
+    assert!(wp_backend_anomaly_left_goal_unjudged(&diagnosis, &unjudged));
+
+    // No anomaly on the stream, so no abort to attribute anything to, however
+    // the goals came out.
+    assert!(!wp_backend_anomaly_left_goal_unjudged(
+        &serde_json::Value::Null,
+        &unjudged
+    ));
 }
 
 /// A goal WP proved whose property Frama-C would not call valid. Both shapes
@@ -1067,3 +1110,65 @@ fn canary_criteria_judge_the_reason_rather_than_the_verdict() {
     .is_some());
 }
 
+/// A comparison that did not happen must not read as one that found nothing.
+///
+/// The dangerous shape is the last case below and no integration test can stage
+/// it: every variant proves, and no digest was ever established because the
+/// ast-utils plug-in is absent or printSource outran its budget. Left alone,
+/// the summary answers distinct_asts 0, duplicate_ast_count 0, verdict proved,
+/// which is byte-identical to a matrix that really was checked and really was
+/// clean. That is the miss this whole tool exists to catch, one level up.
+#[test]
+fn variant_summary_will_not_call_an_unchecked_matrix_proved() {
+    let entry = |label: &str, verdict: &str, digest: serde_json::Value| {
+        json!({"label": label, "verdict": verdict, "ast_digest": digest})
+    };
+
+    let clean = check_variants_summary(vec![
+        entry("a", "proved", json!("d0")),
+        entry("b", "proved", json!("d1")),
+    ]);
+    assert_eq!(clean["verdict"], "proved");
+    assert_eq!(clean["distinct_asts"], 2);
+    assert_eq!(clean["ast_digest_unavailable_count"], 0);
+    assert!(clean["reason"].is_null());
+
+    // A duplicate outranks the clean answer and names itself in the reason.
+    let mut dup = entry("b", "proved", json!("d0"));
+    dup["duplicate_ast"] = json!("a");
+    let duplicated = check_variants_summary(vec![entry("a", "proved", json!("d0")), dup]);
+    assert_eq!(duplicated["verdict"], "incomplete");
+    assert_eq!(duplicated["duplicate_ast_count"], 1);
+    assert_eq!(duplicated["distinct_asts"], 1);
+    assert!(duplicated["reason"]
+        .as_str()
+        .unwrap()
+        .contains("byte-identical"));
+
+    // Every variant proved and nothing was comparable. The verdict must not be
+    // "proved", and the reason must say which of the two gaps it is.
+    let blind = check_variants_summary(vec![
+        entry("a", "proved", serde_json::Value::Null),
+        entry("b", "proved", serde_json::Value::Null),
+    ]);
+    assert_eq!(
+        blind["verdict"], "incomplete",
+        "no digest was established, so nothing was compared: {blind:?}"
+    );
+    assert_eq!(blind["ast_digest_unavailable_count"], 2);
+    assert_eq!(blind["distinct_asts"], 0);
+    assert!(blind["reason"]
+        .as_str()
+        .unwrap()
+        .contains("compared to nothing"));
+
+    // One missing digest is enough; the others being fine does not restore the
+    // guarantee, because the missing one was compared to none of them.
+    let partial = check_variants_summary(vec![
+        entry("a", "proved", json!("d0")),
+        entry("b", "proved", serde_json::Value::Null),
+    ]);
+    assert_eq!(partial["verdict"], "incomplete", "{partial:?}");
+    assert_eq!(partial["ast_digest_unavailable_count"], 1);
+    assert_eq!(partial["distinct_asts"], 1);
+}

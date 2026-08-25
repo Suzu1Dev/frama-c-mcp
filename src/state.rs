@@ -1,4 +1,4 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -70,7 +70,13 @@ pub struct SessionState {
     pub eva_completed: bool,
     pub wp_completed: bool,
     pub functions: HashMap<String, FunctionInfo>,
-    pub stale_markers: HashMap<String, StaleMarker>,
+
+    // BTreeMap rather than HashMap: the only reads are a key lookup and the
+    // capped sample reload_project reports, and a HashMap's per-process seed
+    // made that sample a different twenty on every run of the same reload.
+    // Ordered by construction is cheaper than sorting at the use site and
+    // cannot be forgotten by the next reader of this field.
+    pub stale_markers: BTreeMap<String, StaleMarker>,
     // Phase 2
     pub globals: HashMap<String, GlobalInfo>,
     pub callgraph_edges: Vec<CallEdge>,
@@ -673,7 +679,7 @@ impl SessionState {
         // reload)
     }
 
-    pub fn set_stale_markers(&mut self, stale_markers: HashMap<String, StaleMarker>) {
+    pub fn set_stale_markers(&mut self, stale_markers: BTreeMap<String, StaleMarker>) {
         self.stale_markers = stale_markers;
     }
 
@@ -839,14 +845,17 @@ impl SessionState {
             return Err(format!("cannot store verified conclusion for '{}': missing proof_receipt", entry.function));
         };
 
-        // v2 stays accepted. Conclusions stored before v3 added the contract
-        // snapshot are not wrong, they just cannot be byte-compared with a v3
-        // receipt, which is what a version bump is for. Rejecting them would
-        // invalidate stored work to gain nothing.
+        // Older receipts stay accepted. v3 added the contract snapshot and v4
+        // added the AST digest, so neither compares byte-for-byte with newer
+        // receipts. Rejecting stored work would gain nothing.
         let schema = receipt.get("schema").and_then(|v| v.as_str());
         if !matches!(
             schema,
-            Some("frama-c-mcp.proof-receipt.v2" | "frama-c-mcp.proof-receipt.v3")
+            Some(
+                "frama-c-mcp.proof-receipt.v2"
+                    | "frama-c-mcp.proof-receipt.v3"
+                    | "frama-c-mcp.proof-receipt.v4"
+            )
         ) {
             return Err(format!("cannot store verified conclusion for '{}': invalid proof_receipt schema", entry.function));
         }

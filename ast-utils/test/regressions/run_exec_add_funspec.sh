@@ -29,9 +29,9 @@ trap 'rm -rf "$WORK"' EXIT
 cp "$HERE/funspec_scope.c" "$HERE/batch_exec_add_funspec.json" "$WORK/"
 (cd "$WORK" && "$FC" -load-module ast_utils_plugin \
     -server-batch batch_exec_add_funspec.json funspec_scope.c \
-    >/dev/null 2>&1)
+    > /dev/null 2>&1)
 
-python3 - "$WORK/batch_exec_add_funspec.out.json" <<'PY'
+python3 - "$WORK/batch_exec_add_funspec.out.json" << 'PY'
 import json, sys
 
 # Per-entry contract: (expected_success,

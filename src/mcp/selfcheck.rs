@@ -628,8 +628,8 @@ impl FramaCMcpServer {
         }
 
         // Under the private root, which is in /tmp and short for the reason
-        // that matters here: a Unix socket path is capped near 104 bytes, and on
-        // macOS `temp_dir()` is `/var/folders/<32>/<8>/T/`, half the budget
+        // that matters here: a Unix socket path is capped near 104 bytes, and
+        // on macOS `temp_dir()` is `/var/folders/<32>/<8>/T/`, half the budget
         // before this directory is even named. The probe server died with
         // ENAMETOOLONG, so every request came back `not_probed` and self_check
         // looked clean having checked nothing. The root is shorter than the

@@ -27,7 +27,6 @@ target/
 .vscode/
 .idea/
 .claude/
-.editorconfig
 
 # OS
 .DS_Store
