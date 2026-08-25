@@ -756,6 +756,41 @@ pub fn goal_needs_failure_classification(goal: &serde_json::Value) -> bool {
     !proved || (vacuous && !property_is_dead(goal))
 }
 
+/// Whether a backend abort left a goal in this run without a verdict.
+///
+/// Attribution by message text was tried first and cannot work. WP emits the
+/// abort in one place, as "Goal <label>: running prover <p> failed (...)",
+/// where the label comes from a fixed table of goal kinds: Property,
+/// Invariant, Preservation, Terminates, and a dozen more. It names a kind, not
+/// a goal. Two of the fields a matcher would compare against, stable_goal_id
+/// and hash_label, are minted by this server and cannot occur in Frama-C output
+/// at all, and matching the generic label instead marks every goal of that kind
+/// rather than the one that aborted. So the text gate was false on every real
+/// run and true for the wrong goals on the one shape that overlapped.
+///
+/// WP does the attribution structurally instead. A prover run that failed
+/// leaves the goal FAILED, which is the same status the per-goal classifier
+/// reads, so a FAILED goal alongside an abort on the message stream is a goal
+/// no prover answered. That is coarser than naming the goal, and it is the
+/// resolution WP actually offers: an abort with every goal otherwise decided
+/// costs nothing and is reported without touching the verdict.
+pub fn wp_backend_anomaly_left_goal_unjudged(
+    diagnosis: &serde_json::Value,
+    goals: &serde_json::Value,
+) -> bool {
+    if !diagnosis.is_object() {
+        return false;
+    }
+    goals
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|goal| goal_needs_failure_classification(goal))
+        .any(|goal| {
+            crate::mcp::status::own_status(goal).is_some_and(crate::mcp::status::status_is_failed)
+        })
+}
+
 fn check_goal_counts_as_progress(goal: &serde_json::Value) -> bool {
     if let Some(counts) = goal
         .get("counts_as_progress")
@@ -832,6 +867,7 @@ pub mod incomplete_code {
     pub const VALID_UNDER_HYP: &str = "VALID_UNDER_HYP";
     pub const EVA_NOT_REQUESTED: &str = "EVA_NOT_REQUESTED";
     pub const WP_NOT_REQUESTED: &str = "WP_NOT_REQUESTED";
+    pub const WP_BACKEND_ANOMALY: &str = "WP_BACKEND_ANOMALY";
 
     // Only the doc comparison reads the list as a list; the emit sites name
     // codes one at a time. It used to be cfg(test) gated, which stopped meaning
@@ -857,6 +893,7 @@ pub mod incomplete_code {
         VALID_UNDER_HYP,
         EVA_NOT_REQUESTED,
         WP_NOT_REQUESTED,
+        WP_BACKEND_ANOMALY,
     ];
 }
 
@@ -2202,8 +2239,8 @@ impl FramaCMcpServer {
         // run_e_acsl.
         //
         // The guard is returned to the caller, which holds it for the whole run
-        // and only then parks it on the server, so the file outlives the run and
-        // the reported path stays readable.
+        // and only then parks it on the server, so the file outlives the run
+        // and the reported path stays readable.
         let dir = private_temp_dir("frama-c-mcp-e-acsl-ast-").map_err(|error| {
             McpError::internal_error(format!("failed to create a temp dir: {error}"), None)
         })?;
@@ -2310,6 +2347,12 @@ impl FramaCMcpServer {
             "eva_alarms": eva_alarms,
             "wp": wp,
             "wp_goals": wp_goals,
+
+            // Null for the same reason as "detail" above: WP never ran, so
+            // there is no message stream to have found an anomaly in. The field
+            // is present because the two build sites carry one field set, which
+            // check_returns_one_field_set_on_both_paths freezes.
+            "wp_backend_diagnosis": null,
             "messages": messages,
             "messages_truncated": messages_truncated,
             "recommended_next_call": {
@@ -2344,11 +2387,11 @@ impl FramaCMcpServer {
 
         // The guard goes on the server rather than on this stack frame. The
         // reload below records these paths as the session's loaded files, and
-        // run_wp, run_e_acsl and the goal detail path all re-read that list from
-        // disk long after check has returned, so removing the directory here
-        // left the session pointing at a file that was gone. Parking it keeps
-        // one alive per session and replaces it when the next inline check
-        // loads a different one.
+        // run_wp, run_e_acsl and the goal detail path all re-read that list
+        // from disk long after check has returned, so removing the directory
+        // here left the session pointing at a file that was gone. Parking it
+        // keeps one alive per session and replaces it when the next inline
+        // check loads a different one.
         let (files, temporary_source_dir) = match params.source {
             Some(source) => {
                 let (files, dir, guard) = materialize_check_source(&source)?;
@@ -2446,7 +2489,7 @@ impl FramaCMcpServer {
             Err(_) => (Vec::new(), true),
         };
 
-        let incomplete = check_incomplete_items(
+        let mut incomplete = check_incomplete_items(
             params.rte,
             &reload,
             &eva,
@@ -2456,11 +2499,59 @@ impl FramaCMcpServer {
             wanted,
         );
 
+        // Read from the drain above, because no goal carries it. A Why3 abort
+        // stamps every affected goal FAILED and says why on the message stream
+        // rather than in the record, so a run that only reads goals reports a
+        // crashed backend as a wrong specification.
+        let backend_diagnosis = wp_backend_diagnosis(
+            &messages,
+            wp.pointer("/effective_wp_config/model").and_then(|value| value.as_str()),
+        );
+
+        // An abort is only a gap when it left something unjudged. WP runs
+        // Alt-Ergo, CVC5 and Z3 by default and keeps the first success, so one
+        // prover's Why3 driver can crash on a goal another prover then proves.
+        // Counting that as incomplete turns a fully proved run into
+        // "incomplete" over a backend hiccup no goal is waiting on, which is
+        // the same wrong answer in the other direction. The diagnosis is still
+        // reported; only the verdict is left alone.
+        let anomaly_left_goals_unjudged = wp_backend_anomaly_left_goal_unjudged(
+            &backend_diagnosis,
+            &wp_goals,
+        );
+        if anomaly_left_goals_unjudged {
+            let field = |name: &str| {
+                backend_diagnosis
+                    .get(name)
+                    .cloned()
+                    .unwrap_or_else(|| json!(null))
+            };
+            incomplete.push(json!({
+                "code": incomplete_code::WP_BACKEND_ANOMALY,
+                "reason": field("reason"),
+                "kind": field("kind"),
+                "model": field("model"),
+                "anomaly_count": field("anomaly_count"),
+            }));
+        }
+
         // Ordered after "incomplete" so the fallback can name the gaps it
         // found. Not every gap has an alarm or a goal to point at: an axiom
         // leaves every one of them valid, and a fallback that cannot name it
         // reads as all clear next to a verdict of incomplete.
-        let recommended_next_call = first_unproved_lemma_next_call(&eva_alarms, &wp_goals)
+        //
+        // The backend diagnosis comes first for the same reason a timeout is
+        // read before a goal's text: reading a VC no prover ever received sends
+        // the caller to rewrite an annotation that was never judged.
+        //
+        // Gated on the same condition as the incomplete entry above: an abort
+        // that cost no goal its verdict should not displace the call that
+        // targets a goal which is still open.
+        let recommended_next_call = backend_diagnosis
+            .get("next_action")
+            .filter(|value| anomaly_left_goals_unjudged && value.is_object())
+            .cloned()
+            .or_else(|| first_unproved_lemma_next_call(&eva_alarms, &wp_goals))
             .or_else(|| first_alarm_next_call(&eva_alarms))
             .or_else(|| first_wp_goal_next_call(&wp_goals, params.function.as_deref()))
             .unwrap_or_else(|| {
@@ -2473,10 +2564,34 @@ impl FramaCMcpServer {
                 } else {
                     ("check", json!({"want": ["eva", "wp"]}))
                 };
+
+                // A clean run is exactly when vacuity is worth testing, and
+                // exactly when nothing else prompts for it. check runs no smoke
+                // tests, so it cannot see a contract that proves by excluding
+                // its own branch: the goals are valid, the verdict is proved,
+                // and an over-strong requires has quietly removed the case the
+                // function exists to handle.
+                //
+                // Carried in the reason rather than by redirecting the call.
+                // Two stronger versions were tried and both were wrong: as an
+                // incomplete[] code it gated the verdict, so "proved" became
+                // unreachable and the abs-int canary went red; as a replacement
+                // tool it broke the recommendation this payload has always made
+                // on a clean run.
+                let reason = if incomplete.is_empty() {
+                    "Every goal is valid, which says the code matches the contract, not that \
+                     the contract was worth matching. check runs no vacuity tests: run_wp \
+                     {smoke: true, provers: [...]} is the only check that sees an over-strong \
+                     requires, which proves everything and silently excludes the branch it \
+                     forbids."
+                        .to_string()
+                } else {
+                    check_blocked_reason(&incomplete)
+                };
                 json!({
                     "tool": tool,
                     "args": args,
-                    "reason": check_blocked_reason(&incomplete),
+                    "reason": reason,
                 })
             });
         let verdict = if incomplete.is_empty() {
@@ -2522,6 +2637,7 @@ impl FramaCMcpServer {
             "eva_alarms": reported_alarms,
             "wp": wp,
             "wp_goals": reported_goals,
+            "wp_backend_diagnosis": backend_diagnosis,
             "messages": messages,
             "messages_truncated": messages_truncated,
             "recommended_next_call": recommended_next_call,

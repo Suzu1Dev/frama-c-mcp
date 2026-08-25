@@ -80,6 +80,7 @@ want lifecycle && run lifecycle cargo test --test test-process-lifecycle -- --te
 want reload && run reload cargo test --test test-reload-project-regression -- --test-threads=1
 want store && run store cargo test --test test-store-conclusion -- --test-threads=1
 want abs-int && run abs-int scripts/check-abs-int-fixtures.sh
+want wp-model && run wp-model scripts/check-wp-model-fixtures.sh
 want artifacts && run artifacts scripts/check-artifacts.sh
 want corpus && run corpus scripts/check-tutorial-corpus.sh
 want stdio && run stdio cargo test --test test-mcp-stdio --release -- --test-threads=1

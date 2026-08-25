@@ -255,7 +255,7 @@ pub fn missing_header_name(msg: &str) -> Option<&str> {
     name.ends_with(".h").then_some(name)
 }
 
-fn classify_server_error(msg: &str) -> (&'static str, bool, Option<serde_json::Value>) {
+pub fn classify_server_error(msg: &str) -> (&'static str, bool, Option<serde_json::Value>) {
     let lower = msg.to_ascii_lowercase();
 
     // First, because it is the most specific test here: it demands a compiler
@@ -288,6 +288,28 @@ fn classify_server_error(msg: &str) -> (&'static str, bool, Option<serde_json::V
                     "The preprocessor could not resolve {header}, so nothing \
                      that includes it was parsed and it has no goals."
                 )
+            })),
+        );
+    }
+
+    // Ahead of the Why3 configuration branch below, because the two overlap on
+    // the text an abort actually carries. Why3 reports one of its anomalies as
+    // "anomaly: Not_found", which satisfies that branch's "why3" plus "not
+    // found" and would route a crashed backend to configure a toolchain that is
+    // working. The needles here are the reverse test, and this is the reader
+    // that sees the abort text: protocol errors carry it, goal records do not.
+    if crate::mcp::server::wpclass::why3_aborted(&lower) {
+        return (
+            "Why3Anomaly",
+            false,
+            Some(serde_json::json!({
+                "tool": "self_check",
+                "args_example": {},
+                "reason": "Why3 aborted rather than answering, so nothing here is a verdict on \
+                           the C code or the ACSL. Record the Frama-C, Why3, and prover versions \
+                           before changing an annotation. Under Typed+nocast a pointer cast \
+                           reaching a goal is the usual cause and the same contract proves under \
+                           Typed+cast."
             })),
         );
     }
@@ -358,10 +380,11 @@ fn classify_server_error(msg: &str) -> (&'static str, bool, Option<serde_json::V
     ("FramaCServerError", false, None)
 }
 
-fn failure_kind_for_error_kind(kind: &str) -> &'static str {
+pub fn failure_kind_for_error_kind(kind: &str) -> &'static str {
     match kind {
         "MissingProver" => "missing_prover",
         "MissingWhy3Config" => "missing_why3_config",
+        "Why3Anomaly" => "frama_c_internal",
         "MissingPluginRequest" => "missing_plugin_request",
         "AcslParseError" => "acsl_parse_error",
         "MissingHeader" => "missing_header",

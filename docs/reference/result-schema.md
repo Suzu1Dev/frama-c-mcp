@@ -42,6 +42,7 @@ null either way, not absent, and `incomplete[]` is what tells the two apart.
 | `eva_alarms` | array, object, or null | Object when summarized, array when `detail` is `full`, null when EVA did not run |
 | `wp` | object or null | WP run result; null when the reload failed or `want` excluded it |
 | `wp_goals` | array, object, or null | Object when summarized, array when `detail` is `full`, null when WP did not run |
+| `wp_backend_diagnosis` | object or null | Non-null when the message stream shows a Why3 abort, so a FAILED goal is a crashed prover and not a verdict. Non-null does not imply `incomplete`: WP keeps the first prover that answers, so an abort that cost no goal its verdict is reported here and adds no `WP_BACKEND_ANOMALY`. The abort is attributed to goals by their `FAILED` status, not by the message text, which names a goal kind (`Goal Property:`) and never a goal |
 | `messages` | array | Frama-C diagnostics drained for this run |
 | `messages_truncated` | boolean | The drain hit its cap and dropped some |
 | `recommended_next_call` | object | `{tool, args, reason}` |
@@ -82,6 +83,7 @@ goal whose property sits in unreachable code. Branch on `code`.
 | `VALID_UNDER_HYP` | WP proved the goal, but Frama-C consolidated its property as valid only under hypotheses nothing has established |
 | `EVA_NOT_REQUESTED` | `want` excluded EVA, so nothing here excludes the alarms it finds |
 | `WP_NOT_REQUESTED` | `want` excluded WP, so nothing here is a proof |
+| `WP_BACKEND_ANOMALY` | Why3 aborted, so the FAILED goals of this run were never judged by a prover |
 
 The same table is in README, and `src/mcp/analysis.rs` names the codes once in
 `incomplete_code`. A test asserts all three agree, so a code added in one place

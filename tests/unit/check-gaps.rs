@@ -8,6 +8,7 @@ use frama_c_mcp::mcp::server::analysis::{
     check_incomplete_items,
     goal_needs_failure_classification,
     property_is_dead, render_sequent, WantedAnalyses,
+    wp_backend_anomaly_left_goal_unjudged,
 };
 use frama_c_mcp::mcp::server::selfcheck::{
     buggy_fixture_reason, fixed_fixture_reason,
@@ -56,6 +57,47 @@ fn undischarged_rte_alarm_makes_check_incomplete() {
     );
     let flagged: Vec<&serde_json::Value> = alarms.iter().map(|a| &a["property"]).collect();
     assert_eq!(flagged, vec![&json!("#p4"), &json!("#p5")]);
+}
+
+/// An abort is a gap only when it cost a goal its verdict.
+///
+/// The anomaly text below is verbatim from Frama-C 33 on
+/// tests/fixtures/pointer-cast-anomaly.c under Typed+nocast. Read it before
+/// changing this: WP names a goal *kind* there, "Goal Property:", drawn from a
+/// fixed table. It names no goal, so there is nothing in the message to match a
+/// goal against, and an earlier gate that tried scored false on every real run.
+/// The link from the abort to the obligation it cost is the goal's own FAILED
+/// status, which is what this reads.
+#[test]
+fn backend_anomaly_counts_only_when_a_goal_went_unjudged() {
+    let diagnosis = json!({
+        "kind": "why3_anomaly_with_pointer_cast",
+        "anomalies": ["Goal Property:\n  running prover Alt-Ergo:2.6.3 failed \
+                       ([Why3 Error] anomaly: Invalid_argument(\"unbound variable in of_term\"))"],
+    });
+
+    // WP runs several provers and keeps the first that answers, so one driver
+    // crashing on a goal another proved costs nothing. Reporting that as
+    // incomplete turns a fully proved run into a gap over a hiccup.
+    let all_decided = json!([
+        {"name": "Post-condition", "normalized_status": "valid"},
+        {"name": "Assertion", "normalized_status": "timeout"}
+    ]);
+    assert!(!wp_backend_anomaly_left_goal_unjudged(&diagnosis, &all_decided));
+
+    // A FAILED goal is one no prover answered.
+    let unjudged = json!([
+        {"name": "Post-condition", "wpo": "typed_nocast_nextblk_ensures", "normalized_status": "failed"},
+        {"name": "Assertion", "normalized_status": "valid"}
+    ]);
+    assert!(wp_backend_anomaly_left_goal_unjudged(&diagnosis, &unjudged));
+
+    // No anomaly on the stream, so no abort to attribute anything to, however
+    // the goals came out.
+    assert!(!wp_backend_anomaly_left_goal_unjudged(
+        &serde_json::Value::Null,
+        &unjudged
+    ));
 }
 
 /// A goal WP proved whose property Frama-C would not call valid. Both shapes

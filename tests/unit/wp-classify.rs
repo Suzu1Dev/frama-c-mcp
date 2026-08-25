@@ -502,6 +502,27 @@ fn wp_run_response_reports_task_failure_kind() {
     );
     assert_eq!(missing_prover["failure_kind"], "missing_prover");
 
+    // A crashed backend, as the payload actually carries it: a goal stamped
+    // FAILED and no log text anywhere. This used to hand the goal a name
+    // containing the anomaly text, which no WP run produces, so the branch it
+    // exercised could never fire on a real one.
+    let why3_crash = wp_run_response(
+        json!({
+            "goals": [{
+                "stable_goal_id": "g1",
+                "name": "Post-condition",
+                "normalized_status": "failed"
+            }]
+        }),
+        &params,
+        vec![],
+        "main",
+        false,
+        vec![],
+        None,
+    );
+    assert_eq!(why3_crash["failure_kind"], "frama_c_internal");
+
     let unproved = wp_run_response(
         json!({"goals": [{"stable_goal_id": "g1", "normalized_status": "unknown"}]}),
         &params,
@@ -786,6 +807,43 @@ fn classify_wp_failure_internal_error() {
     );
 }
 
+/// What an aborted goal actually looks like, which is the whole difficulty.
+///
+/// The goal below is the record Frama-C 33 leaves after Why3 crashes on it,
+/// taken from a real run of tests/fixtures/pointer-cast-anomaly.c under
+/// Typed+nocast: the name is the ordinary WP goal name and the status is a bare
+/// FAILED. Nothing in it mentions Why3, an anomaly, or a prover, because WP
+/// puts that on the message stream instead. An earlier version of this test
+/// handed the classifier a goal whose name was the anomaly text and asserted it
+/// classified, which only proved that a string matcher matches the string given
+/// to it.
+#[test]
+fn classify_aborted_goal_as_infrastructure_failure() {
+    let classification = classify_wp_failure_from_goal(
+        &json!({
+            "name": "Post-condition",
+            "wpo": "typed_nocast_nextblk_ensures",
+            "normalized_status": "failed"
+        }),
+        Some("nextblk"),
+    );
+    assert_eq!(classification["category"], "internal_error");
+    assert_eq!(classification["failure_kind"], "frama_c_internal");
+    assert_eq!(classification["next_action"]["tool"], "self_check");
+
+    // The verdict a client branches on must not read as a weak specification:
+    // no prover answered this goal at all.
+    assert_eq!(
+        classification["semantic_verdict"]["kind"],
+        "backend_unavailable"
+    );
+    let fix = classification["proofread_report"]["findings"][0]["suggested_fix"]
+        .as_str()
+        .unwrap();
+    assert!(fix.contains("not evidence"), "{fix}");
+    assert!(fix.contains("wp_backend_diagnosis"), "{fix}");
+}
+
 #[test]
 fn classify_wp_failure_unknown_fallback() {
     let classification = classify_wp_failure_from_goal(
@@ -818,9 +876,12 @@ fn classify_wp_failure_routes_setup_failures() {
     );
     assert_eq!(missing_prover["failure_kind"], "missing_prover");
     assert_eq!(missing_prover["next_action"]["tool"], "self_check");
+
+    // Was "specification_too_weak" here, which is the conclusion a setup
+    // failure must never invite: no prover ran, so nothing judged the spec.
     assert_eq!(
         missing_prover["semantic_verdict"]["kind"],
-        "specification_too_weak"
+        "backend_unavailable"
     );
 
     let missing_why3 = classify_wp_failure_from_goal(
@@ -854,7 +915,10 @@ fn runtime_check_suggested_for_unproved_claims() {
     ] {
         let classification = classify_wp_failure_from_goal(&goal, Some("f"));
         let suggestion = &classification["runtime_check_suggestion"];
-        assert_eq!(suggestion["kind"], "external_manual_e_acsl", "{classification:?}");
+        assert_eq!(
+            suggestion["kind"], "external_manual_e_acsl",
+            "{classification:?}"
+        );
         assert_eq!(suggestion["availability"]["tool"], "self_check");
 
         // The whole list and its order, not just its head. This payload told an
@@ -1233,7 +1297,6 @@ fn capped_lossy_string_preserves_raw_bytes_until_cap() {
     assert_eq!(raw, "abc");
     assert!(truncated);
 }
-
 
 /// A drained scheduler payload says nothing about goals, so triage that reads
 /// only the payload used to answer "No timeout ... evidence was found" at high

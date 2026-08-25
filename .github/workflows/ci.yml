@@ -225,6 +225,9 @@ jobs:
       - name: Abs-int false-OK guard
         run: scripts/check-abs-int-fixtures.sh
 
+      - name: WP model and encoding fixture gate
+        run: scripts/check-wp-model-fixtures.sh
+
       - name: Integration tests (live Frama-C server)
         run: cargo test --test test-integration -- --test-threads=1
 

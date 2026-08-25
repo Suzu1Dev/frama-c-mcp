@@ -7028,6 +7028,7 @@ async fn check_returns_one_field_set_on_both_paths() {
         "temporary_source_dir",
         "verdict",
         "wp",
+        "wp_backend_diagnosis",
         "wp_goals",
     ];
 

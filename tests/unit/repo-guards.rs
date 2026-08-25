@@ -632,7 +632,7 @@ fn ci_frama_c_version_matches_supported_minimum() {
         );
     }
 
-    // The two shell gates pin proved-goal counts, so they match an exact
+    // The three shell gates pin proved-goal counts, so they match an exact
     // version where the constant is only a floor. That difference is fine until
     // they disagree: a matrix the scripts refuse means CI installs a Frama-C
     // its own gates will not run against, and the floor above cannot see it
@@ -640,9 +640,10 @@ fn ci_frama_c_version_matches_supported_minimum() {
     for script in [
         "scripts/check-tutorial-corpus.sh",
         "scripts/check-abs-int-fixtures.sh",
+        "scripts/check-wp-model-fixtures.sh",
 
         // Refuses an unsupported matrix value before ten minutes of opam
-        // install, and so pins the same version the two gates above do.
+        // install, and so pins the same version the gates above do.
         ".ci/check-frama-c-matrix-version.sh",
     ] {
         let text = std::fs::read_to_string(root.join(script)).expect(script);

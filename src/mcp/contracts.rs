@@ -544,10 +544,9 @@ pub fn result_unconstrained_findings(
             "{function} bounds its result to {low}..{high} but never says which \
              input yields {listed}, so proving it does not pin down what it returns."
         ),
-        "suggested_fix": format!(
+        "suggested_fix":
             "Characterize the remaining results, one ensures per value in the form \
-             \\result == V <==> <condition on the parameters>."
-        ),
+             \\result == V <==> <condition on the parameters>.",
         "evidence": [{
             "field": "result_values_determined",
             "value": determined

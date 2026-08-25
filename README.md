@@ -411,6 +411,7 @@ payload contract and the change rule. The full set:
 | `VALID_UNDER_HYP` | WP proved the goal, but Frama-C consolidated its property as valid only under hypotheses nothing has established |
 | `EVA_NOT_REQUESTED` | `want` excluded EVA, so nothing here excludes the alarms it finds |
 | `WP_NOT_REQUESTED` | `want` excluded WP, so nothing here is a proof |
+| `WP_BACKEND_ANOMALY` | Why3 aborted, so the FAILED goals of this run were never judged by a prover |
 
 Treat the set as additive: codes are added as gaps are found, and three were
 added in one day. Branch on the ones you handle and surface the rest rather
@@ -570,8 +571,21 @@ return deltas.
 
 ### WP memory model
 
-The server uses `Typed+nocast`, so casts fail safely instead of being silently
-assumed away.
+The server uses `Typed+nocast`, so a cast makes the relevant VC fail instead of
+being silently assumed away. That failure is not always safe. Measured on
+Frama-C 33 with Why3 1.8.2, a cast that reaches the goal rather than only the
+code aborts Why3 with `Invalid_argument("unbound variable in of_term")`, and WP
+then stamps the goals `FAILED` with no prover having answered; the same contract
+proves under `Typed+cast`. `check` reports that case as `wp_backend_diagnosis`
+plus the `WP_BACKEND_ANOMALY` code, because the goal records alone cannot show
+it: the anomaly is on the message stream, so a per-goal classifier reads a
+crashed backend as a wrong specification.
+
+Which goals the abort cost is read off their `FAILED` status rather than off the
+message. WP words the abort as `Goal <kind>:`, where the kind comes from a fixed
+table (`Property`, `Invariant`, `Preservation`, and a dozen more), so the text
+names a kind and never a goal. A goal left `FAILED` is one no prover answered,
+and that is the only link the two have.
 
 ### Callee contracts
 
