@@ -884,12 +884,80 @@ fn only_a_refused_or_missing_socket_is_worth_retrying() {
 
     assert!(socket_not_listening_yet(&io_error(ErrorKind::ConnectionRefused)));
     assert!(socket_not_listening_yet(&io_error(ErrorKind::NotFound)));
+    assert!(frama_c_mcp::mcp::proc::socket_refused(&io_error(ErrorKind::ConnectionRefused)));
+    assert!(!frama_c_mcp::mcp::proc::socket_refused(&io_error(ErrorKind::NotFound)));
 
     // A socket that answered and then broke is not a startup race: the server
     // has already taken this client, so reconnecting waits forever.
     assert!(!socket_not_listening_yet(&io_error(ErrorKind::ConnectionReset)));
     assert!(!socket_not_listening_yet(&io_error(ErrorKind::PermissionDenied)));
     assert!(!socket_not_listening_yet(&FramaCError::ConnectTimeout));
+}
+
+/// A socket that refuses has to be retried until the deadline, not reported on
+/// the first attempt.
+///
+/// This is the whole defense against the startup race: the path appears at
+/// bind and refuses until listen, so a connect that gives up on the first
+/// ECONNREFUSED turns a normal startup into a failed one about one run in ten.
+/// Nothing downstream can catch that regression. The retry either absorbs the
+/// refusal, in which case the run is indistinguishable from a healthy one, or
+/// it does not, in which case some test fails somewhere for a reason that
+/// reads like whatever it was testing.
+///
+/// So the deadline is the observable: reaching it proves the loop kept trying,
+/// and the message proves it reached the timeout rather than a raw io error.
+///
+/// The give-up message is asserted to name the refusal, not only the timeout.
+/// A missing path is retried by the same predicate and produces the same
+/// "never listened" text, so a timeout assertion alone passes just as green
+/// when the setup below stops leaving a socket behind, and the case this test
+/// is named for would go uncovered without anything turning red.
+#[tokio::test]
+async fn a_refused_socket_is_retried_until_the_deadline() {
+    use std::sync::Arc;
+    use tokio::sync::RwLock;
+
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("refuses.sock");
+
+    // Binding and dropping leaves the path in place with nothing behind it,
+    // which is what the kernel answers ECONNREFUSED for. That is the same
+    // state Frama-C is in between bind and listen.
+    drop(tokio::net::UnixListener::bind(&socket).unwrap());
+
+    let mut child = tokio::process::Command::new("sleep")
+        .arg("30")
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+
+    let timeout = Duration::from_millis(300);
+    let started = std::time::Instant::now();
+    let error = frama_c_mcp::mcp::proc::connect_when_listening(
+        &socket,
+        Arc::new(RwLock::new(frama_c_mcp::state::SessionState::default())),
+        &mut child,
+        timeout,
+    )
+    .await;
+    let Err(error) = error else {
+        panic!("connected to a path nothing is listening on");
+    };
+
+    assert!(
+        started.elapsed() >= timeout,
+        "gave up after {:?}, so the refusal was not retried",
+        started.elapsed()
+    );
+    assert!(
+        error.contains("never listened"),
+        "unexpected give-up reason: {error}"
+    );
+    assert!(
+        error.contains("Connection refused"),
+        "the path was not refusing, so the refusal was never exercised: {error}"
+    );
 }
 
 /// `inconsistent` is the one propStatus value nothing matched, so it fell
