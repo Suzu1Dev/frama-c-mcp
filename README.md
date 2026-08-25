@@ -123,21 +123,32 @@ in place of `cargo build --release`, not a way to skip the switch.
 ### Install
 
 ```bash
-./scripts/install.sh          # to ~/.local/bin
-BINDIR=/usr/local/bin ./scripts/install.sh
+make install                     # to ~/.local/bin
+make install BINDIR=/usr/local/bin
 ```
 
-The script builds and installs both the Rust binary and the `ast-utils` plugin.
-It runs `dune` through `opam exec`, so the plugin lands in the active switch;
-select the switch holding Frama-C before running it. The install fails if the
-resulting plugin is not loadable by that switch's `frama-c`. `BINDIR` must be
-writable without `sudo`, which would discard the opam environment.
+`make install` builds and installs both the Rust binary and the `ast-utils`
+plugin. It runs `dune` through `opam exec`, so the plugin lands in the active
+switch; select the switch holding Frama-C before running it. The install fails
+if the resulting plugin is not loadable by that switch's `frama-c`. `BINDIR`
+must be writable without `sudo`, which would discard the opam environment.
 
-Use the script instead of copying over an existing binary. On macOS, replacing
-an executed binary in place can leave a stale code-signature blob and cause
-every subsequent execution to fail with `SIGKILL (Code Signature Invalid)`.
-The script installs through a temporary file, ad-hoc signs it, runs it once,
-and then renames it into place.
+It finishes by pointing whichever agents are installed at the binary it just
+placed: Claude Code through `claude mcp add`, and codex by adding an
+`[mcp_servers.frama-c]` section to `~/.codex/config.toml` when that file exists
+and has no such section. An agent that is not installed is skipped rather than
+failing the install, and an existing codex section is left alone rather than
+rewritten. Run `make register` on its own to redo just that step.
+
+Use it instead of copying over an existing binary. On macOS, replacing an
+executed binary in place can leave a stale code-signature blob and cause every
+subsequent execution to fail with `SIGKILL (Code Signature Invalid)`. The
+install goes through a temporary file, ad-hoc signs it, runs it once, and then
+renames it into place.
+
+The other targets: `make` builds the release binary, `make indent` runs `shfmt`
+over the shell scripts and `commentflow` over the sources that carry comments,
+and `make clean` removes `target/` and the plugin's `_build/`.
 
 ### Connect an agent
 
