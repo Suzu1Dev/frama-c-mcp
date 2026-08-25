@@ -457,3 +457,128 @@ fn reload_project_recovers_after_a_rejected_file() {
         "a rejected file left the session unusable: {recovered:?}"
     );
 }
+
+/// `detail` decides how big a reload response is, and summary is the default.
+///
+/// Untested when it landed, and the shape it changes is the one every reload
+/// returns: entries dropped from Frama-C's full function record to name and
+/// defined. The suites kept passing because they index by `name`, which the
+/// change preserved deliberately, so nothing was holding that decision in
+/// place. This does.
+#[test]
+fn reload_project_detail_governs_the_function_list() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let source = tmp.path().join("detail.c");
+    std::fs::write(
+        &source,
+        "int helper(int x) { return x + 1; }\nint main(void) { return helper(1); }\n",
+    )
+    .unwrap();
+
+
+    let (_dir, mut mcp) = McpHandle::spawn_in_temp_dir();
+
+    let summary = mcp.call_tool(
+        "reload_project",
+        &format!(r#"{{"files": ["{}"]}}"#, source.display()),
+    );
+    assert!(summary.get("error").is_none(), "reload failed: {summary:?}");
+    let summary_payload = tool_payload(&summary);
+    let summary_entries = summary_payload["functions"]
+        .as_array()
+        .expect("functions array")
+        .clone();
+
+    assert_eq!(
+        summary_payload["detail"], "summary",
+        "the response must say which shape it chose: {summary_payload}"
+    );
+
+    // The two keys a caller picks a target with, and nothing else. Asserted as
+    // an exact key set rather than "contains name", because the point of the
+    // default is what it leaves out.
+    for entry in &summary_entries {
+        let mut keys: Vec<&String> = entry.as_object().expect("entry object").keys().collect();
+        keys.sort();
+        assert_eq!(
+            keys,
+            vec!["defined", "name"],
+            "summary entry carries more than it should: {entry}"
+        );
+    }
+    assert!(
+        summary_entries
+            .iter()
+            .any(|entry| entry["name"] == "helper"),
+        "summary must still name every function: {summary_payload}"
+    );
+
+    let full = mcp.call_tool(
+        "reload_project",
+        &format!(r#"{{"files": ["{}"], "detail": "full"}}"#, source.display()),
+    );
+    assert!(full.get("error").is_none(), "full reload failed: {full:?}");
+    let full_payload = tool_payload(&full);
+    let full_entries = full_payload["functions"]
+        .as_array()
+        .expect("functions array")
+        .clone();
+
+    assert_eq!(
+        full_payload["detail"], "full",
+        "the response must say which shape it chose: {full_payload}"
+    );
+    assert_eq!(
+        full_entries.len(),
+        summary_entries.len(),
+        "the two shapes must describe the same functions"
+    );
+
+    // Full is a superset. Not a fixed key list, because these come from
+    // Frama-C's own fetchFunctions record and move with it; what must hold is
+    // that asking for more returns more.
+    let summary_keys = summary_entries[0].as_object().unwrap().len();
+    let full_keys = full_entries[0].as_object().unwrap().len();
+    assert!(
+        full_keys > summary_keys,
+        "full must carry more per entry than summary: {full_keys} vs {summary_keys}"
+    );
+    for entry in &full_entries {
+        assert!(
+            entry.get("name").is_some(),
+            "full must keep the key callers index by: {entry}"
+        );
+    }
+
+    // An unrecognised value is refused, not silently downgraded. It used to
+    // mean summary, so "Full" and "verbose" both quietly returned less than was
+    // asked for and the only hint was the echoed detail field coming back as a
+    // value the caller never sent. detail is an enum now, so serde rejects and
+    // names the two spellings that work.
+    let odd = mcp.call_tool(
+        "reload_project",
+        &format!(r#"{{"files": ["{}"], "detail": "Full"}}"#, source.display()),
+    );
+
+    // Either wire shape counts as a refusal. rmcp 3 reports a parameter it
+    // cannot deserialize as a tool result carrying isError, which is what this
+    // asserts against today, but a JSON-RPC error object is the other way a
+    // server may answer and every other failure test in this suite reads that
+    // one. Accepting both keeps the test about the refusal rather than about
+    // which envelope carried it.
+    let refused_as_tool_error = odd["result"]["isError"] == true;
+    let refused_as_rpc_error = odd.get("error").is_some();
+    assert!(
+        refused_as_tool_error || refused_as_rpc_error,
+        "an unrecognised detail must be refused, not downgraded: {odd:?}"
+    );
+    let refusal = if refused_as_rpc_error {
+        odd["error"].to_string()
+    } else {
+        tool_text(&odd)
+    };
+    assert!(
+        refusal.contains("summary") && refusal.contains("full"),
+        "the refusal must name the spellings that work: {refusal}"
+    );
+}

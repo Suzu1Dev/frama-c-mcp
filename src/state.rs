@@ -1,4 +1,4 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -70,7 +70,13 @@ pub struct SessionState {
     pub eva_completed: bool,
     pub wp_completed: bool,
     pub functions: HashMap<String, FunctionInfo>,
-    pub stale_markers: HashMap<String, StaleMarker>,
+
+    // BTreeMap rather than HashMap: the only reads are a key lookup and the
+    // capped sample reload_project reports, and a HashMap's per-process seed
+    // made that sample a different twenty on every run of the same reload.
+    // Ordered by construction is cheaper than sorting at the use site and
+    // cannot be forgotten by the next reader of this field.
+    pub stale_markers: BTreeMap<String, StaleMarker>,
     // Phase 2
     pub globals: HashMap<String, GlobalInfo>,
     pub callgraph_edges: Vec<CallEdge>,
@@ -673,7 +679,7 @@ impl SessionState {
         // reload)
     }
 
-    pub fn set_stale_markers(&mut self, stale_markers: HashMap<String, StaleMarker>) {
+    pub fn set_stale_markers(&mut self, stale_markers: BTreeMap<String, StaleMarker>) {
         self.stale_markers = stale_markers;
     }
 

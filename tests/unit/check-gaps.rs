@@ -6,6 +6,7 @@ use frama_c_mcp::mcp::server::*;
 use frama_c_mcp::mcp::server::analysis::{
     check_blocked_reason,
     check_incomplete_items,
+    check_variants_summary,
     goal_needs_failure_classification,
     property_is_dead, render_sequent, WantedAnalyses,
     wp_backend_anomaly_left_goal_unjudged,
@@ -1109,3 +1110,65 @@ fn canary_criteria_judge_the_reason_rather_than_the_verdict() {
     .is_some());
 }
 
+/// A comparison that did not happen must not read as one that found nothing.
+///
+/// The dangerous shape is the last case below and no integration test can stage
+/// it: every variant proves, and no digest was ever established because the
+/// ast-utils plug-in is absent or printSource outran its budget. Left alone,
+/// the summary answers distinct_asts 0, duplicate_ast_count 0, verdict proved,
+/// which is byte-identical to a matrix that really was checked and really was
+/// clean. That is the miss this whole tool exists to catch, one level up.
+#[test]
+fn variant_summary_will_not_call_an_unchecked_matrix_proved() {
+    let entry = |label: &str, verdict: &str, digest: serde_json::Value| {
+        json!({"label": label, "verdict": verdict, "ast_digest": digest})
+    };
+
+    let clean = check_variants_summary(vec![
+        entry("a", "proved", json!("d0")),
+        entry("b", "proved", json!("d1")),
+    ]);
+    assert_eq!(clean["verdict"], "proved");
+    assert_eq!(clean["distinct_asts"], 2);
+    assert_eq!(clean["ast_digest_unavailable_count"], 0);
+    assert!(clean["reason"].is_null());
+
+    // A duplicate outranks the clean answer and names itself in the reason.
+    let mut dup = entry("b", "proved", json!("d0"));
+    dup["duplicate_ast"] = json!("a");
+    let duplicated = check_variants_summary(vec![entry("a", "proved", json!("d0")), dup]);
+    assert_eq!(duplicated["verdict"], "incomplete");
+    assert_eq!(duplicated["duplicate_ast_count"], 1);
+    assert_eq!(duplicated["distinct_asts"], 1);
+    assert!(duplicated["reason"]
+        .as_str()
+        .unwrap()
+        .contains("byte-identical"));
+
+    // Every variant proved and nothing was comparable. The verdict must not be
+    // "proved", and the reason must say which of the two gaps it is.
+    let blind = check_variants_summary(vec![
+        entry("a", "proved", serde_json::Value::Null),
+        entry("b", "proved", serde_json::Value::Null),
+    ]);
+    assert_eq!(
+        blind["verdict"], "incomplete",
+        "no digest was established, so nothing was compared: {blind:?}"
+    );
+    assert_eq!(blind["ast_digest_unavailable_count"], 2);
+    assert_eq!(blind["distinct_asts"], 0);
+    assert!(blind["reason"]
+        .as_str()
+        .unwrap()
+        .contains("compared to nothing"));
+
+    // One missing digest is enough; the others being fine does not restore the
+    // guarantee, because the missing one was compared to none of them.
+    let partial = check_variants_summary(vec![
+        entry("a", "proved", json!("d0")),
+        entry("b", "proved", serde_json::Value::Null),
+    ]);
+    assert_eq!(partial["verdict"], "incomplete", "{partial:?}");
+    assert_eq!(partial["ast_digest_unavailable_count"], 1);
+    assert_eq!(partial["distinct_asts"], 1);
+}

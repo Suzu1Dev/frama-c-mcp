@@ -1245,3 +1245,50 @@ fn the_scratch_root_is_private_or_refused() {
         private_root_path().display()
     );
 }
+
+/// The stale-marker map is ordered, so the capped sample reload_project reports
+/// is the same sample on the next run.
+///
+/// This used to be a sorting helper plus a fifty-line test that rebuilt a
+/// HashMap to prove the sort held. The container carries the property now, so
+/// what is worth pinning is the container: a change back to HashMap makes the
+/// twenty reported markers depend on a per-process hash seed, and nothing else
+/// in the tree would notice.
+#[test]
+fn the_stale_marker_map_iterates_in_marker_order() {
+    let location = |line: u64| frama_c_mcp::state::MarkerLocation {
+        marker_kind: "property".to_string(),
+        marker: format!("#p{line:03}"),
+        function_marker: None,
+        function_name: None,
+        kinstr_marker: None,
+        source_file: Some("a.c".to_string()),
+        source_line: Some(line),
+    };
+    let markers: std::collections::BTreeMap<String, frama_c_mcp::state::StaleMarker> = (0..50)
+        .rev()
+        .map(|i| {
+            (
+                format!("#p{i:03}"),
+                frama_c_mcp::state::StaleMarker {
+                    previous: location(i),
+                    current: location(i + 1000),
+                },
+            )
+        })
+        .collect();
+
+    // Inserted in reverse; read back in order regardless.
+    let first: Vec<&str> = markers
+        .values()
+        .take(20)
+        .map(|m| m.previous.marker.as_str())
+        .collect();
+    assert_eq!(first.first(), Some(&"#p000"), "{first:?}");
+    assert_eq!(first.last(), Some(&"#p019"), "{first:?}");
+
+    let mut state = SessionState::default();
+    state.set_stale_markers(markers);
+    assert!(state.stale_marker("#p007").is_some(), "lookup still works");
+    assert!(state.stale_marker("#p099").is_none());
+}

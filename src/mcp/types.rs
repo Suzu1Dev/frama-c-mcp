@@ -122,6 +122,26 @@ pub struct ReloadProjectParams {
     pub force_includes: Option<Vec<String>>,
     /// Target machine model passed to Frama-C as `-machdep <machine>`.
     pub machdep: Option<String>,
+    /// Response size. "summary" (default) lists each function's name and
+    /// whether it is defined; "full" adds the signature, source location,
+    /// declaration marker and filter flags for every one.
+    ///
+    /// Summary is the default because the full list is what makes this
+    /// response unusable on a real file: a 2000-line allocator with 65
+    /// functions returns 58KB, which overflows a tool-result budget before any
+    /// analysis has run. The names are what a caller needs to pick a target.
+    ///
+    /// `list {kind: "functions"}` covers part of the rest, returning the
+    /// signature and the source location per function. It does not carry the
+    /// declaration marker or the filter flags, so a caller that needs those
+    /// asks for `"full"` here rather than going there.
+    ///
+    /// Unrelated to `check`'s own `detail`, which takes the same two words and
+    /// governs goals and alarms instead. A `check` never passes its value on:
+    /// the function list it embeds is not the point of the call, so its reload
+    /// is always summarised and `check {detail: "full"}` returns a payload
+    /// whose nested `reload.detail` reads `summary`.
+    pub detail: Option<Detail>,
     /// Path to compile_commands.json. If `files` is omitted, source files are
     /// loaded from this database.
     #[serde(alias = "compilation_db")]
@@ -226,7 +246,56 @@ pub struct RunWpParams {
 // about and spread the rest. Every field is an Option, so spelling all twenty
 // out by hand carried no information, and adding one broke every hand-written
 // literal at once (the CLI in main.rs, plus the tests).
-#[derive(Debug, Default, Deserialize, JsonSchema)]
+
+/// How much of a response to return.
+///
+/// An enum rather than a free-form string, so serde refuses an unrecognised
+/// value and names the two that work, and so schemars publishes them in
+/// tools/list for a client to complete. As a String, `"FULL"` and `"verbose"`
+/// were silently summary: no error, and the only hint was the echoed `detail`
+/// field coming back as a value the caller had not sent.
+///
+/// Shared by the two params that use the vocabulary. They govern different
+/// subjects, which is a naming question rather than a typing one; the meaning
+/// of the two words is the same in both places.
+#[derive(Clone, Copy, Default, PartialEq, Debug, Deserialize, JsonSchema, clap::ValueEnum)]
+#[serde(rename_all = "snake_case")]
+pub enum Detail {
+    /// Counts plus the entries that need attention.
+    #[default]
+    Summary,
+    /// Every entry.
+    Full,
+}
+
+impl Detail {
+    pub fn is_full(self) -> bool {
+        self == Detail::Full
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Detail::Summary => "summary",
+            Detail::Full => "full",
+        }
+    }
+}
+
+/// One configuration in a `check {variants: [...]}` call.
+#[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
+pub struct CheckVariant {
+    /// Name for this configuration in the result. Defaults to its index.
+    pub label: Option<String>,
+    /// Preprocessor definitions for this variant, replacing the top-level ones.
+    #[serde(default, deserialize_with = "deserialize_vec_or_string")]
+    pub defines: Option<Vec<String>>,
+    /// Machine model for this variant, replacing the top-level one.
+    pub machdep: Option<String>,
+    /// WP memory model for this variant, replacing the top-level one.
+    pub model: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
 pub struct CheckParams {
     // The analysis tuning knobs below stay accepted but are hidden from the
     // generated schema: a first call needs a file and maybe a function, not
@@ -265,6 +334,27 @@ pub struct CheckParams {
     pub force_includes: Option<Vec<String>>,
     /// Target machine model passed to Frama-C as `-machdep <machine>`.
     pub machdep: Option<String>,
+    /// Configurations to check instead of one. Each entry may carry `defines`,
+    /// `machdep`, `model` and a `label`, and overrides the top-level value of
+    /// the same name; everything else, including `files` and `function`, is
+    /// shared. The result gains a `variants` array, one entry per
+    /// configuration, each with its own verdict, counts and `ast_digest`.
+    ///
+    /// This exists because the questions worth asking about a real project are
+    /// comparative: portable path against compiler intrinsics, 32-bit against
+    /// 64-bit, one memory model against another. Answering them one `check` at
+    /// a time makes the comparison the caller's job, and the comparison is
+    /// where the mistakes are: two configurations that select the same code
+    /// produce the same goal counts and read as coverage that was never there.
+    /// `variants` reports `duplicate_ast` when two entries asked for
+    /// different code and analysed byte-identical ASTs, which no goal count can
+    /// show, and `ast_digest_unavailable_count` when it could not make that
+    /// comparison at all. Entries that differ only in `model` are exempt: no
+    /// WP option changes the AST, so a memory-model sweep shares one by design
+    /// and flagging it would cry wolf on the comparison this tool most exists
+    /// to support.
+    #[serde(default, deserialize_with = "deserialize_vec_or_string")]
+    pub variants: Option<Vec<CheckVariant>>,
     /// Path to compile_commands.json. If files is omitted, source files are
     /// loaded from this database.
     #[serde(alias = "compilation_db")]
@@ -275,7 +365,7 @@ pub struct CheckParams {
     /// non-valid goals and undischarged alarms; "full" returns every goal and
     /// alarm. The verdict, incomplete[] and recommended_next_call are computed
     /// from the complete data either way.
-    pub detail: Option<String>,
+    pub detail: Option<Detail>,
     /// EVA precision profile: "fast", "default", or "deep".
     #[schemars(skip)]
     pub profile: Option<String>,
@@ -350,7 +440,7 @@ pub struct GetWpGoalsParams {
 ///
 /// Every variant carries a plain comment rather than a doc comment, for the
 /// reason recorded on ContextKind.
-#[derive(PartialEq, Debug, Deserialize, JsonSchema)]
+#[derive(Clone, PartialEq, Debug, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum CheckAnalysis {
     // EVA, the abstract interpreter. Answers eva and eva_alarms.

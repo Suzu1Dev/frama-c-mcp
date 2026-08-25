@@ -49,8 +49,8 @@ enum Command {
         #[arg(long)]
         function: Option<String>,
         /// Response size: "summary" (default) or "full".
-        #[arg(long)]
-        detail: Option<String>,
+        #[arg(long, value_enum)]
+        detail: Option<frama_c_mcp::mcp::types::Detail>,
         /// Include directory passed to Frama-C's preprocessor.
         #[arg(short = 'I', long = "include")]
         include_paths: Vec<String>,

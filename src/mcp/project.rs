@@ -191,10 +191,26 @@ impl FramaCMcpServer {
         let current_markers = marker_location_snapshot(&client).await.ok();
         let stale_markers = match (previous_markers.as_ref(), current_markers.as_ref()) {
             (Some(previous), Some(current)) => stale_marker_locations(previous, current),
-            _ => HashMap::new(),
+            _ => BTreeMap::new(),
         };
         let stale_marker_count = stale_markers.len();
-        let stale_marker_values = stale_markers.values().cloned().collect::<Vec<_>>();
+
+        // Capped. A reload with RTE on a file that includes <string.h> reports
+        // over a thousand of these, nearly all of them inside Frama-C's own
+        // libc headers rather than the caller's source, and at roughly 460
+        // bytes each they were 551KB of a 569KB response: enough to overflow a
+        // tool-result budget before any analysis ran. The count is the signal;
+        // the full set stays in session state for whatever needs it.
+        //
+        // stale_markers is a BTreeMap, so this is the first twenty by marker
+        // and the same twenty on the next run of the same reload.
+        const STALE_MARKER_SAMPLE: usize = 20;
+        let stale_marker_values = stale_markers
+            .values()
+            .take(STALE_MARKER_SAMPLE)
+            .map(|marker| serde_json::to_value(marker).unwrap_or(serde_json::Value::Null))
+            .collect::<Vec<_>>();
+        let stale_markers_omitted = stale_marker_count.saturating_sub(stale_marker_values.len());
         self.state.write().await.set_stale_markers(stale_markers);
 
         // Drained last, so the parse and AST-reload diagnostics this load
@@ -202,8 +218,27 @@ impl FramaCMcpServer {
         // otherwise invisible unless some request happens to fail carrying it.
         let (messages, truncated) = drain_messages(&client).await;
 
+        // Summarised unless asked otherwise: see the note on
+        // ReloadProjectParams::detail. The shape stays an array of objects
+        // carrying "name", which is what callers and tests index by.
+        let detail = params.detail.unwrap_or_default();
+        let entries = if detail.is_full() {
+            entries
+        } else {
+            entries
+                .iter()
+                .map(|entry| {
+                    json!({
+                        "name": entry.get("name").cloned().unwrap_or(serde_json::Value::Null),
+                        "defined": entry.get("defined").cloned().unwrap_or(serde_json::Value::Null),
+                    })
+                })
+                .collect()
+        };
+
         let result = json!({
             "functions": entries,
+            "detail": detail.as_str(),
             "files": files,
             "rte": rte,
             "include_paths": project_options.include_paths,
@@ -215,6 +250,7 @@ impl FramaCMcpServer {
                 "checked": previous_markers.is_some() && current_markers.is_some(),
                 "stale_marker_count": stale_marker_count,
                 "stale_markers": stale_marker_values,
+                "stale_markers_omitted": stale_markers_omitted,
             },
             "ast_reload_health": health.payload,
             "messages": messages,

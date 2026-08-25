@@ -8063,3 +8063,90 @@ async fn work_after_an_inline_source_check_still_finds_the_source() {
 
     let _ = client.cancel().await;
 }
+
+/// Two configurations that select the same code are one configuration checked
+/// twice, and only the AST digest can say so.
+///
+/// This is the regression for a real miss: a project's verify target ran a
+/// default pass alongside a -DTLSF_NO_INTRINSICS pass and reported both green
+/// for several rounds. Frama-C does not predefine __GNUC__, so the source chose
+/// its portable fallbacks either way. Goal counts were equal and correct, and
+/// nothing in the result disagreed.
+#[tokio::test]
+async fn check_variants_reports_configurations_that_analyse_the_same_ast() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let file = tmp.path().join("cfg.c");
+    std::fs::write(
+        &file,
+        "int id(int x)\n{\n#ifdef CHANGES_CODE\n    return x + 1;\n#else\n    return x;\n#endif\n}\n",
+    )
+    .expect("write");
+
+    let client = spawn_mcp_client(file.to_str().unwrap()).await;
+    let result = call_tool_json(&client, "check", json!({
+        "files": [file.to_str().unwrap()],
+        "function": "id",
+        "want": ["wp"],
+        "timeout": 2,
+        "variants": [
+            {"label": "plain", "defines": []},
+            // Selects nothing different, so it must not read as a second
+            // configuration. This is the shape of the original miss.
+            {"label": "same-code", "defines": ["PICKS_NOTHING"]},
+            // A model sweep over the same AST-input group is intentional, even
+            // though this digest also occurred for plain above.
+            {"label": "same-code-cast", "defines": ["PICKS_NOTHING"], "model": "Typed+cast"},
+            {"label": "changed", "defines": ["CHANGES_CODE"]}
+        ],
+    }))
+    .await
+    .unwrap();
+
+    assert_eq!(result["schema"], "frama-c-mcp.check-variants.v1", "{result:?}");
+    assert_eq!(result["variant_count"], 4, "{result:?}");
+
+    let variants = result["variants"].as_array().expect("variants array");
+    let by_label = |name: &str| {
+        variants
+            .iter()
+            .find(|v| v["label"] == name)
+            .unwrap_or_else(|| panic!("no variant {name}: {result:?}"))
+            .clone()
+    };
+
+    for label in ["plain", "same-code", "changed"] {
+        assert_eq!(by_label(label)["model"], "Typed+nocast", "{result:?}");
+    }
+    assert_eq!(by_label("same-code-cast")["model"], "Typed+cast", "{result:?}");
+
+    // A define that selects nothing must be reported against the first variant
+    // sharing its AST.
+    assert_eq!(by_label("same-code")["duplicate_ast"], "plain", "{result:?}");
+    assert_eq!(
+        by_label("same-code")["ast_digest"], by_label("plain")["ast_digest"],
+        "{result:?}"
+    );
+    assert!(
+        by_label("same-code-cast").get("duplicate_ast").is_none(),
+        "a model sweep over the same inputs is not a duplicate: {result:?}"
+    );
+
+    // A define that does change the code is a genuinely separate analysis and
+    // must not be flagged, or the report would cry wolf on every real matrix.
+    assert!(
+        by_label("changed").get("duplicate_ast").is_none(),
+        "a define that changes code is not a duplicate: {result:?}"
+    );
+    assert_ne!(
+        by_label("changed")["ast_digest"], by_label("plain")["ast_digest"],
+        "{result:?}"
+    );
+
+    assert_eq!(result["duplicate_ast_count"], 1, "{result:?}");
+    assert_eq!(result["distinct_asts"], 2, "{result:?}");
+    assert_eq!(
+        result["verdict"], "incomplete",
+        "a duplicated configuration must not read as a clean multi-config run: {result:?}"
+    );
+    let _ = client.cancel().await;
+}

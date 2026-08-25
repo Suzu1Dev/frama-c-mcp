@@ -1352,6 +1352,88 @@ fn proofread_finding_gaps(
     }
 }
 
+/// What a variant varied that could change the analysed code. `model` is not
+/// in it: no WP option reaches the AST.
+type AstInputs = (Vec<String>, Option<String>);
+
+/// Per AST digest, the variants that produced it, one entry per distinct set of
+/// AST-relevant inputs. A second entry under one digest is the finding: two
+/// configurations asked for different code and got the same. Repeats within a
+/// group are a model sweep and are not.
+type DigestGroups = std::collections::HashMap<String, Vec<(String, AstInputs)>>;
+
+/// The verdict over a finished set of variant entries.
+///
+/// Free-standing so the decision can be tested without a Frama-C instance: the
+/// case that matters most is the one no integration test can stage, a run where
+/// every variant proved and no digest was ever established.
+pub fn check_variants_summary(results: Vec<serde_json::Value>) -> serde_json::Value {
+    let digest_of = |entry: &serde_json::Value| {
+        entry
+            .get("ast_digest")
+            .and_then(|value| value.as_str())
+            .map(str::to_string)
+    };
+
+    let duplicate_count = results
+        .iter()
+        .filter(|entry| entry.get("duplicate_ast").is_some())
+        .count();
+    let all_proved = results
+        .iter()
+        .all(|entry| entry.get("verdict").and_then(|v| v.as_str()) == Some("proved"));
+    let distinct_asts = results
+        .iter()
+        .filter_map(digest_of)
+        .collect::<std::collections::HashSet<_>>()
+        .len();
+
+    // A digest that could not be established compares equal to nothing, so a
+    // variant carrying one was never compared to anything. Counted and
+    // reported, because the alternative is the failure this tool exists to
+    // catch, one level up: with no digests at all the summary would read
+    // distinct_asts 0, duplicate_ast_count 0, verdict proved, which is
+    // indistinguishable from a matrix that really was checked and really was
+    // clean. A comparison that did not happen must not read as one that
+    // happened and found nothing.
+    let unestablished = results.iter().filter(|entry| digest_of(entry).is_none()).count();
+
+    let reason = if duplicate_count > 0 {
+        json!("Two or more variants asked for different code and analysed byte-identical \
+               ASTs, so they are one configuration checked twice rather than several \
+               checked once. Equal goal counts cannot show this; the digests can. \
+               Variants that differ only in the WP model are not counted here: no proof \
+               option changes the AST, so sharing one is expected.")
+    } else if unestablished > 0 {
+        json!("At least one variant has no AST digest, so it was compared to nothing and this \
+               run cannot say whether the configurations differ. Read \
+               proof_receipt.subject.ast_digest_unavailable_reason on that variant: the usual \
+               causes are the ast-utils plug-in not being installed and printSource outrunning \
+               its budget on a large project.")
+    } else {
+        serde_json::Value::Null
+    };
+
+    json!({
+        "schema": "frama-c-mcp.check-variants.v1",
+
+        // Not "proved" unless every variant proved AND every pair was actually
+        // comparable. Both gaps mean the same thing: the question this tool was
+        // asked has not been answered.
+        "verdict": if duplicate_count == 0 && unestablished == 0 && all_proved {
+            "proved"
+        } else {
+            "incomplete"
+        },
+        "variant_count": results.len(),
+        "distinct_asts": distinct_asts,
+        "duplicate_ast_count": duplicate_count,
+        "ast_digest_unavailable_count": unestablished,
+        "reason": reason,
+        "variants": results,
+    })
+}
+
 pub fn check_incomplete_items(
     rte: Option<bool>,
     reload: &serde_json::Value,
@@ -2406,6 +2488,11 @@ impl FramaCMcpServer {
                 machdep: params.machdep,
                 compilation_database: params.compilation_database,
                 rte: Some(params.rte.unwrap_or(true)),
+
+                // check's own detail governs goals and alarms; the function
+                // list it embeds is never the point of the call, and at full
+                // size it dominates the payload.
+                detail: None,
             }))
             .await
         {
@@ -2604,7 +2691,8 @@ impl FramaCMcpServer {
         // Everything above this line reads the complete arrays, so summarizing
         // cannot change the verdict, incomplete[], or the recommended call.
         let goals = wp_goals.as_array().cloned().unwrap_or_default();
-        let summarize = params.detail.as_deref() != Some("full");
+        let detail = params.detail.unwrap_or_default();
+        let summarize = !detail.is_full();
         let (reported_goals, reported_alarms) = if summarize {
             (
                 summarize_unless_skipped(
@@ -2668,7 +2756,139 @@ impl FramaCMcpServer {
         &self,
         Parameters(params): Parameters<CheckParams>,
     ) -> Result<CallToolResult, McpError> {
+        if let Some(variants) = params.variants.clone().filter(|v| !v.is_empty()) {
+            return Ok(json_result(self.check_variants(params, variants).await?));
+        }
         Ok(json_result(self.check_payload(params).await?))
+    }
+
+    /// Run the same check over several configurations and report them together.
+    ///
+    /// Sequential on purpose: each variant reloads the one Frama-C instance,
+    /// so running them concurrently would have them overwrite each other's AST.
+    ///
+    /// The digest comparison is the part that earns this tool. Two variants
+    /// whose defines select the same code produce identical goal counts and
+    /// identical verdicts, and read as coverage that was never there; the only
+    /// signal that separates them is the normalised AST. Reported as
+    /// `duplicate_ast` against the first variant with that digest and the same
+    /// AST-relevant inputs.
+    async fn check_variants(
+        &self,
+        base: CheckParams,
+        variants: Vec<CheckVariant>,
+    ) -> Result<serde_json::Value, McpError> {
+        let mut results = Vec::new();
+
+        // Keyed by digest, holding every AST-relevant input group seen with it.
+        // This stops a model sweep reading as a mistake: the digest hashes the
+        // printed source, which no WP option changes.
+        let mut digests: DigestGroups = DigestGroups::new();
+
+        let mut labels_seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+        for (index, variant) in variants.iter().enumerate() {
+            // Disambiguated rather than rejected. Labels are how duplicate_ast
+            // points at the variant it collided with, so two variants sharing
+            // one make that pointer name nothing; suffixing the index keeps the
+            // caller's chosen name readable and the reference exact.
+            let mut label = variant
+                .label
+                .clone()
+                .unwrap_or_else(|| format!("variant{index}"));
+
+            // Looped, not suffixed once: a caller who passes "a" twice and also
+            // passes "a#1" would otherwise get two variants called "a#1", and
+            // duplicate_ast names a label, so it would point at whichever of
+            // them landed first.
+            if !labels_seen.insert(label.clone()) {
+                let base = label.clone();
+                let mut suffix = index;
+                loop {
+                    label = format!("{base}#{suffix}");
+                    if labels_seen.insert(label.clone()) {
+                        break;
+                    }
+                    suffix += 1;
+                }
+            }
+
+            // params starts as base, so Option::or is the override: the
+            // variant's value when it set one, the base's otherwise. One
+            // expression per field, rather than an if-block here and an or_else
+            // in the report below, which is how the two came to disagree about
+            // what "effective" meant.
+            let mut params = base.clone();
+            params.variants = None;
+            params.defines = variant.defines.clone().or(params.defines);
+            params.machdep = variant.machdep.clone().or(params.machdep);
+            params.model = variant.model.clone().or(params.model);
+
+            // Captured before check_payload takes ownership, so the report
+            // names what this variant actually ran with.
+            let effective_defines = params.defines.clone().unwrap_or_default();
+            let effective_machdep = params.machdep.clone();
+
+            let payload = self.check_payload(params).await?;
+            let digest = payload
+                .pointer("/proof_receipt/subject/ast_digest")
+                .and_then(|value| value.as_str())
+                .map(str::to_string);
+
+            // What the caller varied that could have changed the code. model is
+            // deliberately not in it.
+            let ast_inputs = (effective_defines.clone(), effective_machdep.clone());
+            let duplicate_of = digest.as_ref().and_then(|d| {
+                digests
+                    .get(d)
+                    .and_then(|groups| {
+                        (!groups.iter().any(|(_, seen_inputs)| seen_inputs == &ast_inputs))
+                            .then(|| groups[0].0.clone())
+                    })
+            });
+            if let Some(d) = digest.clone() {
+                let groups = digests.entry(d).or_default();
+                if !groups
+                    .iter()
+                    .any(|(_, seen_inputs)| seen_inputs == &ast_inputs)
+                {
+                    groups.push((label.clone(), ast_inputs));
+                }
+            }
+
+            let mut entry = json!({
+                "label": label,
+                "defines": effective_defines,
+                "machdep": effective_machdep,
+                "model": payload.pointer("/wp/effective_wp_config/model").cloned(),
+                "verdict": payload.get("verdict").cloned().unwrap_or(serde_json::Value::Null),
+                "incomplete": payload
+                    .get("incomplete")
+                    .and_then(|v| v.as_array())
+                    .map(|items| {
+                        items
+                            .iter()
+                            .filter_map(|i| i.get("code").and_then(|c| c.as_str()))
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default(),
+                "ast_digest": digest,
+                "wp_backend_diagnosis": payload
+                    .get("wp_backend_diagnosis")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null),
+                "proof_receipt_sha256": payload
+                    .pointer("/proof_receipt/sha256")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null),
+            });
+            if let (Some(obj), Some(first)) = (entry.as_object_mut(), duplicate_of) {
+                obj.insert("duplicate_ast".to_string(), json!(first));
+            }
+            results.push(entry);
+        }
+
+        Ok(check_variants_summary(results))
     }
 
     async fn eva_alarms_payload(

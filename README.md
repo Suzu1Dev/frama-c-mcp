@@ -521,6 +521,16 @@ check {files or source, function?, detail?}
 # goal and alarm, which runs to hundreds of kilobytes on a real file. The
 # verdict and incomplete[] are computed from the complete data either way.
 
+# reload_project takes a detail of its own, with the same two words and a
+# different subject: its own function list, not goals and alarms. Summary gives
+# each function's name and whether it is defined, which is what picking a target
+# needs; full adds the signature, source location, declaration marker and filter
+# flags, and turns 65 functions into 58KB. The two never interact, and a check
+# never passes its value down: the reload embedded in a check payload is always
+# summarised, so check {detail: "full"} returns a document whose nested
+# reload.detail reads "summary". That is deliberate, because the function list
+# is not what a check was asked about.
+
 # Or step-by-step:
 check {files, want: ["eva"]} -> get_wp_goals {want: ["alarms"]}
   -> get_wp_goals {want: ["investigation"], marker}

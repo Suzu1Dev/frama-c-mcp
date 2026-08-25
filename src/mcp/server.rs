@@ -615,7 +615,7 @@ async fn marker_location_snapshot(
 pub fn stale_marker_locations(
     previous: &HashMap<String, MarkerLocation>,
     current: &HashMap<String, MarkerLocation>,
-) -> HashMap<String, StaleMarker> {
+) -> BTreeMap<String, StaleMarker> {
     previous
         .iter()
         .filter_map(|(marker, old_location)| {
