@@ -7,17 +7,18 @@ frama_c="${FRAMA_C_BIN:-frama-c}"
 version="$("$frama_c" -version | awk '{print $1}')"
 
 case "$version" in
-31.0 | 33.0) ;;
-*)
-    echo "Unsupported Frama-C version: $version" >&2
-    echo "Supported versions are 31.0 and 33.0." >&2
-    exit 1
-    ;;
+    31.0 | 33.0) ;;
+    *)
+        echo "Unsupported Frama-C version: $version" >&2
+        echo "Supported versions are 31.0 and 33.0." >&2
+        exit 1
+        ;;
 esac
 
 status=0
 
-check_wp() {
+check_wp()
+{
     local name="$1"
     local file="$2"
     local expected_proved="$3"
@@ -51,16 +52,16 @@ check_wp() {
         return
     fi
 
-    if [[ "$require_goal" == yes ]] &&
-        ! printf '%s\n' "$out" | grep -q 'typed_abs_int_assert_rte_signed_overflow'; then
+    if [[ "$require_goal" == yes ]] \
+        && ! printf '%s\n' "$out" | grep -q 'typed_abs_int_assert_rte_signed_overflow'; then
         echo "FAIL $name: missing signed-overflow goal" >&2
         echo "$out" >&2
         status=1
         return
     fi
 
-    if [[ "$require_goal" == no ]] &&
-        printf '%s\n' "$out" | grep -q 'typed_abs_int_assert_rte_signed_overflow'; then
+    if [[ "$require_goal" == no ]] \
+        && printf '%s\n' "$out" | grep -q 'typed_abs_int_assert_rte_signed_overflow'; then
         echo "FAIL $name: fixed fixture still reports signed-overflow goal" >&2
         echo "$out" >&2
         status=1
@@ -78,7 +79,8 @@ check_wp "abs-int-fixed.c" "$root/tests/fixtures/abs-int-fixed.c" 14 14 no
 # for a whole release while its overflow alarm was missing from `incomplete[]`
 # and the verdict came entirely from dead-code demotion. Assert the reason, not
 # the verdict.
-check_mcp() {
+check_mcp()
+{
     local name="$1"
     local file="$2"
     local expectation="$3"

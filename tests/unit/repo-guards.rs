@@ -890,7 +890,7 @@ fn gate_of(command: &str) -> Option<String> {
     // where nothing could fail a push on it. The shfmt step spans several lines
     // of a "run: |" block, so it is matched on the invocation rather than on
     // the whole command.
-    if command.contains("shfmt -i 4 -d") {
+    if command.contains("shfmt -d") {
         return Some("shfmt".to_string());
     }
     if command.starts_with("cargo clippy") {

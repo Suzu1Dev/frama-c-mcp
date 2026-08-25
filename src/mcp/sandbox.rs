@@ -185,10 +185,11 @@ impl FramaCMcpServer {
                 );
             }
         }
+
         // The root first, and checked, because create_dir_all would otherwise
         // make it as a side effect with whatever the umask says, which is the
-        // 0755 the check below exists to refuse. What lands in here is the C the
-        // analysis reads and the socket this server then trusts.
+        // 0755 the check below exists to refuse. What lands in here is the C
+        // the analysis reads and the socket this server then trusts.
         crate::mcp::store::ensure_private_root()
             .map_err(|e| McpError::internal_error(format!("scratch root unusable: {e}"), None))?;
         std::fs::create_dir_all(&sandbox_dir)

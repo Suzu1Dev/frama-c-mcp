@@ -16,12 +16,12 @@
 # The invocation below is spelled out rather than routed through a variable, and
 # that is load-bearing rather than style. gate_of in tests/unit/repo-guards.rs
 # recognizes this gate by the exact words of the invocation, so writing the
-# binary as a variable made the gate invisible: ci_gates stopped yielding it, and both
-# run_gates_runs_every_ci_gate and documented_gate_list_covers_ci stopped
-# requiring it, with no test failing. Keep the command literal. A full path is
-# literal enough, which is why the download is called by path rather than put on
-# PATH: prepending a world-writable directory would also decide which git and
-# which xargs the line below gets.
+# binary as a variable made the gate invisible: ci_gates stopped yielding it,
+# and both run_gates_runs_every_ci_gate and documented_gate_list_covers_ci
+# stopped requiring it, with no test failing. Keep the command literal. A full
+# path is literal enough, which is why the download is called by path rather
+# than put on PATH: prepending a world-writable directory would also decide
+# which git and which xargs the line below gets.
 #
 # This comment deliberately does not repeat the command it is about. A comment
 # containing it would satisfy the guard on its own, which would put the gate
@@ -38,4 +38,4 @@ curl -sSfL -o /tmp/shfmt https://github.com/mvdan/sh/releases/download/v3.13.1/s
 echo "fb096c5d1ac6beabbdbaa2874d025badb03ee07929f0c9ff67563ce8c75398b1  /tmp/shfmt" | sha256sum -c -
 chmod +x /tmp/shfmt
 
-git ls-files -z '*.sh' '*.hook' | xargs -0 /tmp/shfmt -i 4 -d
+git ls-files -z '*.sh' '*.hook' | xargs -0 /tmp/shfmt -d

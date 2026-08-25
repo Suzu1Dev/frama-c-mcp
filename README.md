@@ -588,7 +588,7 @@ scripts/run-gates.sh unit stdio
 
 | Suite | Needs Frama-C? | Coverage |
 |-------|----------------|----------|
-| `shfmt -i 4 -d` | no | Every tracked shell script is 4-space formatted |
+| `shfmt -d` | no | Every tracked shell script matches `.editorconfig` |
 | `cargo clippy --all-targets` | no | Lint checks for all targets, denied via `[lints.clippy]` |
 | `cargo test --test unit` | no | Codec, state, callgraph, topological order, tool payload shapes |
 | `test-store-conclusion` | no | Conclusion persistence and the on-disk long-text layout |

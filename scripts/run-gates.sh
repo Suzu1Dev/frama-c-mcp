@@ -32,11 +32,12 @@ ran=0
 
 # Keep the command's own exit status: no pipes, no trailing test that becomes
 # the function's result.
-run() {
+run()
+{
     local name=$1
     shift
     local log="$logs/$name.log"
-    "$@" >"$log" 2>&1
+    "$@" > "$log" 2>&1
     local rc=$?
     ran=$((ran + 1))
 
@@ -59,7 +60,8 @@ if [ "${selected[0]:-}" = "fast" ]; then
     selected=(shfmt clippy unit release)
 fi
 
-want() {
+want()
+{
     [ ${#selected[@]} -eq 0 ] && return 0
     local target=$1
     for gate in "${selected[@]}"; do
@@ -70,7 +72,7 @@ want() {
 
 # Unaligned on purpose. The columns used to line up, and that is exactly what
 # the shfmt gate below rejects, so this file failed the gate it exists to run.
-want shfmt && run shfmt bash -c "git ls-files -z '*.sh' '*.hook' | xargs -0 shfmt -i 4 -d"
+want shfmt && run shfmt bash -c "git ls-files -z '*.sh' '*.hook' | xargs -0 shfmt -d"
 want clippy && run clippy cargo clippy --all-targets
 want unit && run unit cargo test --test unit
 want release && run release cargo build --release --tests

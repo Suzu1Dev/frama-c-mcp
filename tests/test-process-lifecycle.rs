@@ -126,6 +126,7 @@ fn tutorial_corpus_filenames_and_local_includes_are_stable() {
 fn cli_check_subcommand_help_exposes_json_shape() {
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_frama-c-mcp"))
         .args(["check", "--help"])
+
         // Colour is pinned rather than inherited, because this is the one test
         // that reads clap's rendering instead of our own JSON. clap colours
         // through anstream, which honours CLICOLOR_FORCE even when stdout is
@@ -2257,7 +2258,8 @@ fn a_missing_header_is_classified_on_the_first_reload() {
     assert_eq!(data["suggestion"]["tool"], "reload_project", "{response:?}");
 }
 
-/// structuredContent goes to the peers whose revision defines it, and no others.
+/// structuredContent goes to the peers whose revision defines it, and no
+/// others.
 ///
 /// The field arrived in 2025-06-18. This server also agrees to 2024-11-05 and
 /// 2025-03-26, and every tool answering with an object fills it, so those peers
@@ -2265,10 +2267,10 @@ fn a_missing_header_is_classified_on_the_first_reload() {
 /// what they do not know; one that validates its input is entitled not to.
 ///
 /// Both directions are asserted from one test, because the interesting failure
-/// is not "absent" or "present" on its own but the two disagreeing: a strip that
-/// fires for everybody silently removes the feature, and the suite would not
-/// have said so, since every other reader in this repository parses the text
-/// block.
+/// is not "absent" or "present" on its own but the two disagreeing: a strip
+/// that fires for everybody silently removes the feature, and the suite would
+/// not have said so, since every other reader in this repository parses the
+/// text block.
 #[test]
 fn structured_content_follows_the_negotiated_protocol_version() {
     let frama_c = std::env::var("FRAMA_C_BIN").unwrap_or_else(|_| "frama-c".into());

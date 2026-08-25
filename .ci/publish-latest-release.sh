@@ -17,12 +17,14 @@
 
 set -eu
 
-status_of() {
-    gh api "$1" --silent -i 2>/dev/null | head -1 | awk '{print $2}'
+status_of()
+{
+    gh api "$1" --silent -i 2> /dev/null | head -1 | awk '{print $2}'
 }
-require_answer() {
+require_answer()
+{
     case "$1" in
-    200 | 404) return 0 ;;
+        200 | 404) return 0 ;;
     esac
     echo "unexpected status '${1:-none}' querying $2, aborting before any deletion" >&2
     exit 1
@@ -31,8 +33,9 @@ require_answer() {
 release_status=$(status_of "repos/$GH_REPO/releases/tags/latest")
 require_answer "$release_status" "the latest release"
 if [ "$release_status" = 200 ]; then
-    # No --cleanup-tag. It deletes the release first and then errors if the
-    # tag is already gone, which is the state left by a previous run that died
+
+    # No --cleanup-tag. It deletes the release first and then errors if the tag
+    # is already gone, which is the state left by a previous run that died
     # between the two steps, or by someone deleting the tag in the web UI. Under
     # set -e that ends the run with the release destroyed and no replacement
     # published, which is the one outcome this script is arranged to avoid. The
@@ -51,7 +54,7 @@ fi
 tag_status=$(status_of "repos/$GH_REPO/git/ref/tags/latest")
 require_answer "$tag_status" "the latest tag"
 if [ "$tag_status" = 200 ]; then
-    gh api -X DELETE "repos/$GH_REPO/git/refs/tags/latest" >/dev/null
+    gh api -X DELETE "repos/$GH_REPO/git/refs/tags/latest" > /dev/null
 fi
 
 # A read loop rather than mapfile, which is bash 4 and absent from the bash 3.2
@@ -60,7 +63,7 @@ fi
 assets=()
 while IFS= read -r asset; do
     [ -n "$asset" ] && assets+=("$asset")
-done <assets.txt
+done < assets.txt
 gh release create latest "${assets[@]}" \
     --target "$GITHUB_SHA" \
     --title "latest" \

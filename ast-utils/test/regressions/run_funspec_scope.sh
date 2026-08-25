@@ -28,10 +28,10 @@ trap 'rm -rf "$WORK"' EXIT
 cp "$HERE/funspec_scope.c" "$HERE/batch_funspec_scope.json" "$WORK/"
 (cd "$WORK" && "$FC" -load-module ast_utils_plugin \
     -server-batch batch_funspec_scope.json funspec_scope.c \
-    >/dev/null 2>&1)
+    > /dev/null 2>&1)
 
 # Parse output and verify each id's verdict.
-python3 - "$WORK/batch_funspec_scope.out.json" <<'PY'
+python3 - "$WORK/batch_funspec_scope.out.json" << 'PY'
 import json, re, sys
 
 EXPECTED = {

@@ -31,4 +31,4 @@ if [ ${#missing[@]} -ne 0 ] || [ ${#found[@]} -ne ${#expected[@]} ]; then
     echo "  found:   ${found[*]:-none}" >&2
     exit 1
 fi
-printf 'dist/%s\n' "${expected[@]}" >assets.txt
+printf 'dist/%s\n' "${expected[@]}" > assets.txt

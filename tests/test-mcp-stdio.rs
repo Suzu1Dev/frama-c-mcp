@@ -8008,7 +8008,8 @@ async fn unconstrained_assigns_compares_the_written_field_not_the_object() {
 
 /// A call after an inline-source check still finds the source it loaded.
 ///
-/// `check {source: ...}` writes the program to a scratch directory and loads it,
+/// `check {source: ...}` writes the program to a scratch directory and loads
+/// it,
 /// so the session's file list names a path under that directory, and run_wp,
 /// run_e_acsl and the WP goal detail path all re-read that list from disk. When
 /// the scratch directory was removed as `check` returned, every one of those

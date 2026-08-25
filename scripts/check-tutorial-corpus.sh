@@ -7,12 +7,12 @@ frama_c="${FRAMA_C_BIN:-frama-c}"
 version="$("$frama_c" -version | awk '{print $1}')"
 
 case "$version" in
-31.0 | 33.0) ;;
-*)
-    echo "Unsupported tutorial corpus Frama-C version: $version" >&2
-    echo "Supported versions are 31.0 and 33.0." >&2
-    exit 1
-    ;;
+    31.0 | 33.0) ;;
+    *)
+        echo "Unsupported tutorial corpus Frama-C version: $version" >&2
+        echo "Supported versions are 31.0 and 33.0." >&2
+        exit 1
+        ;;
 esac
 
 status=0
@@ -31,28 +31,30 @@ prover_seen=0
 # version does not. If a future version ever does move a row, add a `case
 # "$version:$name"` arm above the shared table rather than duplicating all
 # eleven again.
-expected_baseline() {
+expected_baseline()
+{
     local name="$1"
     case "$name" in
-    swap-frame.c) echo "57 57 5" ;;
-    abs-behaviors.c) echo "15 16 5" ;;
-    triangle-behaviors.c) echo "43 43 10" ;;
-    loops.c) echo "46 46 5" ;;
-    bsearch.c) echo "27 27 5" ;;
-    ghost-code.c) echo "20 20 5" ;;
-    count-logic.c) echo "13 15 5" ;;
-    sort-permutation.c) echo "33 33 5" ;;
-    verker-string.c) echo "31 42 5" ;;
-    linked-n.c) echo "14 20 5" ;;
-    modular-group) echo "28 28 5" ;;
-    *)
-        echo "Missing tutorial corpus baseline for fixture $name" >&2
-        exit 1
-        ;;
+        swap-frame.c) echo "57 57 5" ;;
+        abs-behaviors.c) echo "15 16 5" ;;
+        triangle-behaviors.c) echo "43 43 10" ;;
+        loops.c) echo "46 46 5" ;;
+        bsearch.c) echo "27 27 5" ;;
+        ghost-code.c) echo "20 20 5" ;;
+        count-logic.c) echo "13 15 5" ;;
+        sort-permutation.c) echo "33 33 5" ;;
+        verker-string.c) echo "31 42 5" ;;
+        linked-n.c) echo "14 20 5" ;;
+        modular-group) echo "28 28 5" ;;
+        *)
+            echo "Missing tutorial corpus baseline for fixture $name" >&2
+            exit 1
+            ;;
     esac
 }
 
-check_wp() {
+check_wp()
+{
     local name="$1"
     shift
     local expected_proved expected_total timeout

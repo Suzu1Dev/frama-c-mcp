@@ -82,7 +82,7 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Shell formatting (shfmt -i 4)
+      - name: Shell formatting (shfmt, .editorconfig)
         if: runner.os == 'Linux'
         run: .ci/check-shell-formatting.sh
 

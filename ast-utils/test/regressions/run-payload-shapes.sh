@@ -13,7 +13,7 @@ WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 
 cp "$HERE/payload-shapes.c" "$WORK/"
-cat >"$WORK/batch.json" <<'JSON'
+cat > "$WORK/batch.json" << 'JSON'
 [
   {"kind":"GET","id":"cil","request":"plugins.ast-utils.getCilContext","data":"sum"},
   {"kind":"GET","id":"loop","request":"plugins.ast-utils.getLoopEffects","data":"sum"},
@@ -26,9 +26,9 @@ JSON
 (cd "$WORK" && "$FC" -load-module ast_utils_plugin \
     -server-batch batch.json \
     -server-batch-output-dir . \
-    payload-shapes.c >/dev/null 2>&1)
+    payload-shapes.c > /dev/null 2>&1)
 
-python3 - "$WORK/batch.out.json" <<'PY'
+python3 - "$WORK/batch.out.json" << 'PY'
 import json
 import sys
 
