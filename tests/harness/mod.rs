@@ -31,6 +31,78 @@ pub fn suite_state_dir() -> PathBuf {
     dir
 }
 
+/// The state directory the calling test should hand its servers.
+///
+/// One directory per test process is not enough once tests run concurrently.
+/// Every default-spawned server writes the same files under it, and
+/// `remember_sandbox_metadata` in src/mcp/store.rs is a read-modify-write: it
+/// loads the whole `sandboxes.json`, edits it, and writes it back. Two servers
+/// doing that at once lose one of the two entries no matter how carefully each
+/// write lands, which is why `write_json_atomic` is not on its own enough and
+/// this exists as well. Unique experiment ids do not help either; they stop the
+/// ids colliding, not the file.
+///
+/// The unit is the test rather than the server, because eleven tests spawn two
+/// to four servers and some exist to check that the second one reads what the
+/// first persisted. Splitting per server would break exactly those.
+///
+/// libtest names the thread it runs a test on after that test, in serial runs
+/// as well as concurrent ones, so this answers per test without any caller
+/// having to say which test it is. Verified rather than assumed: a run of two
+/// tests leaves two directories named after them, and a "--test-threads=1" run
+/// of one leaves that one. The unnamed branch is a fallback for a harness that
+/// does not name its threads, and it lands on today's shared directory, which
+/// is safe there because such a harness is not running tests concurrently.
+pub fn test_state_dir() -> PathBuf {
+    let suite = suite_state_dir();
+    match std::thread::current().name() {
+        Some(name) if name != "main" => suite.join(path_segment(name)),
+        _ => suite,
+    }
+}
+
+/// A test name reduced to one filesystem path segment.
+///
+/// Module-qualified names carry "::", and the server rejects a path segment
+/// holding a separator outright, so anything that is not a plain identifier
+/// character becomes an underscore.
+fn path_segment(name: &str) -> String {
+    name.chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '_' { c } else { '_' })
+        .collect()
+}
+
+/// A command that will start the MCP server under test.
+///
+/// The state directory decision lives here rather than at the call sites, which
+/// is where it used to be: six of them, across three files, two of which were
+/// thirty near-identical lines apart in this module. A decision spelled out six
+/// times is one that gets changed four times, and the two spellings then differ
+/// in a way nothing reports.
+pub fn server_command(binary: &Path, frama_c: &str, cwd: Option<&Path>) -> StdCommand {
+    assert!(
+        binary.exists(),
+        "MCP binary missing: {}\nRun `cargo build --release` first.",
+        binary.display()
+    );
+
+    let mut cmd = StdCommand::new(binary);
+    cmd.arg("--frama-c").arg(frama_c);
+
+    // A caller that supplies a cwd is already isolated, since the default state
+    // path is relative to it. Everyone else gets the directory their own test
+    // owns.
+    match cwd {
+        Some(cwd) => {
+            cmd.current_dir(cwd);
+        }
+        None => {
+            cmd.env("FRAMA_C_MCP_STATE_DIR", test_state_dir());
+        }
+    }
+    cmd
+}
+
 pub struct McpHandle {
     child: StdChild,
     stdin: Option<ChildStdin>,
@@ -100,67 +172,17 @@ impl McpHandle {
         frama_c: &str,
         cwd: Option<&Path>,
     ) -> Self {
-        assert!(
-            binary.exists(),
-            "MCP binary missing: {}\nRun `cargo build --release` first.",
-            binary.display()
-        );
-
-        let mut cmd = StdCommand::new(&binary);
-        cmd.arg("--frama-c")
-            .arg(frama_c)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-
-        // A caller that supplies a cwd is already isolated, since the default
-        // state path is relative to it. Everyone else shares the suite
-        // directory.
-        match cwd {
-            Some(cwd) => {
-                cmd.current_dir(cwd);
-            }
-            None => {
-                cmd.env("FRAMA_C_MCP_STATE_DIR", suite_state_dir());
-            }
-        }
-        let mut child = cmd.spawn().expect("spawn MCP server");
-        let pid = child.id();
-        let stdin = Some(child.stdin.take().unwrap());
-        let stdout = BufReader::new(child.stdout.take().unwrap());
-        let mut handle = Self {
-            child,
-            stdin,
-            stdout,
-            pid,
-            last_response_bytes: 0,
-        };
+        let mut handle = Self::spawn_uninitialized(binary, frama_c, cwd);
         handle.initialize();
         handle
     }
 
     /// The process, started but not yet hand-shaken.
     fn spawn_uninitialized(binary: PathBuf, frama_c: &str, cwd: Option<&Path>) -> Self {
-        assert!(
-            binary.exists(),
-            "MCP binary missing: {}\nRun `cargo build --release` first.",
-            binary.display()
-        );
-
-        let mut cmd = StdCommand::new(&binary);
-        cmd.arg("--frama-c")
-            .arg(frama_c)
-            .stdin(Stdio::piped())
+        let mut cmd = server_command(&binary, frama_c, cwd);
+        cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        match cwd {
-            Some(cwd) => {
-                cmd.current_dir(cwd);
-            }
-            None => {
-                cmd.env("FRAMA_C_MCP_STATE_DIR", suite_state_dir());
-            }
-        }
         let mut child = cmd.spawn().expect("spawn MCP server");
         let pid = child.id();
         let stdin = Some(child.stdin.take().unwrap());

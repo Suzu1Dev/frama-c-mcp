@@ -251,7 +251,11 @@ jobs:
           cargo test --test test-store-conclusion -- --test-threads=1
 
       - name: MCP stdio E2E tests
-        run: cargo test --test test-mcp-stdio --release -- --test-threads=1
+        # Parallel, unlike the gates above: every test in this suite owns its
+        # server, its frama-c and its state directory. See scripts/run-gates.sh
+        # for the measurement. libtest's default is available parallelism, so
+        # this follows the runner rather than pinning a count.
+        run: cargo test --test test-mcp-stdio --release
 
   # The supported floor, compiled but not measured. The three shell gates in
   # the lane above pin proved-goal counts to Frama-C 33.0 and Alt-Ergo 2.6.3,

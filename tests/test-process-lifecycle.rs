@@ -164,7 +164,7 @@ fn cli_check_returns_json_reload_error_when_frama_c_is_missing() {
 
         // The CLI is not known to persist anything here, but no test should
         // rely on that and leave a `.frama-c-mcp` in the repo.
-        .env("FRAMA_C_MCP_STATE_DIR", harness::suite_state_dir())
+        .env("FRAMA_C_MCP_STATE_DIR", harness::test_state_dir())
         .output()
         .expect("run check");
 
@@ -193,7 +193,7 @@ fn cli_check_require_complete_fails_on_incomplete_payload() {
             "--json",
             "--require-complete",
         ])
-        .env("FRAMA_C_MCP_STATE_DIR", harness::suite_state_dir())
+        .env("FRAMA_C_MCP_STATE_DIR", harness::test_state_dir())
         .output()
         .expect("run check");
 
@@ -226,7 +226,7 @@ fn cli_check_leaves_no_frama_c_behind() {
     let source = workspace_path("tests/fixtures/test_abs.c");
     let child = std::process::Command::new(env!("CARGO_BIN_EXE_frama-c-mcp"))
         .args(["check", source.to_str().unwrap(), "--json"])
-        .env("FRAMA_C_MCP_STATE_DIR", harness::suite_state_dir())
+        .env("FRAMA_C_MCP_STATE_DIR", harness::test_state_dir())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
@@ -1915,7 +1915,7 @@ fn sigterm_kills_frama_c_child() {
     let mut mcp = StdCommand::new(&binary)
         .arg("--frama-c")
         .arg(&frama_c)
-        .env("FRAMA_C_MCP_STATE_DIR", harness::suite_state_dir())
+        .env("FRAMA_C_MCP_STATE_DIR", harness::test_state_dir())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
