@@ -3701,7 +3701,7 @@ impl FramaCMcpServer {
 pub fn frama_c_version_limitations(frama_c: &serde_json::Value) -> Vec<String> {
     let mut lines = vec![format!(
         "Frama-C {} or newer is required; run self_check after changing Frama-C versions.",
-        selfcheck::MIN_FRAMA_C_MAJOR
+        selfcheck::min_frama_c_version()
     )];
 
     // Keyed on the absence of a true "supported" rather than on the presence of

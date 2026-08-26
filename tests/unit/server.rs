@@ -344,7 +344,7 @@ async fn self_check_live_reports_frama_c_when_available() {
     assert!(
         payload["frama_c"]["major"]
             .as_u64()
-            .is_some_and(|major| major >= u64::from(selfcheck::MIN_FRAMA_C_MAJOR)),
+            .is_some_and(|major| major >= u64::from(selfcheck::MIN_FRAMA_C_VERSION.0)),
         "{:?}",
         payload["frama_c"]
     );
@@ -357,8 +357,25 @@ async fn self_check_live_reports_frama_c_when_available() {
 /// found" parser gets wrong: Frama-C writes diagnostics to stdout, so a warning
 /// ahead of the banner offers its own numbers first.
 #[test]
-fn frama_c_version_major_prefers_the_first_dotted_number_outside_parens() {
-    use frama_c_mcp::mcp::server::selfcheck::frama_c_version_major as major;
+fn frama_c_version_prefers_the_first_dotted_number_outside_parens() {
+    use frama_c_mcp::mcp::server::selfcheck::frama_c_version as version;
+    let major = |banner: &str| version(banner).map(|(major, _)| major);
+
+    // The minor comes out of the same run as the major, so the two cannot
+    // disagree about which number they read.
+    assert_eq!(version("33.0 (Arsenic)"), Some((33, 0)));
+    assert_eq!(version("32.1 (Germanium)"), Some((32, 1)));
+    assert_eq!(version("32.10 (nothing)"), Some((32, 10)));
+
+    // No minor is a zero rather than a failure: "34" and "34.0" are one
+    // release, and a floor with a minor in it must not reject the bare form
+    // of a version above it.
+    assert_eq!(version("34"), Some((34, 0)));
+
+    // A minor too large to parse falls to 0, which is older than any floor
+    // carrying a minor. Never newer.
+    assert_eq!(version("32.99999999999"), Some((32, 0)));
+
     assert_eq!(major("33.0 (Arsenic)"), Some(33));
     assert_eq!(major("Frama-C 33.0 (Arsenic)"), Some(33));
     assert_eq!(major("31.0 (Gallium)"), Some(31));
@@ -399,25 +416,46 @@ fn version_verdict_separates_exited_zero_from_supported() {
     }));
     assert_eq!(old["major"], 28);
     assert_eq!(old["supported"], false);
-    assert_eq!(old["minimum_major"], selfcheck::MIN_FRAMA_C_MAJOR);
+    assert_eq!(old["minimum_version"], selfcheck::min_frama_c_version());
     assert!(old["unsupported_reason"]
         .as_str()
         .is_some_and(|reason| reason.contains("28")));
 
     let lines = frama_c_version_limitations(&old);
     assert_eq!(lines.len(), 2, "{lines:?}");
-    assert!(lines[0].contains(&format!("Frama-C {}", selfcheck::MIN_FRAMA_C_MAJOR)));
+    assert!(lines[0].contains(&format!("Frama-C {}", selfcheck::min_frama_c_version())));
     assert!(lines[1].contains("not supported"), "{lines:?}");
 
-    let current = selfcheck::with_version_verdict(json!({
+    // The floor itself, and the release CI actually exercises. Both are
+    // asserted: a gate that only pins the boundary stops noticing the day the
+    // tested version drifts above it.
+    for banner in ["32.1 (Germanium)", "33.0 (Arsenic)"] {
+        let supported = selfcheck::with_version_verdict(json!({
+            "status": "ok",
+            "code": 0,
+            "stdout": banner,
+            "stderr": "",
+        }));
+        assert_eq!(supported["supported"], true, "{banner}");
+        assert_eq!(supported["unsupported_reason"], serde_json::Value::Null);
+        assert_eq!(frama_c_version_limitations(&supported).len(), 1);
+    }
+
+    // One minor below the floor. This is the case a major-only gate called
+    // supported while the ast-utils opam constraint refused to install at all,
+    // so self_check said yes to a configuration that could not exist.
+    let just_below = selfcheck::with_version_verdict(json!({
         "status": "ok",
         "code": 0,
-        "stdout": "33.0 (Arsenic)",
+        "stdout": "32.0 (Germanium)",
         "stderr": "",
     }));
-    assert_eq!(current["supported"], true);
-    assert_eq!(current["unsupported_reason"], serde_json::Value::Null);
-    assert_eq!(frama_c_version_limitations(&current).len(), 1);
+    assert_eq!(just_below["major"], 32);
+    assert_eq!(just_below["minor"], 0);
+    assert_eq!(just_below["supported"], false);
+    assert!(just_below["unsupported_reason"]
+        .as_str()
+        .is_some_and(|reason| reason.contains("32.0")));
 
     // A binary that never ran reports why rather than a null nobody reads.
     let missing = selfcheck::with_version_verdict(json!({

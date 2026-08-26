@@ -10,7 +10,8 @@ authors: ["haokun li"]
 license: "MIT"
 depends: [
   "ocaml" {>= "4.14"}
-  "frama-c" {>= "33.0"}
+  "frama-c" {>= "32.1"}
+  "cppo" {build}
   "yojson"
   "dune" {>= "3.0"}
   "odoc" {with-doc}

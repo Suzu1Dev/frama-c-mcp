@@ -425,7 +425,7 @@ let () =
          match Ast_utils_ghost.resolve_ghost_type type_name with
          | Error msg -> ok_json [("success", `Bool false); ("error", `String msg)]
          | Ok typ ->
-           let loc = Fileloc.unknown in
+           let loc = Ast_utils_compat.loc_unknown in
            match Ast_utils_ghost.parse_global_init loc typ expr with
            | Error msg ->
              ok_json [("success", `Bool false); ("error", `String msg)]

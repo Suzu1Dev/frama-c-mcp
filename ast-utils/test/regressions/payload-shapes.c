@@ -23,3 +23,10 @@ int sum(int *a, int n) {
 int divide(int x, int y) {
   return x / y;
 }
+
+/*@ requires nonneg(n);
+    ensures \result >= 0;
+ */
+int unspecified_frame(int n) {
+  return n;
+}

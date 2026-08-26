@@ -272,7 +272,7 @@ class collect_init_visitor col ~target_vid = object
              col.funs <- GFunDecl (spec, callee_vi, loc) :: col.funs
          | None ->
            (* Not registered, so a bare declaration is all there is to emit. *)
-           col.funs <- GFunDecl (Cil.empty_funspec (), vi, Fileloc.unknown) :: col.funs)
+           col.funs <- GFunDecl (Cil.empty_funspec (), vi, Ast_utils_compat.loc_unknown) :: col.funs)
       end;
       DoChildren
     | (Var vi, _) when vi.vglob && vi.vid <> target_vid ->
@@ -382,7 +382,7 @@ let print_includes fmt =
 
 let print_bare_fun_decl fmt vi =
   Format.fprintf fmt "%a@." Printer.pp_global
-    (GFunDecl (Cil.empty_funspec (), vi, Fileloc.unknown))
+    (GFunDecl (Cil.empty_funspec (), vi, Ast_utils_compat.loc_unknown))
 
 let print_global_var fmt g =
   match g with
@@ -595,4 +595,3 @@ let extract kf =
              (Kernel_function.get_name kf))
   | exn ->
     Error (Printf.sprintf "extract failed: %s" (Printexc.to_string exn))
-

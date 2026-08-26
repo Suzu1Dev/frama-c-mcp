@@ -19,7 +19,8 @@ cat > "$WORK/batch.json" << 'JSON'
   {"kind":"GET","id":"loop","request":"plugins.ast-utils.getLoopEffects","data":"sum"},
   {"kind":"GET","id":"contract","request":"plugins.ast-utils.getContractContext","data":"inc"},
   {"kind":"GET","id":"logic","request":"plugins.ast-utils.getLogicDeps","data":"inc"},
-  {"kind":"GET","id":"rte","request":"plugins.ast-utils.getRteObligations","data":"divide"}
+  {"kind":"GET","id":"rte","request":"plugins.ast-utils.getRteObligations","data":"divide"},
+  {"kind":"GET","id":"frame","request":"plugins.ast-utils.getLogicDeps","data":"unspecified_frame"}
 ]
 JSON
 
@@ -45,7 +46,7 @@ for entry in raw:
         continue
     data[case_id] = entry.get("data")
 
-for case_id in ["cil", "loop", "contract", "logic", "rte"]:
+for case_id in ["cil", "loop", "contract", "logic", "rte", "frame"]:
     if case_id not in data:
         fails.append(f"missing response id: {case_id}")
 
@@ -107,6 +108,30 @@ if is_obj(logic):
     want(is_list(preds), "logic: predicates is not array")
     want(any(p.get("name") == "nonneg" for p in preds if is_obj(p)),
          "logic: missing nonneg predicate dependency")
+
+# The assigns text is ACSL a reader can paste back, not a constructor dump.
+# Pinned on both shapes, because the two fail in opposite directions: a Writes
+# clause that stopped printing as ACSL would still look like text, and a
+# WritesAny that fell back to the printer prints nothing at all, which reads as
+# "assigns nothing" when it means "may write anything".
+def assigns_text(payload):
+    if not is_obj(payload):
+        return None
+    clauses = payload.get("contract", {}).get("clauses", [])
+    if not is_list(clauses):
+        return None
+    for clause in clauses:
+        if is_obj(clause) and clause.get("kind") == "assigns":
+            return clause.get("text")
+    return None
+
+logic_assigns = assigns_text(logic)
+frame_assigns = assigns_text(data.get("frame"))
+want(logic_assigns == r"assigns \nothing;",
+     f"logic: assigns text is {logic_assigns!r}, want ACSL")
+want(frame_assigns == r"assigns \everything;",
+     f"frame: an absent assigns clause is {frame_assigns!r}, "
+     "want it named rather than empty")
 
 rte = data.get("rte")
 want(is_obj(rte), "rte: object payload")

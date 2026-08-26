@@ -65,7 +65,7 @@ at it. The plugin and Frama-C must be installed in the same opam switch.
 
 ### Prerequisites
 
-- Frama-C 33.0 (the version exercised by CI)
+- Frama-C 32.1 or newer (CI exercises 33.0)
 - OCaml 4.14.2, opam, and dune >= 3.0
 - Rust 2021 toolchain
 - WP provers: Alt-Ergo, with Z3 and CVC5 optional
@@ -73,7 +73,9 @@ at it. The plugin and Frama-C must be installed in the same opam switch.
 ### Build
 
 ```bash
-eval $(opam env --switch=frama-c-33)
+# Name the switch that holds Frama-C. A bare `opam env` picks up whichever
+# switch happens to be active, which is the failure described below.
+eval $(opam env --switch=frama-c-33 --set-switch)
 
 cd ast-utils
 dune build && dune install
@@ -296,13 +298,15 @@ smoke tests.
 `tools/list` result that is resent on every agent turn, and the three heaviest
 tools. Computed from the running server, so it cannot be quoted stale.
 
-It parses the `frama-c -version` banner rather than only checking that
-the command exited zero. `frama_c.major`, `frama_c.supported` and
-`frama_c.minimum_major` report whether the installed version meets this
-server's minimum supported major version, and `frama_c.unsupported_reason`
-names the mismatch when it does not. An older Frama-C exits zero like any other,
-and the failure it causes lands somewhere with no version in it: a plugin that
-will not load, or a request answered `invalid`.
+It parses the `frama-c -version` banner rather than only checking that the
+command exited zero. `frama_c.major`, `frama_c.minor`, `frama_c.supported`
+and `frama_c.minimum_version` report whether the installed version meets
+this server's minimum supported version, and `frama_c.unsupported_reason`
+names the mismatch when it does not. The minimum carries a minor because the
+floor has one: 32.0 is a real release the plugin does not build against. An
+older Frama-C exits zero like any other, and the failure it causes lands
+somewhere with no version in it: a plugin that will not load, or a request
+answered `invalid`.
 `capabilities.known_frama_c_version_limitations` repeats the reason and is
 derived from the same probe, so it cannot go stale against the version actually
 installed.

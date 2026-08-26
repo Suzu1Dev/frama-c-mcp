@@ -101,16 +101,15 @@ let mk_kind tag fields : Yojson.Basic.t =
   `Assoc (("tag", `String tag) :: fields)
 
 let loc_to_json (loc : Cil_types.location) : Yojson.Basic.t =
-  let pos = fst loc in
   `Assoc [
-    ("file", `String (Filepath.to_string (Filepos.path pos)));
-    ("line", `Int (Filepos.line pos));
-    ("col", `Int (Filepos.input_column pos));
+    ("file", `String (Ast_utils_compat.loc_file loc));
+    ("line", `Int (Ast_utils_compat.loc_line loc));
+    ("col", `Int (Ast_utils_compat.loc_col loc));
   ]
 
 let stmt_loc_to_json (s : stmt) : Yojson.Basic.t =
   let loc = Cil_datatype.Stmt.loc s in
-  if Fileloc.equal loc Fileloc.unknown
+  if Ast_utils_compat.loc_is_unknown loc
   then `Null
   else loc_to_json loc
 
@@ -187,13 +186,17 @@ let ikind_to_string = function
   | IShort -> "CIshort" | IUShort -> "CIushort"
   | ILong -> "CIlong" | IULong -> "CIulong"
   | ILongLong -> "CIlonglong" | IULongLong -> "CIulonglong"
+#if FRAMAC_MAJOR >= 33
   | IInt128 -> "CIint128" | IUInt128 -> "CIuint128"
+#endif
 
 let fkind_to_string = function
   | FFloat -> "CFfloat"
   | FDouble -> "CFdouble"
   | FLongDouble -> "CFlongdouble"
+#if FRAMAC_MAJOR >= 33
   | FFloat32 -> "CFfloat32" | FFloat64 -> "CFfloat64"
+#endif
 
 (* ====== §3.2: cil_type_to_json ====== *)
 
@@ -509,7 +512,7 @@ let rec acsl_term_to_json tbl (t : term) : Yojson.Basic.t =
     else
       mk "ATat" [("t", acsl_term_to_json tbl t1); ("label", `String lbl_str)]
   | Tif (cond, t1, t2) ->
-    mk "ATcond" [("cond", `String (Format.asprintf "%a" Printer.pp_predicate cond));
+    mk "ATcond" [("cond", `String (Ast_utils_compat.if_cond_to_string cond));
                   ("then_", acsl_term_to_json tbl t1);
                   ("else_", acsl_term_to_json tbl t2)]
   | Tlet (li, body) ->
@@ -648,7 +651,11 @@ and acsl_pred_node_to_json tbl (p : predicate) : Yojson.Basic.t =
     mk_kind "APapp" [("func", `String li.l_var_info.lv_name);
                       ("args", `List (List.map (acsl_term_to_json tbl) args))]
   | Pif (p, p1, p2) ->
-    mk_kind "APcond" [("p", acsl_pred_to_json tbl p);
+    (* Printed rather than structured, because the condition is a predicate on
+       33 and a term before it, and those are two different node vocabularies
+       under one key. A reader cannot tell them apart; a string is the same
+       shape on both. ATcond above does the same. *)
+    mk_kind "APcond" [("p", `String (Ast_utils_compat.if_cond_to_string p));
                        ("p1", acsl_pred_to_json tbl p1);
                        ("p2", acsl_pred_to_json tbl p2)]
   | Pat (p1, lbl) ->

@@ -713,7 +713,7 @@ fn every_published_function_has_a_caller() {
 /// no way to be wrong loudly, so the sentence is derived and this checks the
 /// number it derives from.
 ///
-/// The comparison is the floor, not equality. MIN_FRAMA_C_MAJOR is the oldest
+/// The comparison is the floor, not equality. MIN_FRAMA_C_VERSION is the oldest
 /// version accepted rather than the only one, so requiring the matrix to equal
 /// it would fail the day CI moves to a Frama-C the code itself calls supported,
 /// which is a guard failing on the case it exists to allow.
@@ -742,13 +742,13 @@ fn ci_frama_c_version_matches_supported_minimum() {
         "no frama-c-version matrix found in ci.yml, so this guard compared nothing"
     );
     for version in &matrix {
-        let major = selfcheck::frama_c_version_major(version)
+        let parsed = selfcheck::frama_c_version(version)
             .unwrap_or_else(|| panic!("no version number in the ci.yml matrix entry {version:?}"));
         assert!(
-            major >= selfcheck::MIN_FRAMA_C_MAJOR,
-            "ci.yml installs Frama-C {version} but MIN_FRAMA_C_MAJOR is {}, so \
-             self_check would call the version CI tests unsupported",
-            selfcheck::MIN_FRAMA_C_MAJOR
+            parsed >= selfcheck::MIN_FRAMA_C_VERSION,
+            "ci.yml installs Frama-C {version} but the supported floor is {}, so \
+             self_check would call a version CI tests unsupported",
+            selfcheck::min_frama_c_version()
         );
     }
 
@@ -795,6 +795,77 @@ fn ci_frama_c_version_matches_supported_minimum() {
             );
         }
     }
+}
+
+/// CI compiles the plug-in against the oldest Frama-C the tree claims to
+/// support.
+///
+/// The floor is a claim about a build, and for one commit it was a claim
+/// nothing made: the opam constraint and README moved to 32.1 while the only
+/// lane installing Frama-C stayed on 33.0, so the "#if FRAMAC_MAJOR" arms for
+/// the older kernel were never compiled by anything. They did not compile, and
+/// the tree said 32.1 was supported for as long as nobody tried.
+///
+/// Matched as "frama-c.<floor>" inside an opam install command rather than
+/// anywhere in the file, so a version named only in a comment or a cache key
+/// does not satisfy it.
+#[test]
+fn ci_builds_the_plugin_on_the_supported_floor() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+
+    // ci_command_text rather than the raw YAML: CI moves long shell blocks into
+    // .ci/, and a reader of the YAML alone sees a step naming nothing but a
+    // path. Four other guards in this file already go through it.
+    let workflow = ci_command_text(root);
+
+    let floor = format!("frama-c.{}", selfcheck::min_frama_c_version());
+    let installs: Vec<&str> = workflow
+        .lines()
+        .map(str::trim)
+        .filter(|line| line.contains("opam install") && line.contains("frama-c."))
+        .collect();
+
+    assert!(
+        !installs.is_empty(),
+        "no opam install of frama-c found in ci.yml, so this guard compared nothing"
+    );
+    assert!(
+        installs.iter().any(|line| line.contains(&floor)),
+        "the supported floor is {}, but no CI step installs {floor}; the older \
+         arm of every version conditional in ast-utils/src would go uncompiled. \
+         Found: {installs:?}",
+        selfcheck::min_frama_c_version()
+    );
+
+    // The preprocessor that reads those conditionals is a build tool nothing
+    // else pulls in. A lane that builds the plug-in without cppo fails at the
+    // first module carrying a directive, which reads as a broken plug-in rather
+    // than a missing package.
+    //
+    // Whether, not where. cppo is deliberately installed by its own step in the
+    // lane that caches its switch, because folding it into the cached install
+    // would mean a new cache key and a new cache key discards a whole Frama-C
+    // build. Requiring it on the same line as frama-c would forbid that.
+    assert!(
+        workflow.contains("opam install") && workflow.contains("cppo"),
+        "no CI step installs cppo, which ast-utils/src/dune runs over the \
+         modules carrying version conditionals"
+    );
+
+    // The install step is skipped on a cache hit, so the key decides what the
+    // lane actually restores. Asserted as presence of the floor's own key
+    // rather than by filtering keys on a hardcoded major and checking the rest:
+    // that shape stops matching anything the day the floor moves, and then
+    // fails "compared nothing" on exactly the change it exists to allow.
+    let floor_key = format!("frama-c-{}", selfcheck::min_frama_c_version());
+    assert!(
+        workflow
+            .lines()
+            .map(str::trim)
+            .any(|line| line.starts_with("key:") && line.contains(&floor_key)),
+        "no opam cache key names {floor_key}, so a cache hit would restore a \
+         switch holding a different Frama-C than the lane installs"
+    );
 }
 
 /// Every integration test target is run by CI.

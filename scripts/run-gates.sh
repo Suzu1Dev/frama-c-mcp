@@ -50,7 +50,18 @@ run()
 
         # The names, not the count. A flaky suite is only actionable if the run
         # that caught it says which test went.
-        grep -E '^test .*FAILED|^ *FAIL|^error(\[|:)' "$log" | sed 's/^/    /' | head -20
+        local detail
+        detail=$(grep -E '^test .*FAILED|^ *FAIL|^error(\[|:)' "$log" | head -20)
+
+        # A gate can fail without printing any of those. The three shell gates
+        # refuse a Frama-C whose proved-goal counts they were not measured
+        # under, which is what a 32.1 switch gets, and the refusal says so in
+        # prose. Printing nothing there reports a bare rc=1 and sends the
+        # reader to a log to learn something the runner already had.
+        if [ -z "$detail" ]; then
+            detail=$(tail -3 "$log")
+        fi
+        printf '%s\n' "$detail" | sed 's/^/    /'
         printf '    full log: %s\n' "$log"
     fi
 }

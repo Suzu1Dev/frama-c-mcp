@@ -105,6 +105,33 @@ tracked = set(listing.stdout.split()) if listing.returncode == 0 else None
 
 def is_published(rel_path):
     return rel_path in tracked if tracked is not None else Path(rel_path).exists()
+
+
+# A file the build reads that git does not carry. dune's "(modules :standard)"
+# and cargo both glob the working tree, so an untracked source compiles on the
+# machine that wrote it and every checkout fails on an unbound module in files
+# nobody edited. This happened twice in one change: ast-utils/scripts, named by
+# a preprocess action, and ast_utils_compat.ml, opened by seven modules.
+#
+# Asked of git rather than by walking directories. git already knows which files
+# are untracked and not ignored, so there is no second root list to keep in step
+# with the one above, no skip list to re-derive, and a deliberately ignored file
+# cannot be reported. A hand-maintained list would have the same failure mode as
+# the bug it catches: ast-utils/scripts was new in the change that added this.
+#
+# This is the one check here that cannot fire in CI, where a checkout is tracked
+# by definition. That is the argument for it rather than against it: the mistake
+# is local, so the catch has to be local too.
+untracked = subprocess.run(
+    ["git", "ls-files", "--others", "--exclude-standard", "--"] + [str(r) for r in roots],
+    capture_output=True,
+    text=True,
+)
+if untracked.returncode == 0:
+    for rel_path in untracked.stdout.split():
+        report(Path(rel_path), 0, "build input not tracked by git", "")
+        failed = True
+
 md_link = re.compile(r"\[[^\]]*\]\(([^)]+)\)")
 md_files = (
     sorted(p for p in tracked if p.endswith(".md"))

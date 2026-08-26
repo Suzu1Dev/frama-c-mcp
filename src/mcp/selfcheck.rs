@@ -499,18 +499,22 @@ pub fn probe_failure(probe: &serde_json::Value, expected_output: &str) -> Option
     })
 }
 
-/// The oldest Frama-C this server will call supported.
+/// The oldest Frama-C this server will call supported, as (major, minor).
 ///
-/// Every request name, payload shape and prover default in this tree was
-/// measured on 33.0, and the ast-utils plugin does not compile against 31.0 at
-/// all. A lower Frama-C is therefore not a weaker configuration, it is one
-/// nothing here has ever run against. It is a floor rather than an exact
-/// target, so a newer Frama-C is accepted and only the shell gates, which pin
-/// proof counts, care which one it is.
-pub const MIN_FRAMA_C_MAJOR: u32 = 33;
+/// Frama-C 32.1 is the oldest release the ast-utils plug-in builds against, and
+/// it is a floor rather than an exact target, so a newer Frama-C is accepted.
+/// The minor is carried because the floor has one: 32.0 is a real release that
+/// the opam constraint in ast-utils rejects, and a major-only gate answered
+/// "supported" for it while the plug-in could not be installed at all.
+pub const MIN_FRAMA_C_VERSION: (u32, u32) = (32, 1);
 
-/// Major version out of a "frama-c -version" banner, or None when it holds no
-/// version-shaped number outside parentheses.
+/// The floor as it appears in a message or a payload field, "32.1".
+pub fn min_frama_c_version() -> String {
+    format!("{}.{}", MIN_FRAMA_C_VERSION.0, MIN_FRAMA_C_VERSION.1)
+}
+
+/// Major and minor version out of a "frama-c -version" banner, or None when it
+/// holds no version-shaped number outside parentheses.
 ///
 /// The first DOTTED number wins, and an undotted one is only the fallback.
 /// Taking the first digits found instead is wrong on this tool specifically:
@@ -523,14 +527,23 @@ pub const MIN_FRAMA_C_MAJOR: u32 = 33;
 /// metadata: a codename here, and on other tools a build date or a distribution
 /// release that reads exactly like a version number and sorts nowhere near one.
 ///
-/// A number too large for u32 answers None rather than saturating. Saturating
+/// A major too large for u32 answers None rather than saturating. Saturating
 /// made a malformed banner read as newer than any floor, which is the one
 /// direction a version check must not fail in.
-pub fn frama_c_version_major(banner: &str) -> Option<u32> {
+///
+/// An unparseable minor answers 0 rather than None, which fails in that same
+/// safe direction: 0 is older than any floor carrying a minor, never newer. The
+/// two fields differ because a missing major means the banner was not a version
+/// at all, while a missing minor is just a version written without one.
+///
+/// An undotted banner yields minor 0, so a bare "33" and a "33.0" name the same
+/// release rather than one of them failing the floor.
+pub fn frama_c_version(banner: &str) -> Option<(u32, u32)> {
     let mut depth = 0usize;
     let mut digits = String::new();
     let mut undotted = None;
-    for ch in banner.chars() {
+    let mut chars = banner.chars().peekable();
+    while let Some(ch) = chars.next() {
         if depth == 0 && ch.is_ascii_digit() {
             digits.push(ch);
             continue;
@@ -543,7 +556,11 @@ pub fn frama_c_version_major(banner: &str) -> Option<u32> {
         if !digits.is_empty() {
             let value = digits.parse::<u32>().ok();
             if ch == '.' {
-                return value;
+                let mut minor = String::new();
+                while chars.peek().is_some_and(char::is_ascii_digit) {
+                    minor.push(chars.next().unwrap_or_default());
+                }
+                return value.map(|major| (major, minor.parse::<u32>().unwrap_or(0)));
             }
             undotted = undotted.or(value);
             digits.clear();
@@ -558,10 +575,10 @@ pub fn frama_c_version_major(banner: &str) -> Option<u32> {
     if !digits.is_empty() {
         undotted = undotted.or_else(|| digits.parse::<u32>().ok());
     }
-    undotted
+    undotted.map(|major| (major, 0))
 }
 
-/// Add the parsed major and a supported/unsupported verdict to a -version
+/// Add the parsed version and a supported/unsupported verdict to a -version
 /// probe.
 ///
 /// The probe used to report nothing but "the command exited 0", so a Frama-C
@@ -576,16 +593,18 @@ pub fn with_version_verdict(mut probe: serde_json::Value) -> serde_json::Value {
     if !probe.is_object() {
         return probe;
     }
-    let major = probe["stdout"].as_str().and_then(frama_c_version_major);
-    probe["minimum_major"] = json!(MIN_FRAMA_C_MAJOR);
-    probe["major"] = json!(major);
-    probe["supported"] = json!(major.is_some_and(|major| major >= MIN_FRAMA_C_MAJOR));
-    probe["unsupported_reason"] = match major {
-        Some(major) if major >= MIN_FRAMA_C_MAJOR => serde_json::Value::Null,
-        Some(major) => json!(format!(
-            "Frama-C {major} is below the {MIN_FRAMA_C_MAJOR} this server targets: \
+    let version = probe["stdout"].as_str().and_then(frama_c_version);
+    probe["minimum_version"] = json!(min_frama_c_version());
+    probe["major"] = json!(version.map(|(major, _)| major));
+    probe["minor"] = json!(version.map(|(_, minor)| minor));
+    probe["supported"] = json!(version.is_some_and(|version| version >= MIN_FRAMA_C_VERSION));
+    probe["unsupported_reason"] = match version {
+        Some(version) if version >= MIN_FRAMA_C_VERSION => serde_json::Value::Null,
+        Some((major, minor)) => json!(format!(
+            "Frama-C {major}.{minor} is below the {} this server targets: \
              request names and payload shapes are unverified there, and the \
-             ast-utils plugin does not build against it"
+             ast-utils plugin does not build against it",
+            min_frama_c_version()
         )),
         None if probe["status"] == "ok" => json!(format!(
             "no version number in the -version banner: {}",
