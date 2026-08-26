@@ -313,13 +313,25 @@ fn no_em_dash_in_a_rust_comment() {
 /// values threaded between them.
 ///
 /// The measurement is a brace at the function's own indentation, not a parse.
-/// It is not exact, and it cannot be: this tree is not rustfmt output, since
-/// no gate runs cargo fmt and it rewrites most of src when asked, so a closing
-/// brace is where the author left it. Every way it goes wrong under-reports
-/// rather than crying wolf, which is the right direction for a guard: a
-/// declaration
-/// with no body, a form of pub this does not strip, and a brace this cannot find
-/// all skip the function instead of inventing a length for it.
+/// It is inexact and cannot be otherwise, because no gate runs cargo fmt here
+/// and it rewrites most of src when asked, so a closing brace sits where the
+/// author left it rather than where a formatter would put it.
+///
+/// It is built to under-report rather than to cry wolf, and each way it can go
+/// wrong lands on that side. A declaration with no body, a form of pub this
+/// does not strip, and a brace this cannot find all skip the function instead
+/// of inventing a length for it. So does an overshoot: when the search runs
+/// past a close it failed to recognize, it meets the next declaration at the
+/// same indentation and gives up, rather than reporting this function plus
+/// whatever followed it. That case used to report the sum, which is why
+/// closes_at exists as well, to keep the overshoot rare in the first place.
+///
+/// One hole is left, and it stays open because closing it needs the lexer this
+/// deliberately is not. A fn declaration written inside a block comment or a
+/// raw string reads here as a real one, and could then be measured against a
+/// brace that is not its own. Measured on this tree: src/ holds one block
+/// comment and no raw string carrying Rust, so nothing reaches it today, and
+/// the C fixtures that would are under tests/, which this does not read.
 ///
 /// So the ceiling is a backstop for the reviewer rather than a substitute: a
 /// function doing two unrelated things at 180 lines is still wrong and this
@@ -342,9 +354,20 @@ fn no_function_in_src_runs_past_the_length_ceiling() {
             let Some(name) = function_name(line) else { continue };
             let indent = &line[..line.len() - line.trim_start().len()];
             let close = format!("{indent}}}");
-            let Some(end) = (start + 1..lines.len()).find(|&i| lines[i] == close) else {
+            let Some(end) =
+                (start + 1..lines.len()).find(|&i| closes_at(lines[i], &close)) else {
                 continue;
             };
+            // A sibling declaration at this indentation before the close means
+            // the search ran past the real one, so the length would be this
+            // function plus whatever followed it. Skip instead of reporting a
+            // number that was never measured on one function.
+            if (start + 1..end).any(|i| {
+                function_name(lines[i]).is_some()
+                    && lines[i].len() - lines[i].trim_start().len() == indent.len()
+            }) {
+                continue;
+            }
             let length = end - start + 1;
             if length > CEILING {
                 offenders.push(format!(
@@ -379,6 +402,19 @@ fn function_name(line: &str) -> Option<&str> {
     let rest = rest.strip_prefix("fn ")?;
     let end = rest.find(|c: char| !c.is_alphanumeric() && c != '_')?;
     Some(&rest[..end])
+}
+
+/// Whether a line is the closing brace of a block opened at this indentation.
+///
+/// Not an equality test. A brace carrying trailing whitespace or a trailing
+/// comment is still that brace, and treating it as anything else sends the
+/// search on to the next sibling's close, which inflates the length of a
+/// function that is not over anything. Measured on this tree: giving
+/// parse_proved_goals a commented close took it from 17 lines to 26.
+fn closes_at(line: &str, close: &str) -> bool {
+    let Some(rest) = line.strip_prefix(close) else { return false };
+    let rest = rest.trim();
+    rest.is_empty() || rest.starts_with("//")
 }
 
 /// Walk every .rs file under a directory.
