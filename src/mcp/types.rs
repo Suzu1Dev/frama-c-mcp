@@ -13,9 +13,14 @@ where
 {
     use serde::de::Error;
     let v: Option<serde_json::Value> = Option::deserialize(deserializer)?;
-    let arr_value = match v {
+    // The arms yield the elements rather than the Value holding them. Yielding
+    // the Value meant the two arms that had just proved it was an array handed
+    // back something whose type had forgotten, so the line below had to assert
+    // it again, and it took the elements by cloning each one out of a document
+    // that is dropped on the next line.
+    let arr = match v {
         None | Some(serde_json::Value::Null) => return Ok(None),
-        Some(array @ serde_json::Value::Array(_)) => array,
+        Some(serde_json::Value::Array(items)) => items,
         Some(serde_json::Value::String(s)) => {
             // Empty strings are treated as None (LLM occasionally passes "")
             if s.trim().is_empty() {
@@ -27,12 +32,14 @@ where
                     e
                 ))
             })?;
-            if !parsed.is_array() {
-                return Err(D::Error::custom(
-                    "field passed as string but parsed JSON is not an array",
-                ));
+            match parsed {
+                serde_json::Value::Array(items) => items,
+                _ => {
+                    return Err(D::Error::custom(
+                        "field passed as string but parsed JSON is not an array",
+                    ))
+                }
             }
-            parsed
         }
         Some(other) => {
             return Err(D::Error::custom(format!(
@@ -46,9 +53,7 @@ where
             )));
         }
     };
-    let arr = arr_value.as_array().expect("checked above");
-    arr.iter()
-        .cloned()
+    arr.into_iter()
         .map(|item| serde_json::from_value(item).map_err(D::Error::custom))
         .collect::<Result<Vec<T>, _>>()
         .map(Some)

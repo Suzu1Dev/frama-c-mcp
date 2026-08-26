@@ -236,6 +236,15 @@ pub fn socket_not_listening_yet(e: &FramaCError) -> bool {
     ))
 }
 
+/// True when the connect was refused, which is the half of
+/// "socket_not_listening_yet" that means the path exists and nothing is
+/// accepting on it. That is the startup race, and it is also a stale socket
+/// left by a dead server, so this narrows the retry predicate rather than
+/// identifying a bound-but-not-listening server on its own.
+pub fn socket_refused(e: &FramaCError) -> bool {
+    matches!(e, FramaCError::Io(io) if io.kind() == std::io::ErrorKind::ConnectionRefused)
+}
+
 /// Connect to a Frama-C that is still starting, retrying while the socket
 /// refuses connections.
 ///
@@ -266,6 +275,7 @@ pub async fn connect_when_listening(
         .to_str()
         .ok_or_else(|| format!("socket path is not UTF-8: {}", socket.display()))?;
     let deadline = std::time::Instant::now() + timeout;
+    let mut refusals = 0u32;
     loop {
         // A process that has already exited will never listen. Say so instead
         // of spending the rest of the timeout waiting for a corpse.
@@ -273,7 +283,21 @@ pub async fn connect_when_listening(
             return Err(format!("frama-c exited during startup: {status}"));
         }
         match FramaCClient::connect(path, state.clone()).await {
-            Ok(client) => return Ok(client),
+            Ok(client) => {
+                // The recovered race is the case nothing else can see. A
+                // refusal that this loop absorbs leaves no trace in the tool
+                // result, in the exit status, or in the test that was running,
+                // so a suite drifting toward the flake looks exactly like a
+                // healthy one until the timeout is finally exceeded.
+                if refusals > 0 {
+                    tracing::warn!(
+                        socket = %socket.display(),
+                        refusals,
+                        "connected only after the socket refused: frama-c bound before it listened"
+                    );
+                }
+                return Ok(client);
+            }
             Err(e) if socket_not_listening_yet(&e) => {
                 if std::time::Instant::now() >= deadline {
                     return Err(format!(
@@ -281,6 +305,7 @@ pub async fn connect_when_listening(
                         socket.display()
                     ));
                 }
+                refusals += u32::from(socket_refused(&e));
                 tokio::time::sleep(Duration::from_millis(25)).await;
             }
             Err(e) => return Err(e.to_string()),

@@ -2609,12 +2609,24 @@ impl FramaCMcpServer {
 
         // All functions must be in the same sandbox.
         let first = &names[0];
+        // Read the id off the name rather than off the resolved client. Only
+        // run_wp_target_scope routes anything here, and it routes on the same
+        // colon, so this arm cannot be reached with a bare name. That is an
+        // agreement between two functions eight hundred lines apart, and the
+        // cost of expressing it as an assertion here was a panic in a
+        // long-lived server if the routing ever widened.
+        let FunctionScope::Sandbox {
+            experiment_id: exp_id,
+            ..
+        } = scope_for_function(first)
+        else {
+            return Err(McpError::invalid_params(
+                "sandbox WP needs a sandbox-prefixed name like exp42:foo",
+                None,
+            ));
+        };
         let resolved = self.resolve_client(first).await?;
         let client = &resolved.client;
-        let exp_id = resolved
-            .experiment_id
-            .as_ref()
-            .expect("invariant: a sandbox scope resolves to a sandbox client");
         let mut target_names = Vec::new();
         for name in names {
             match scope_for_function(name) {
@@ -2649,7 +2661,7 @@ impl FramaCMcpServer {
             let metadata = {
                 let sandboxes = self.sandboxes.read().await;
                 sandboxes
-                    .metadata(exp_id.as_str())
+                    .metadata(exp_id)
                     .cloned()
                     .ok_or_else(|| sandbox_not_found_err(exp_id, &sandboxes.keys()))?
             };
@@ -2707,7 +2719,7 @@ impl FramaCMcpServer {
         let source_files = {
             let sandboxes = self.sandboxes.read().await;
             sandboxes
-                .metadata(exp_id.as_str())
+                .metadata(exp_id)
                 .map(|metadata| vec![metadata.sandbox_dir.join("sandbox.c").display().to_string()])
                 .unwrap_or_default()
         };

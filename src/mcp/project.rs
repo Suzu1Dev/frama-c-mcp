@@ -142,15 +142,14 @@ impl FramaCMcpServer {
         // - compilation database without files: load file entries from it
         // - None + already loaded: use the current files loaded by frama-c
         // - None + not loaded: error (cannot guess in lazy mode)
-        let files = match params.files {
-            Some(f) => f,
-            None if project_options.compilation_database.is_some() => compile_database_files(
-                project_options
-                    .compilation_database
-                    .as_ref()
-                    .expect("checked"),
-            )?,
-            None => {
+        // Matched as a pair rather than guarded on is_some, so the database arm
+        // is handed the database instead of re-fetching one the guard had
+        // already found. A guard cannot bind, which is the whole reason the
+        // old arm had to assert.
+        let files = match (params.files, project_options.compilation_database.as_ref()) {
+            (Some(f), _) => f,
+            (None, Some(database)) => compile_database_files(database)?,
+            (None, None) => {
                 let client_opt = self.client.lock().await.clone();
                 match client_opt {
                     Some(c) => {

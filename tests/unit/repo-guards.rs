@@ -298,6 +298,137 @@ fn no_em_dash_in_a_rust_comment() {
     assert!(offenders.is_empty(), "em dash in a comment: {offenders:?}");
 }
 
+/// No function in src/ runs past the ceiling CLAUDE.md sets.
+///
+/// The length rule was prose alone until this test, and prose went stale: the
+/// document claimed nothing exceeded 250 while check_payload had reached 289.
+/// A rule the tree is measured against is a rule; a rule stated in a file no
+/// checkout even has is a wish.
+///
+/// 300 rather than 250, and the number moved because the measurement said so.
+/// The five functions over 200 are all sequential payload assembly whose steps
+/// feed the next one, which is the shape CLAUDE.md already says not to split,
+/// and check_payload at 289 is that shape and not a function doing several
+/// things. Splitting it would buy helpers with one caller apiece and three
+/// values threaded between them.
+///
+/// The measurement is a brace at the function's own indentation, not a parse.
+/// It is inexact and cannot be otherwise, because no gate runs cargo fmt here
+/// and it rewrites most of src when asked, so a closing brace sits where the
+/// author left it rather than where a formatter would put it.
+///
+/// It is built to under-report rather than to cry wolf, and each way it can go
+/// wrong lands on that side. A declaration with no body, a form of pub this
+/// does not strip, and a brace this cannot find all skip the function instead
+/// of inventing a length for it. So does an overshoot: when the search runs
+/// past a close it failed to recognize, it meets the next declaration at the
+/// same indentation and gives up, rather than reporting this function plus
+/// whatever followed it. That case used to report the sum, which is why
+/// closes_at exists as well, to keep the overshoot rare in the first place.
+///
+/// One hole is left, and it stays open because closing it needs the lexer this
+/// deliberately is not. A fn declaration written inside a block comment or a
+/// raw string reads here as a real one, and could then be measured against a
+/// brace that is not its own. Measured on this tree: src/ holds one block
+/// comment and no raw string carrying Rust, so nothing reaches it today, and
+/// the C fixtures that would are under tests/, which this does not read.
+///
+/// So the ceiling is a backstop for the reviewer rather than a substitute: a
+/// function doing two unrelated things at 180 lines is still wrong and this
+/// test will never say so.
+#[test]
+fn no_function_in_src_runs_past_the_length_ceiling() {
+    const CEILING: usize = 300;
+
+    let mut files = Vec::new();
+    rust_files(
+        &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
+        &mut files,
+    );
+
+    let mut offenders = Vec::new();
+    for path in files {
+        let Ok(text) = std::fs::read_to_string(&path) else { continue };
+        let lines: Vec<&str> = text.lines().collect();
+        for (start, line) in lines.iter().enumerate() {
+            let Some(name) = function_name(line) else { continue };
+            let indent = &line[..line.len() - line.trim_start().len()];
+            let close = format!("{indent}}}");
+            let Some(end) =
+                (start + 1..lines.len()).find(|&i| closes_at(lines[i], &close)) else {
+                continue;
+            };
+            // A sibling declaration at this indentation before the close means
+            // the search ran past the real one, so the length would be this
+            // function plus whatever followed it. Skip instead of reporting a
+            // number that was never measured on one function.
+            if (start + 1..end).any(|i| {
+                function_name(lines[i]).is_some()
+                    && lines[i].len() - lines[i].trim_start().len() == indent.len()
+            }) {
+                continue;
+            }
+            let length = end - start + 1;
+            if length > CEILING {
+                offenders.push(format!(
+                    "{}:{} {name} is {length} lines",
+                    path.display(),
+                    start + 1
+                ));
+            }
+        }
+    }
+
+    assert!(
+        offenders.is_empty(),
+        "over the {CEILING} line ceiling: {offenders:?}"
+    );
+}
+
+/// The name of the function a line declares, if it declares one.
+///
+/// Deliberately blind to a declaration inside a string or a comment: those do
+/// not reach an opening brace at their own indentation, so they find no closing
+/// line and are skipped by the caller rather than needing to be excluded here.
+fn function_name(line: &str) -> Option<&str> {
+    let rest = line.trim_start();
+    let mut rest = rest
+        .strip_prefix("pub(crate) ")
+        .or_else(|| rest.strip_prefix("pub "))
+        .unwrap_or(rest);
+    for prefix in ["default ", "const ", "async ", "unsafe ", "extern \"C\" "] {
+        rest = rest.strip_prefix(prefix).unwrap_or(rest);
+    }
+    let rest = rest.strip_prefix("fn ")?;
+    let end = rest.find(|c: char| !c.is_alphanumeric() && c != '_')?;
+    Some(&rest[..end])
+}
+
+/// Whether a line is the closing brace of a block opened at this indentation.
+///
+/// Not an equality test. A brace carrying trailing whitespace or a trailing
+/// comment is still that brace, and treating it as anything else sends the
+/// search on to the next sibling's close, which inflates the length of a
+/// function that is not over anything. Measured on this tree: giving
+/// parse_proved_goals a commented close took it from 17 lines to 26.
+fn closes_at(line: &str, close: &str) -> bool {
+    let Some(rest) = line.strip_prefix(close) else { return false };
+    let rest = rest.trim();
+    rest.is_empty() || rest.starts_with("//")
+}
+
+/// Walk every .rs file under a directory.
+fn rust_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    for path in entries.flatten().map(|entry| entry.path()) {
+        if path.is_dir() {
+            rust_files(&path, out);
+        } else if path.extension().is_some_and(|ext| ext == "rs") {
+            out.push(path);
+        }
+    }
+}
+
 /// The retry counts a goal as flipped only when the first pass timed out on
 /// that same goal and the second pass proved it.
 ///
@@ -513,17 +644,6 @@ fn ci_named_tests_still_exist() {
 #[test]
 fn every_published_function_has_a_caller() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-
-    fn rust_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
-        let Ok(entries) = std::fs::read_dir(dir) else { return };
-        for path in entries.flatten().map(|entry| entry.path()) {
-            if path.is_dir() {
-                rust_files(&path, out);
-            } else if path.extension().is_some_and(|ext| ext == "rs") {
-                out.push(path);
-            }
-        }
-    }
 
     let mut sources = Vec::new();
     rust_files(&root.join("src"), &mut sources);
