@@ -249,6 +249,23 @@ pub fn persist_program_state(state: &ProjectVerificationState) -> std::io::Resul
     persist_program_state_at(&conclusion_base_dir(), state)
 }
 
+/// An empty directory path, spelled as the working directory.
+///
+/// Two shapes produce one: Path::parent answers Some("") for a bare file name
+/// rather than None, and FRAMA_C_MCP_STATE_DIR set to an empty string makes
+/// conclusion_base_dir itself empty. Both mean the working directory to every
+/// caller, but the filesystem disagrees about which calls accept it. create_dir_all
+/// and join take "" happily; read_dir and a temp file creation both fail on it,
+/// so a sweep would quietly do nothing and a write would error. One conversion
+/// here rather than a different guess at each call site.
+fn dir_or_cwd(dir: &Path) -> &Path {
+    if dir.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        dir
+    }
+}
+
 /// Prefix for this module's in-flight writes. A crash between create and
 /// rename leaves one behind, and the prefix is how sweep_writer_temp_files
 /// tells those from anything else in the directory.
@@ -272,7 +289,7 @@ const WRITER_TMP_STALE: std::time::Duration = std::time::Duration::from_secs(360
 /// Failures are ignored throughout. This is tidying, and a state directory that
 /// cannot be read or swept is a problem the caller will hit on its own terms.
 pub fn sweep_writer_temp_files(base_dir: &Path) {
-    let Ok(entries) = std::fs::read_dir(base_dir) else {
+    let Ok(entries) = std::fs::read_dir(dir_or_cwd(base_dir)) else {
         return;
     };
     for entry in entries.flatten() {
@@ -307,6 +324,7 @@ pub fn sweep_writer_temp_files(base_dir: &Path) {
 fn lock_state_dir(base_dir: &Path) -> std::io::Result<std::fs::File> {
     use std::os::unix::io::AsRawFd;
 
+    let base_dir = dir_or_cwd(base_dir);
     std::fs::create_dir_all(base_dir)?;
     let file = std::fs::OpenOptions::new()
         .create(true)
@@ -338,14 +356,7 @@ fn lock_state_dir(base_dir: &Path) -> std::io::Result<std::fs::File> {
 /// ensure_private_dir makes it 0700 and refuses one that is readable by others,
 /// and the contents are absolute local paths and pids.
 fn write_json_atomic(path: &Path, value: &impl serde::Serialize) -> std::io::Result<()> {
-    // Path::parent answers Some("") for a bare file name, not None, and a temp
-    // file cannot be created in "". Both spellings mean the working directory,
-    // which is reachable here: FRAMA_C_MCP_STATE_DIR set to an empty string
-    // makes conclusion_base_dir join to exactly that shape.
-    let dir = match path.parent() {
-        Some(parent) if !parent.as_os_str().is_empty() => parent,
-        _ => Path::new("."),
-    };
+    let dir = dir_or_cwd(path.parent().unwrap_or(Path::new("")));
     std::fs::create_dir_all(dir)?;
     let json = serde_json::to_string_pretty(value)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;

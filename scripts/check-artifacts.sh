@@ -122,12 +122,30 @@ def is_published(rel_path):
 # This is the one check here that cannot fire in CI, where a checkout is tracked
 # by definition. That is the argument for it rather than against it: the mistake
 # is local, so the catch has to be local too.
-# The build roots, not `roots`. `roots` also covers docs/, .github/ and the
-# markdown at the top, where an untracked draft is ordinary work in progress
-# rather than a missing build input; failing the gate on those would train a
-# reader to ignore it. A source tree is different: nothing there is meant to be
-# untracked, because the build reads it.
-build_roots = ["Cargo.toml", "Cargo.lock", "build.rs", ".cargo", "src", "tests", "scripts", ".ci", "ast-utils"]
+# Extends `roots` rather than restating it. A second hand-written list is the
+# shape of the bug this check exists to catch: two lists to keep in step, and a
+# source directory added to one and not the other goes unwatched. Everything
+# `roots` covers is watched here for free, so a new root only has to be named
+# once; below it are the build inputs that sit outside `roots` because the
+# scans above have no reason to read them.
+build_roots = [str(r) for r in roots] + ["Cargo.lock", "build.rs", ".cargo"]
+
+# Narrowed by what the file is, since `roots` deliberately reaches into docs/
+# and the markdown at the top, where an untracked draft is ordinary work in
+# progress. A stray .md is a draft; a stray .ml under ast-utils/src is a module
+# the build reads on the machine that wrote it and on no other. Failing the
+# gate on drafts is how a reader learns to ignore it.
+build_input_suffixes = {
+    ".rs", ".ml", ".mli", ".sh", ".c", ".h", ".json", ".toml", ".lock", ".yml", ".yaml", ".opam"
+}
+build_input_names = {"dune", "dune-project"}
+
+
+def is_build_input(rel_path):
+    path = Path(rel_path)
+    return path.name in build_input_names or path.suffix in build_input_suffixes
+
+
 untracked = subprocess.run(
     ["git", "ls-files", "--others", "--exclude-standard", "--"] + build_roots,
     capture_output=True,
@@ -135,8 +153,9 @@ untracked = subprocess.run(
 )
 if untracked.returncode == 0:
     for rel_path in untracked.stdout.split():
-        report(Path(rel_path), 0, "build input not tracked by git", "")
-        failed = True
+        if is_build_input(rel_path):
+            report(Path(rel_path), 0, "build input not tracked by git", "")
+            failed = True
 
 md_link = re.compile(r"\[[^\]]*\]\(([^)]+)\)")
 md_files = (

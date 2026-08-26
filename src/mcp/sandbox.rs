@@ -262,7 +262,18 @@ impl FramaCMcpServer {
             stdout_log_path: Some(stdout_log_path),
             stderr_log_path: Some(stderr_log_path),
         };
-        if let Err(e) = remember_sandbox_metadata(&metadata) {
+        // spawn_blocking because this takes an advisory lock on the state
+        // directory, and LOCK_EX waits without a deadline. Every other caller
+        // of it is another frama-c-mcp process, so the wait is on a process
+        // this executor does not schedule and cannot make progress on. The hold
+        // window is one small read and write, but a tokio worker parked on
+        // another process's syscall is a stall this runtime cannot see.
+        let persisted = tokio::task::spawn_blocking({
+            let metadata = metadata.clone();
+            move || remember_sandbox_metadata(&metadata)
+        })
+        .await;
+        if let Err(e) = persisted.map_err(std::io::Error::other).and_then(|inner| inner) {
             tracing::warn!(
                 experiment_id = %experiment_id,
                 "persist sandbox metadata failed: {}", e
@@ -333,7 +344,14 @@ impl FramaCMcpServer {
         });
 
         self.cleanup_sandbox(&exp_id).await;
-        if let Err(e) = mark_sandbox_metadata_deleted(&exp_id) {
+        // Off the executor for the same reason as the write in create_sandbox:
+        // it waits on a lock another process holds.
+        let marked = tokio::task::spawn_blocking({
+            let exp_id = exp_id.clone();
+            move || mark_sandbox_metadata_deleted(&exp_id)
+        })
+        .await;
+        if let Err(e) = marked.map_err(std::io::Error::other).and_then(|inner| inner) {
             tracing::warn!(experiment_id = %exp_id, "persist sandbox deleted flag failed: {}", e);
         }
 

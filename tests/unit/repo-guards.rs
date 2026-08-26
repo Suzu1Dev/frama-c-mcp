@@ -855,7 +855,21 @@ fn ci_builds_the_plugin_on_the_supported_floor() {
     // by whichever other lane still installs it.
     let ci = std::fs::read_to_string(root.join(".github/workflows/ci.yml")).expect("ci.yml");
     let mut jobs: Vec<(String, String)> = Vec::new();
+
+    // Only inside the jobs: block. Indentation alone cannot say what a job is:
+    // the on: trigger keys push: and pull_request: sit at the same two spaces,
+    // so a scan without this collected them as jobs and gave the first one the
+    // whole top-of-file comment block as its body. Harmless while that comment
+    // says nothing about dune, and a trap the day it does.
+    let mut in_jobs = false;
     for line in ci.lines() {
+        if !line.starts_with(' ') && !line.trim().is_empty() {
+            in_jobs = line.trim_end() == "jobs:";
+            continue;
+        }
+        if !in_jobs {
+            continue;
+        }
         let is_job_header = line.starts_with("  ")
             && !line.starts_with("   ")
             && line.trim_end().ends_with(':')
@@ -867,6 +881,11 @@ fn ci_builds_the_plugin_on_the_supported_floor() {
             body.push('\n');
         }
     }
+    assert!(
+        jobs.iter().all(|(name, _)| name != "push" && name != "pull_request"),
+        "the job scan collected an on: trigger key as a job: {:?}",
+        jobs.iter().map(|(name, _)| name).collect::<Vec<_>>()
+    );
 
     let plugin_builders: Vec<&(String, String)> = jobs
         .iter()
