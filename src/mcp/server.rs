@@ -2496,7 +2496,9 @@ impl FramaCMcpServer {
         frama_c_path: String,
         max_sandboxes: usize,
     ) -> Self {
-        // Restore existing conclusions from .frama-c-mcp/ when session starts.
+        // Restore existing conclusions from .frama-c-mcp/ when session starts,
+        // and drop any in-flight write a previous run died holding.
+        crate::mcp::store::sweep_writer_temp_files(&conclusion_base_dir());
         let loaded = load_conclusions_from_disk(&conclusion_base_dir());
         if !loaded.is_empty() {
             let state_clone = state.clone();
@@ -2609,6 +2611,7 @@ impl FramaCMcpServer {
 
         // All functions must be in the same sandbox.
         let first = &names[0];
+
         // Read the id off the name rather than off the resolved client. Only
         // run_wp_target_scope routes anything here, and it routes on the same
         // colon, so this arm cannot be reached with a bare name. That is an
@@ -3701,7 +3704,7 @@ impl FramaCMcpServer {
 pub fn frama_c_version_limitations(frama_c: &serde_json::Value) -> Vec<String> {
     let mut lines = vec![format!(
         "Frama-C {} or newer is required; run self_check after changing Frama-C versions.",
-        selfcheck::MIN_FRAMA_C_MAJOR
+        selfcheck::min_frama_c_version()
     )];
 
     // Keyed on the absence of a true "supported" rather than on the presence of

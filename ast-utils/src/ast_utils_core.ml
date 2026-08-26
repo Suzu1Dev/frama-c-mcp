@@ -156,7 +156,7 @@ let make_typer kf kinstr =
                  with Not_found -> "Unbound variable " ^ x)
               | Kstmt _ -> "Unbound variable " ^ x
             in
-            raise (Typing_error (Fileloc.unknown, msg))
+            raise (Typing_error (Ast_utils_compat.loc_unknown, msg))
 
         let find_label s = Kernel_function.find_label kf s
       end)
@@ -180,7 +180,7 @@ let make_global_typer () =
         let find_enum_tag x =
           try Globals.Types.find_enum_tag x
           with Not_found ->
-            raise (Typing_error (Fileloc.unknown, "Unbound variable " ^ x))
+            raise (Typing_error (Ast_utils_compat.loc_unknown, "Unbound variable " ^ x))
         let find_label _ = raise Not_found
       end)
   in
@@ -329,7 +329,7 @@ let type_global global_string =
   try
     sync_typedefs ();
     let module LT = (val make_global_typer () : Logic_typing.S) in
-    let loc = Fileloc.unknown in
+    let loc = Ast_utils_compat.loc_unknown in
     match Logic_lexer.annot (fst loc, global_string) with
     | Some (_, Logic_ptree.Adecl decls) ->
       let globals = List.filter_map LT.annot decls in

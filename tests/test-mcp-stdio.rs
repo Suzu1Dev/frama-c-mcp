@@ -26,8 +26,8 @@
 //! frama-c subprocess) on a unique socket path, so tests can run in
 //! parallel without socket collisions.
 
-// Only for `suite_state_dir`: this suite spawns the server itself rather than
-// through `McpHandle`, but it needs the same per-run state directory.
+// Only for `test_state_dir`: this suite spawns the server itself rather than
+// through `McpHandle`, but it needs the same per-test state directory.
 #[path = "harness/mod.rs"]
 mod harness;
 
@@ -129,7 +129,7 @@ async fn spawn_mcp_client_inner(
             cmd.current_dir(cwd);
         }
         None => {
-            cmd.env("FRAMA_C_MCP_STATE_DIR", harness::suite_state_dir());
+            cmd.env("FRAMA_C_MCP_STATE_DIR", harness::test_state_dir());
         }
     }
 

@@ -29,7 +29,7 @@ let term_kind_to_string =
 let rec clause_metadata_of_property prop =
   let loc = Property.location prop in
   let loc_source =
-    if Fileloc.equal loc Fileloc.unknown then "unknown"
+    if Ast_utils_compat.loc_is_unknown loc then "unknown"
     else "property"
   in
   let names = Property.get_names prop in
@@ -181,7 +181,7 @@ let callee_context_of_property prop =
 
 let vc_loc_json prop steps =
   let prop_loc = Property.location prop in
-  if not (Fileloc.equal prop_loc Fileloc.unknown) then
+  if not (Ast_utils_compat.loc_is_unknown prop_loc) then
     (Ast_utils_ast.loc_to_json prop_loc, "high", "property")
   else
     match List.find_map (fun step ->
@@ -225,4 +225,3 @@ let step_to_json (step : Wp.Conditions.step) : Json.t option =
   | Wp.Conditions.Branch (p, _, _) -> make "branch" p
   | Wp.Conditions.Either _ | Wp.Conditions.State _
   | Wp.Conditions.Probe _ -> None
-

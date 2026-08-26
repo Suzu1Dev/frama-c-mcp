@@ -13,6 +13,7 @@ where
 {
     use serde::de::Error;
     let v: Option<serde_json::Value> = Option::deserialize(deserializer)?;
+
     // The arms yield the elements rather than the Value holding them. Yielding
     // the Value meant the two arms that had just proved it was an array handed
     // back something whose type had forgotten, so the line below had to assert

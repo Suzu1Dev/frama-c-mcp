@@ -204,13 +204,12 @@ let get_function_ast (kf : kernel_function) : Yojson.Basic.t =
   ]
 
 let loc_to_json loc =
-  if Fileloc.equal loc Fileloc.unknown then `Null
+  if Ast_utils_compat.loc_is_unknown loc then `Null
   else
-    let pos = fst loc in
     `Assoc [
-      ("file", `String (Filepath.to_string (Filepos.path pos)));
-      ("line", `Int (Filepos.line pos));
-      ("col", `Int (Filepos.input_column pos));
+      ("file", `String (Ast_utils_compat.loc_file loc));
+      ("line", `Int (Ast_utils_compat.loc_line loc));
+      ("col", `Int (Ast_utils_compat.loc_col loc));
     ]
 
 let stmt_kind_name s =
@@ -598,11 +597,25 @@ let post_clause_deps bhv (term_kind, ip) =
     `Assoc (("termination", `String (Cil_printer.get_termination_kind_name term_kind)) :: fields)
   | json -> json
 
+(* The text is real ACSL, so a reader can paste it back. That is a change from
+   the constructor dump this used to emit, which was only available on 33
+   anyway: Cil_types gained its deriving-show printers there, and 32.1 has no
+   Cil_types.pp_assigns at all.
+
+   WritesAny is spelled out rather than printed. Printer.pp_assigns emits
+   nothing for it, and an empty text reads as "assigns nothing" to anyone who
+   does not already know the constructor. WritesAny means the opposite: no
+   clause was written, so the function may write anything, which is the
+   unsound-by-default case a frame condition has to account for. *)
 let assigns_clause_deps bhv =
+  let text = match bhv.b_assigns with
+    | WritesAny -> "assigns \\everything;"
+    | Writes _ -> pp_to_string Printer.pp_assigns bhv.b_assigns
+  in
   `Assoc [
     ("kind", `String "assigns");
     ("behavior", `String bhv.b_name);
-    ("text", `String (pp_to_string Cil_types.pp_assigns bhv.b_assigns));
+    ("text", `String text);
     ("deps", logic_deps_of_assigns bhv.b_assigns);
   ]
 
@@ -971,23 +984,23 @@ class write_effects_visitor = object(self)
   method! vinst i =
     (match i with
      | Set (lv, _, loc) ->
-       self#add_write (Filepos.line (fst loc)) lv
+       self#add_write (Ast_utils_compat.loc_line loc) lv
      | Call (Some lv, fn, _, loc) ->
-       self#add_write (Filepos.line (fst loc)) lv;
+       self#add_write (Ast_utils_compat.loc_line loc) lv;
        (match fn with
         | Var vi -> self#add_callee vi
-        | _ -> self#add_unresolved "indirect_call" (Filepos.line (fst loc)))
+        | _ -> self#add_unresolved "indirect_call" (Ast_utils_compat.loc_line loc))
      | Call (None, fn, _, loc) ->
        (match fn with
         | Var vi -> self#add_callee vi
-        | _ -> self#add_unresolved "indirect_call" (Filepos.line (fst loc)))
+        | _ -> self#add_unresolved "indirect_call" (Ast_utils_compat.loc_line loc))
      | Asm (_, _, _, loc) ->
-       self#add_unresolved "inline_asm" (Filepos.line (fst loc))
+       self#add_unresolved "inline_asm" (Ast_utils_compat.loc_line loc)
      | Local_init (vi, ConsInit (callee, _, _), loc) ->
-       self#add_write (Filepos.line (fst loc)) (Var vi, NoOffset);
+       self#add_write (Ast_utils_compat.loc_line loc) (Var vi, NoOffset);
        self#add_callee callee
      | Local_init (vi, AssignInit _, loc) ->
-       self#add_write (Filepos.line (fst loc)) (Var vi, NoOffset)
+       self#add_write (Ast_utils_compat.loc_line loc) (Var vi, NoOffset)
      | _ -> ());
     DoChildren
 

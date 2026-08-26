@@ -16,6 +16,7 @@
   "A Frama-C plugin providing CIL AST to JSON conversion, ACSL string parsing/type-checking, and annotation insertion/removal via Frama-C Server requests")
  (depends
   (ocaml (>= 4.14))
-  (frama-c (>= 33.0))
+  (frama-c (>= 32.1))
+  (cppo :build)
   yojson
   dune))

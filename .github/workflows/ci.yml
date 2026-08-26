@@ -141,6 +141,7 @@ jobs:
           persist-credentials: false
 
       - name: Install WP provers (z3, cvc5)
+        timeout-minutes: 5
         run: |
           sudo apt-get update -y
           sudo apt-get install -y z3 cvc5
@@ -182,6 +183,14 @@ jobs:
       - name: Install Frama-C ${{ matrix.frama-c-version }} and Alt-Ergo 2.6.3
         if: steps.cache-opam.outputs.cache-hit != 'true'
         run: opam install -y frama-c.${{ matrix.frama-c-version }} alt-ergo.2.6.3
+
+      # Unconditional, unlike the Frama-C install above. cppo is the plug-in's
+      # preprocessor, it builds in seconds, and it is a no-op on a warm switch.
+      # Folding it into the cached step instead would mean a new cache key, and
+      # that discards a whole Frama-C switch, about ten minutes of from-source
+      # build, to add a package that takes one.
+      - name: Install cppo
+        run: opam install -y cppo
 
       - name: Check installed Frama-C and Alt-Ergo versions
         run: .ci/check-installed-versions.sh '${{ matrix.frama-c-version }}'
@@ -242,7 +251,61 @@ jobs:
           cargo test --test test-store-conclusion -- --test-threads=1
 
       - name: MCP stdio E2E tests
-        run: cargo test --test test-mcp-stdio --release -- --test-threads=1
+        # Parallel, unlike the gates above: every test in this suite owns its
+        # server, its frama-c and its state directory. See scripts/run-gates.sh
+        # for the measurement. libtest's default is available parallelism, so
+        # this follows the runner rather than pinning a count.
+        run: cargo test --test test-mcp-stdio --release
+
+  # The supported floor, compiled but not measured. The three shell gates in
+  # the lane above pin proved-goal counts to Frama-C 33.0 and Alt-Ergo 2.6.3,
+  # so they cannot answer here, and widening their version cases to admit 32.1
+  # would compare this lane's proofs against numbers measured somewhere else.
+  # What the floor actually claims is narrower: that the plug-in still compiles
+  # against the oldest Frama-C the opam constraint allows, and that its own
+  # OCaml regressions still pass there. That is what this lane checks, and
+  # until it existed nothing did: the version conditionals in ast-utils/src
+  # have one arm no other job ever reaches.
+  #
+  # The version is pinned in ci_builds_the_plugin_on_the_supported_floor
+  # against selfcheck::MIN_FRAMA_C_VERSION, so moving the floor without moving
+  # this fails the unit lane rather than going quiet.
+  plugin-floor:
+    name: ast-utils plugin on the supported floor
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Setup OCaml
+        uses: ocaml/setup-ocaml@v3
+        with:
+          ocaml-compiler: "4.14.2"
+
+      - name: Cache opam state (~/.opam + _opam)
+        id: cache-opam
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.opam
+            _opam
+          key: ${{ runner.os }}-opam-ocaml-4.14.2-frama-c-32.1-cppo-v1
+
+      - name: Install Frama-C 32.1 and cppo
+        if: steps.cache-opam.outputs.cache-hit != 'true'
+        run: opam install -y frama-c.32.1 cppo
+
+      - name: Check installed Frama-C version
+        run: opam exec -- frama-c -version
+
+      - name: ast-utils, build & install plugin
+        working-directory: ast-utils
+        run: |
+          opam exec -- dune build
+          opam exec -- dune install
+          opam exec -- dune runtest
 
   # The MCP server half of the product, prebuilt. The ast-utils plugin is not
   # here and cannot be: a .cmxs is tied to the exact OCaml and Frama-C the
@@ -309,7 +372,7 @@ jobs:
   # while the old release is still up, and cancel-in-progress is off for main so
   # nothing kills this job mid-window.
   release:
-    needs: [rust-quick, artifact-scans, integration, build]
+    needs: [rust-quick, artifact-scans, integration, plugin-floor, build]
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-24.04
     timeout-minutes: 15

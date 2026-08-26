@@ -185,11 +185,11 @@ and parse_additive ls fundec loc =
     match peek ls with
     | TkPlus ->
       ignore (next_token ls);
-      left := Cil.mkBinOp_exn ~loc PlusA !left
+      left := Ast_utils_compat.mk_binop ~loc PlusA !left
                 (parse_multiplicative ls fundec loc)
     | TkMinus ->
       ignore (next_token ls);
-      left := Cil.mkBinOp_exn ~loc MinusA !left
+      left := Ast_utils_compat.mk_binop ~loc MinusA !left
                 (parse_multiplicative ls fundec loc)
     | _ -> cont := false
   done;
@@ -202,15 +202,15 @@ and parse_multiplicative ls fundec loc =
     match peek ls with
     | TkStar ->
       ignore (next_token ls);
-      left := Cil.mkBinOp_exn ~loc Mult !left
+      left := Ast_utils_compat.mk_binop ~loc Mult !left
                 (parse_unary ls fundec loc)
     | TkSlash ->
       ignore (next_token ls);
-      left := Cil.mkBinOp_exn ~loc Div !left
+      left := Ast_utils_compat.mk_binop ~loc Div !left
                 (parse_unary ls fundec loc)
     | TkPercent ->
       ignore (next_token ls);
-      left := Cil.mkBinOp_exn ~loc Mod !left
+      left := Ast_utils_compat.mk_binop ~loc Mod !left
                 (parse_unary ls fundec loc)
     | _ -> cont := false
   done;
@@ -242,7 +242,7 @@ and parse_primary ls fundec loc =
         | TArray _ ->
           Cil.new_exp ~loc (Lval (Var vi, Index (idx, NoOffset)))
         | TPtr _ ->
-          let addr = Cil.mkBinOp_exn ~loc PlusPI (Cil.evar ~loc vi) idx in
+          let addr = Ast_utils_compat.mk_binop ~loc PlusPI (Cil.evar ~loc vi) idx in
           Cil.new_exp ~loc (Lval (Cil.mkMem ~addr ~off:NoOffset))
         | _ ->
           failwith (Printf.sprintf
@@ -376,7 +376,7 @@ let insert_ghost_global name typ init =
          let _ = Globals.Vars.find_from_astinfo name Global in
          raise (Failure (Printf.sprintf "global '%s' already exists" name))
        with Not_found -> ());
-      let loc = Fileloc.unknown in
+      let loc = Ast_utils_compat.loc_unknown in
       let vi = Cil.makeGlobalVar ~ghost:true ~temp:false ~loc name typ in
       vi.vdefined <- true;
       let initinfo = { init } in
@@ -410,7 +410,7 @@ let insert_ghost_lemma_function
          ignore (Globals.Vars.find_from_astinfo name Global);
          raise (Failure (Printf.sprintf "global '%s' already exists" name))
        with Not_found -> ());
-      let loc = Fileloc.unknown in
+      let loc = Ast_utils_compat.loc_unknown in
       let fun_typ =
         Cil_const.mk_tfun Cil_const.voidType
           (Some [(param_name, param_typ, [])]) false
@@ -421,7 +421,7 @@ let insert_ghost_lemma_function
       let param = Cil.makeFormalVar fundec param_name param_typ in
       Cil.setFormals fundec [param];
       let recursive_arg =
-        Cil.mkBinOp_exn ~loc MinusA (Cil.evar ~loc param) (Cil.integer ~loc 1)
+        Ast_utils_compat.mk_binop ~loc MinusA (Cil.evar ~loc param) (Cil.integer ~loc 1)
       in
       let call_stmt =
         Cil.mkStmtOneInstr ~ghost:true ~valid_sid:true
@@ -670,7 +670,7 @@ let insert_ghost_loop
         Cil.mkStmtOneInstr ~ghost:true ~valid_sid:true
           (Set
              (Cil.var vi,
-              Cil.mkBinOp_exn ~loc PlusA (Cil.evar ~loc vi) step,
+              Ast_utils_compat.mk_binop ~loc PlusA (Cil.evar ~loc vi) step,
               loc))
       in
       let loop_stmts =

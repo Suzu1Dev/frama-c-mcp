@@ -50,7 +50,18 @@ run()
 
         # The names, not the count. A flaky suite is only actionable if the run
         # that caught it says which test went.
-        grep -E '^test .*FAILED|^ *FAIL|^error(\[|:)' "$log" | sed 's/^/    /' | head -20
+        local detail
+        detail=$(grep -E '^test .*FAILED|^ *FAIL|^error(\[|:)' "$log" | head -20)
+
+        # A gate can fail without printing any of those. The three shell gates
+        # refuse a Frama-C whose proved-goal counts they were not measured
+        # under, which is what a 32.1 switch gets, and the refusal says so in
+        # prose. Printing nothing there reports a bare rc=1 and sends the
+        # reader to a log to learn something the runner already had.
+        if [ -z "$detail" ]; then
+            detail=$(tail -3 "$log")
+        fi
+        printf '%s\n' "$detail" | sed 's/^/    /'
         printf '    full log: %s\n' "$log"
     fi
 }
@@ -85,7 +96,13 @@ want abs-int && run abs-int scripts/check-abs-int-fixtures.sh
 want wp-model && run wp-model scripts/check-wp-model-fixtures.sh
 want artifacts && run artifacts scripts/check-artifacts.sh
 want corpus && run corpus scripts/check-tutorial-corpus.sh
-want stdio && run stdio cargo test --test test-mcp-stdio --release -- --test-threads=1
+# No --test-threads=1, unlike every other Frama-C gate here. Each of this
+# suite's 89 tests spawns its own server, its own frama-c and its own state
+# directory, so nothing is shared to serialise. Measured cold on 8 cores:
+# 1160.81s serial against 218.42s at libtest's default, both 89/89. The default
+# is available parallelism rather than a pinned number, so a 4-core runner gets
+# 4 and this does not oversubscribe whatever machine it lands on.
+want stdio && run stdio cargo test --test test-mcp-stdio --release
 
 if [ "$ran" -eq 0 ]; then
     echo "no gate matched: ${selected[*]:-}" >&2

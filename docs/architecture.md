@@ -125,6 +125,19 @@ Core reasons for choosing A:
 - Transmission: Unix Socket, custom framing (`S`+3 hex / `L`+7 hex length prefix)
 - `SET`/`EXEC` queued asynchronous - POLL is required to get the intermediate SIGNAL and the final result
 
+The supported range is Frama-C 32.1 through 33.0: 32.1 is the oldest the
+ast-utils plugin compiles against, and 33.0 is what CI measures proof counts
+under. Kernel APIs moved between the two. `ast-utils/src/ast_utils_compat.ml` wraps
+every difference a function can absorb (locations, `Cil.mkBinOp`), and
+`ast-utils/src/ast_utils_export.ml` carries the two that a wrapper cannot, the
+integer and float kind match arms, where a constructor exists on only one
+version. A dune rule
+records `frama-c -version` in a `framac-version` file and
+`ast-utils/scripts/cppo-frama-c.sh` reads the major from that file to pick the
+arm. The indirection is the point: an action whose inputs dune cannot see gets
+replayed from cache, so a lookup inside the script would pin the arm to
+whichever switch built the tree first.
+
 The framing and command set above are unchanged between Frama-C 31.0 and 33.0.
 Request names are not: 33.0 rejects the `plugins.eva.general.*` group that 31.0
 used, and drops `plugins.wp.setProvers`. The client tries the 33.0 name first

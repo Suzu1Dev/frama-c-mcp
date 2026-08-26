@@ -922,8 +922,8 @@ async fn a_refused_socket_is_retried_until_the_deadline() {
     let socket = dir.path().join("refuses.sock");
 
     // Binding and dropping leaves the path in place with nothing behind it,
-    // which is what the kernel answers ECONNREFUSED for. That is the same
-    // state Frama-C is in between bind and listen.
+    // which is what the kernel answers ECONNREFUSED for. That is the same state
+    // Frama-C is in between bind and listen.
     drop(tokio::net::UnixListener::bind(&socket).unwrap());
 
     let mut child = tokio::process::Command::new("sleep")

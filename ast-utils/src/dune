@@ -1,8 +1,37 @@
+; The Frama-C major the version conditionals in this directory key on.
+;
+; It has to be a file rather than something the preprocessor looks up itself.
+; dune caches an action against its declared inputs, and a script that asks the
+; switch for a version has no such input, so the cache replays the arm from
+; whichever Frama-C was on PATH the first time. That is silent and it produces a
+; plug-in compiled for the other release: measured here, a tree built on 32.1
+; and then rebuilt on 33.0 kept the 32.1 preprocessing and failed on match arms
+; for constructors 33 does have.
+;
+; (universe) marks the rule impure so dune reruns it every build, which costs
+; one banner for the directory rather than one per module. -no-autoload-plugins
+; because the banner does not depend on the plug-ins, and loading every .cmxs in
+; the switch to print it is the bulk of what "frama-c -version" costs.
+(rule
+ (targets framac-version)
+ (deps (universe))
+ (action
+  (with-stdout-to framac-version (run frama-c -no-autoload-plugins -version))))
+
 (library
  (name ast_utils)
  (public_name ast_utils.core)
  (libraries frama-c.kernel yojson)
  (modules :standard \ ast_utils_register ast_utils_property)
+ ; Named rather than library-wide: two of the nine modules carry version arms,
+ ; and listing them keeps that answerable from the build description instead of
+ ; by grepping for #if. A directive added to an unlisted module fails loudly, as
+ ; an OCaml syntax error, rather than building the wrong arm.
+ (preprocess
+  (per_module
+   ((action (run %{dep:../scripts/cppo-frama-c.sh} %{dep:framac-version} %{input-file}))
+    ast_utils_compat
+    ast_utils_export)))
  (flags :standard)
  (modes byte native)
  (wrapped false)
