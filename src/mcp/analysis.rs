@@ -4017,8 +4017,8 @@ impl FramaCMcpServer {
         &self,
         function: &str,
     ) -> Result<serde_json::Value, McpError> {
-        // One match, not two calls to scope_for_function. Asking twice meant the
-        // sandbox arm had to assert an experiment id the first call already
+        // One match, not two calls to scope_for_function. Asking twice meant
+        // the sandbox arm had to assert an experiment id the first call already
         // carried, and the main arm had to declare a sandbox unreachable
         // because the branch above had returned. Binding both arms here says
         // the same thing without either claim.

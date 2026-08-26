@@ -358,6 +358,7 @@ fn no_function_in_src_runs_past_the_length_ceiling() {
                 (start + 1..lines.len()).find(|&i| closes_at(lines[i], &close)) else {
                 continue;
             };
+
             // A sibling declaration at this indentation before the close means
             // the search ran past the real one, so the length would be this
             // function plus whatever followed it. Skip instead of reporting a
@@ -845,12 +846,46 @@ fn ci_builds_the_plugin_on_the_supported_floor() {
     // Whether, not where. cppo is deliberately installed by its own step in the
     // lane that caches its switch, because folding it into the cached install
     // would mean a new cache key and a new cache key discards a whole Frama-C
-    // build. Requiring it on the same line as frama-c would forbid that.
+    // build. Requiring it on the same line as frama-c would forbid that. Per
+    // job, not per file. cppo is a build tool nothing else pulls in, so every
+    // lane that builds the plug-in needs its own install of it. Two weaker
+    // shapes both pass while a lane goes without: searching the whole file for
+    // "opam install" and for "cppo" separately is satisfied by a cache key, a
+    // step name, or a comment, and even requiring both on one line is satisfied
+    // by whichever other lane still installs it.
+    let ci = std::fs::read_to_string(root.join(".github/workflows/ci.yml")).expect("ci.yml");
+    let mut jobs: Vec<(String, String)> = Vec::new();
+    for line in ci.lines() {
+        let is_job_header = line.starts_with("  ")
+            && !line.starts_with("   ")
+            && line.trim_end().ends_with(':')
+            && !line.trim_start().starts_with('#');
+        if is_job_header {
+            jobs.push((line.trim().trim_end_matches(':').to_string(), String::new()));
+        } else if let Some((_, body)) = jobs.last_mut() {
+            body.push_str(line);
+            body.push('\n');
+        }
+    }
+
+    let plugin_builders: Vec<&(String, String)> = jobs
+        .iter()
+        .filter(|(_, body)| body.contains("dune build"))
+        .collect();
     assert!(
-        workflow.contains("opam install") && workflow.contains("cppo"),
-        "no CI step installs cppo, which ast-utils/src/dune runs over the \
-         modules carrying version conditionals"
+        !plugin_builders.is_empty(),
+        "no ci.yml job runs dune build, so this guard compared nothing"
     );
+    for (name, body) in plugin_builders {
+        assert!(
+            body.lines()
+                .map(str::trim)
+                .any(|line| line.contains("opam install") && line.contains("cppo")),
+            "ci.yml job {name} builds the plug-in but installs no cppo, which \
+             ast-utils/src/dune runs over the modules carrying version \
+             conditionals"
+        );
+    }
 
     // The install step is skipped on a cache hit, so the key decides what the
     // lane actually restores. Asserted as presence of the floor's own key

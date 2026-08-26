@@ -372,7 +372,7 @@ jobs:
   # while the old release is still up, and cancel-in-progress is off for main so
   # nothing kills this job mid-window.
   release:
-    needs: [rust-quick, artifact-scans, integration, build]
+    needs: [rust-quick, artifact-scans, integration, plugin-floor, build]
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-24.04
     timeout-minutes: 15

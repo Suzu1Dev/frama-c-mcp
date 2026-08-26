@@ -122,8 +122,14 @@ def is_published(rel_path):
 # This is the one check here that cannot fire in CI, where a checkout is tracked
 # by definition. That is the argument for it rather than against it: the mistake
 # is local, so the catch has to be local too.
+# The build roots, not `roots`. `roots` also covers docs/, .github/ and the
+# markdown at the top, where an untracked draft is ordinary work in progress
+# rather than a missing build input; failing the gate on those would train a
+# reader to ignore it. A source tree is different: nothing there is meant to be
+# untracked, because the build reads it.
+build_roots = ["Cargo.toml", "Cargo.lock", "build.rs", ".cargo", "src", "tests", "scripts", ".ci", "ast-utils"]
 untracked = subprocess.run(
-    ["git", "ls-files", "--others", "--exclude-standard", "--"] + [str(r) for r in roots],
+    ["git", "ls-files", "--others", "--exclude-standard", "--"] + build_roots,
     capture_output=True,
     text=True,
 )

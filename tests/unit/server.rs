@@ -368,8 +368,8 @@ fn frama_c_version_prefers_the_first_dotted_number_outside_parens() {
     assert_eq!(version("32.10 (nothing)"), Some((32, 10)));
 
     // No minor is a zero rather than a failure: "34" and "34.0" are one
-    // release, and a floor with a minor in it must not reject the bare form
-    // of a version above it.
+    // release, and a floor with a minor in it must not reject the bare form of
+    // a version above it.
     assert_eq!(version("34"), Some((34, 0)));
 
     // A minor too large to parse falls to 0, which is older than any floor
@@ -2152,4 +2152,63 @@ fn supported_protocol_versions_cover_every_known_revision() {
 
     // The fallback has to be one this server would actually agree to.
     assert!(SUPPORTED_PROTOCOL_VERSIONS.contains(&FALLBACK_PROTOCOL_VERSION));
+}
+
+/// Concurrent writers of one state directory keep every sandbox entry.
+///
+/// remember_sandbox_metadata is a load, edit, store over a single JSON array.
+/// Making each write land whole is not enough: two writers both read the array
+/// before either stores it, so the later store is computed from a state that
+/// predates the earlier one and drops its entry. Nothing errors, the sandbox is
+/// simply not in the list, and the server that created it later reports it
+/// missing. The fix is an advisory lock across the whole sequence, and this is
+/// what fails without it.
+///
+/// Threads rather than processes because flock is per open file description
+/// and these open the lock file separately, which is the same contention two
+/// servers produce. Sixteen writers against one directory, because the window
+/// is small and one pair rarely lands inside it.
+#[test]
+fn concurrent_sandbox_writers_do_not_drop_each_others_entries() {
+    use frama_c_mcp::mcp::store;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let base = dir.path().to_path_buf();
+    const WRITERS: usize = 16;
+
+    std::thread::scope(|scope| {
+        for n in 0..WRITERS {
+            let base = base.clone();
+            scope.spawn(move || {
+                // The loader drops any entry whose paths are not the ones it
+                // would derive itself, so these have to be the real shape or
+                // the assertion below passes for the wrong reason.
+                let id = format!("exp{n}");
+                let sandbox_dir = store::expected_sandbox_dir(&base, &id);
+                let entry = frama_c_mcp::state::SandboxMetadata {
+                    experiment_id: id,
+                    original_function: "f".into(),
+                    sandbox_socket: sandbox_dir.join("frama-c.sock"),
+                    sandbox_dir,
+                    sandbox_pid: 0,
+                    declaration_marker: "#F1".into(),
+                    created_at: String::new(),
+                    last_activity: String::new(),
+                    deleted: false,
+                    command_line: Vec::new(),
+                    stdout_log_path: None,
+                    stderr_log_path: None,
+                    startup_stderr_tail: None,
+                };
+                store::remember_sandbox_metadata_at(&base, &entry).expect("remember");
+            });
+        }
+    });
+
+    let found = store::load_sandbox_metadata_from_disk(&base);
+    let mut ids: Vec<&str> = found.iter().map(|s| s.experiment_id.as_str()).collect();
+    ids.sort();
+    let mut want: Vec<String> = (0..WRITERS).map(|n| format!("exp{n}")).collect();
+    want.sort();
+    assert_eq!(ids, want, "a concurrent writer's entry was dropped");
 }

@@ -249,6 +249,78 @@ pub fn persist_program_state(state: &ProjectVerificationState) -> std::io::Resul
     persist_program_state_at(&conclusion_base_dir(), state)
 }
 
+/// Prefix for this module's in-flight writes. A crash between create and
+/// rename leaves one behind, and the prefix is how sweep_writer_temp_files
+/// tells those from anything else in the directory.
+const WRITER_TMP_PREFIX: &str = ".frama-c-mcp-write-";
+
+/// How stale an in-flight write must look before it counts as debris.
+///
+/// A real write is open for the length of one serialize and one rename, so
+/// milliseconds. Anything of this age is from a process that is gone.
+const WRITER_TMP_STALE: std::time::Duration = std::time::Duration::from_secs(3600);
+
+/// Delete leftover in-flight writes from a state directory.
+///
+/// Age-gated rather than unconditional, and that is the whole difficulty. The
+/// obvious version sweeps at startup on the theory that nothing of ours is in
+/// flight then, but the case this module exists to handle is several servers
+/// sharing one directory: one starting up while another is mid-write would
+/// delete a live temp file and turn a fixed bug back into a worse one. An hour
+/// is far outside any real write and far inside any useful cleanup.
+///
+/// Failures are ignored throughout. This is tidying, and a state directory that
+/// cannot be read or swept is a problem the caller will hit on its own terms.
+pub fn sweep_writer_temp_files(base_dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(base_dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let is_ours = entry
+            .file_name()
+            .to_str()
+            .is_some_and(|name| name.starts_with(WRITER_TMP_PREFIX));
+        if !is_ours {
+            continue;
+        }
+        let stale = entry
+            .metadata()
+            .and_then(|meta| meta.modified())
+            .is_ok_and(|at| at.elapsed().is_ok_and(|age| age > WRITER_TMP_STALE));
+        if stale {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}
+
+/// Hold the state directory against other servers for the duration.
+///
+/// write_json_atomic makes one write land whole; it does not make a
+/// load-modify-store sequence safe, because the two readers both see the state
+/// before either write. Two servers registering sandboxes then lose one entry
+/// with no error anywhere. The lock is advisory and process-wide, which is
+/// exactly the scope of the problem: the contending writers are separate
+/// frama-c-mcp processes pointed at one directory.
+///
+/// The lock is released when the returned file is dropped, and by the kernel if
+/// the process dies holding it, so a crash cannot wedge the directory.
+fn lock_state_dir(base_dir: &Path) -> std::io::Result<std::fs::File> {
+    use std::os::unix::io::AsRawFd;
+
+    std::fs::create_dir_all(base_dir)?;
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(base_dir.join(".lock"))?;
+
+    // SAFETY: flock takes a valid descriptor and touches no memory of ours.
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(file)
+}
+
 /// Serialize to `path`, atomically, without a temp name a second writer can
 /// collide on.
 ///
@@ -277,7 +349,15 @@ fn write_json_atomic(path: &Path, value: &impl serde::Serialize) -> std::io::Res
     std::fs::create_dir_all(dir)?;
     let json = serde_json::to_string_pretty(value)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-    let mut tmp = tempfile::NamedTempFile::new_in(dir)?;
+
+    // Named so a leftover is recognisable. The old fixed ".json.tmp" was
+    // self-limiting, a crash mid-write left one file and the next write reused
+    // it; a random name leaves a new one every time, so the prefix is what lets
+    // a reader tell this program's debris from a file it should keep.
+    let mut tmp = tempfile::Builder::new()
+        .prefix(WRITER_TMP_PREFIX)
+        .suffix(".json")
+        .tempfile_in(dir)?;
     std::io::Write::write_all(&mut tmp, json.as_bytes())?;
     tmp.persist(path).map_err(|e| e.error)?;
     Ok(())
@@ -450,17 +530,31 @@ pub fn persist_sandbox_metadata_at(
     write_json_atomic(&sandbox_metadata_file(base_dir), &sandboxes)
 }
 
-pub fn remember_sandbox_metadata(metadata: &SandboxMetadata) -> std::io::Result<()> {
-    let base_dir = conclusion_base_dir();
-    let mut sandboxes = load_sandbox_metadata_from_disk(&base_dir);
+/// Record a sandbox in `base_dir`, against other writers of that directory.
+///
+/// Takes base_dir so a test can drive concurrent writers at one directory
+/// without setting FRAMA_C_MCP_STATE_DIR, which is process-global and would
+/// race every other test in the run. Same reason persist_conclusion_at and
+/// persist_program_state_at are split this way.
+pub fn remember_sandbox_metadata_at(
+    base_dir: &Path,
+    metadata: &SandboxMetadata,
+) -> std::io::Result<()> {
+    let _guard = lock_state_dir(base_dir)?;
+    let mut sandboxes = load_sandbox_metadata_from_disk(base_dir);
     sandboxes.retain(|sandbox| sandbox.experiment_id != metadata.experiment_id);
     sandboxes.push(metadata.clone());
     sandboxes.sort_by(|left, right| left.experiment_id.cmp(&right.experiment_id));
-    persist_sandbox_metadata_at(&base_dir, &sandboxes)
+    persist_sandbox_metadata_at(base_dir, &sandboxes)
+}
+
+pub fn remember_sandbox_metadata(metadata: &SandboxMetadata) -> std::io::Result<()> {
+    remember_sandbox_metadata_at(&conclusion_base_dir(), metadata)
 }
 
 pub fn mark_sandbox_metadata_deleted(experiment_id: &str) -> std::io::Result<()> {
     let base_dir = conclusion_base_dir();
+    let _guard = lock_state_dir(&base_dir)?;
     let mut sandboxes = load_sandbox_metadata_from_disk(&base_dir);
     for sandbox in &mut sandboxes {
         if sandbox.experiment_id == experiment_id {
