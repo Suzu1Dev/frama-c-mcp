@@ -226,13 +226,7 @@ pub fn persist_conclusion_at(
         }
     }
 
-    let meta_path = dir.join("meta.json");
-    let tmp = meta_path.with_extension("json.tmp");
-    let json = serde_json::to_string_pretty(&value)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-    std::fs::write(&tmp, json)?;
-    std::fs::rename(&tmp, &meta_path)?;
-    Ok(())
+    write_json_atomic(&dir.join("meta.json"), &value)
 }
 
 /// Prod entry: Use the default `.frama-c-mcp/` as base_dir to persist
@@ -246,20 +240,47 @@ pub fn persist_conclusion(func: &str, conclusion: &FunctionVerificationState) ->
 /// `persist_program_state`.
 pub fn persist_program_state_at(base_dir: &Path, state: &ProjectVerificationState)
     -> std::io::Result<()> {
-    std::fs::create_dir_all(base_dir)?;
-    let path = base_dir.join("_program.json");
-    let tmp = path.with_extension("json.tmp");
-    let json = serde_json::to_string_pretty(state)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-    std::fs::write(&tmp, json)?;
-    std::fs::rename(&tmp, &path)?;
-    Ok(())
+    write_json_atomic(&base_dir.join("_program.json"), state)
 }
 
 /// Prod entry: Use the default `.frama-c-mcp/` as base_dir to persist
 /// `_program.json`.
 pub fn persist_program_state(state: &ProjectVerificationState) -> std::io::Result<()> {
     persist_program_state_at(&conclusion_base_dir(), state)
+}
+
+/// Serialize to `path`, atomically, without a temp name a second writer can
+/// collide on.
+///
+/// Every persisted file here used to be written as `<target>.json.tmp` and then
+/// renamed. The rename is atomic, the temp name is not: two servers sharing one
+/// state directory pick the same `.tmp` path, interleave their writes into it,
+/// and rename the mixture over the real file. That is not only a test concern,
+/// the default state directory is `.frama-c-mcp/` relative to the working
+/// directory, so it is any two servers started in one project.
+///
+/// NamedTempFile picks a name that cannot be pre-empted and creates it in the
+/// destination directory, so the persist stays a same-filesystem rename. It
+/// also creates at 0600 rather than at the umask, which the file inherits
+/// through the rename. That is the posture this directory already has:
+/// ensure_private_dir makes it 0700 and refuses one that is readable by others,
+/// and the contents are absolute local paths and pids.
+fn write_json_atomic(path: &Path, value: &impl serde::Serialize) -> std::io::Result<()> {
+    // Path::parent answers Some("") for a bare file name, not None, and a temp
+    // file cannot be created in "". Both spellings mean the working directory,
+    // which is reachable here: FRAMA_C_MCP_STATE_DIR set to an empty string
+    // makes conclusion_base_dir join to exactly that shape.
+    let dir = match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
+    };
+    std::fs::create_dir_all(dir)?;
+    let json = serde_json::to_string_pretty(value)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    let mut tmp = tempfile::NamedTempFile::new_in(dir)?;
+    std::io::Write::write_all(&mut tmp, json.as_bytes())?;
+    tmp.persist(path).map_err(|e| e.error)?;
+    Ok(())
 }
 
 pub fn sandbox_metadata_file(base_dir: &Path) -> PathBuf {
@@ -426,14 +447,7 @@ pub fn persist_sandbox_metadata_at(
     base_dir: &Path,
     sandboxes: &[SandboxMetadata],
 ) -> std::io::Result<()> {
-    std::fs::create_dir_all(base_dir)?;
-    let path = sandbox_metadata_file(base_dir);
-    let tmp = path.with_extension("json.tmp");
-    let json = serde_json::to_string_pretty(sandboxes)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-    std::fs::write(&tmp, json)?;
-    std::fs::rename(&tmp, &path)?;
-    Ok(())
+    write_json_atomic(&sandbox_metadata_file(base_dir), &sandboxes)
 }
 
 pub fn remember_sandbox_metadata(metadata: &SandboxMetadata) -> std::io::Result<()> {
