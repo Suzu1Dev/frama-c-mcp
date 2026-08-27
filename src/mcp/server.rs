@@ -1806,6 +1806,10 @@ pub struct ProjectLoadOptions {
 struct SandboxRuntime {
     client: Arc<FramaCClient>,
     child: Arc<AsyncMutex<Option<tokio::process::Child>>>,
+    /// Same role as the server's main_wp_lock, for this sandbox's process:
+    /// one run_wp transaction (config, schedule, drain, fetch) at a time.
+    /// Kept on the entry so delete_sandbox drops the lock with the sandbox.
+    wp_lock: Arc<AsyncMutex<()>>,
 }
 
 #[derive(Clone)]
@@ -1838,6 +1842,12 @@ impl SandboxRegistry {
         })
     }
 
+    fn wp_lock(&self, experiment_id: &str) -> Option<Arc<AsyncMutex<()>>> {
+        self.entries
+            .get(experiment_id)
+            .map(|entry| entry.runtime.wp_lock.clone())
+    }
+
     pub fn metadata_list(&self) -> Vec<SandboxMetadata> {
         self.entries
             .values()
@@ -1858,6 +1868,7 @@ impl SandboxRegistry {
                 runtime: SandboxRuntime {
                     client,
                     child: Arc::new(AsyncMutex::new(Some(child))),
+                    wp_lock: Arc::new(AsyncMutex::new(())),
                 },
             },
         );
@@ -1951,6 +1962,21 @@ pub struct FramaCMcpServer {
     /// apart, so the waiter reads this counter before scheduling and again
     /// after draining, and a change means somebody stopped its run.
     wp_cancel_epoch: Arc<std::sync::atomic::AtomicU64>,
+    /// Held across a whole run_wp transaction on the main instance: config,
+    /// schedule, drain, and goal fetch.
+    ///
+    /// WP's config, scheduler, and goal table are process-global state, while
+    /// the client mutex covers one request only. Two runs that interleave see
+    /// the second one's config govern the first one's goals, and both fetch
+    /// the union of the shared goal table, so each reports goals it never
+    /// scheduled. Held from before apply_wp_config to the end of the handler.
+    ///
+    /// cancel_wp_queue stays outside this lock on purpose: it is the way out
+    /// of a run that is holding it, and taking the lock there would deadlock
+    /// the escape.
+    ///
+    /// Outermost lock: taken before the client lock, never inside it.
+    main_wp_lock: Arc<AsyncMutex<()>>,
     tool_router: ToolRouter<Self>,
 }
 
@@ -2522,6 +2548,7 @@ impl FramaCMcpServer {
             main_spawn_lock: Arc::new(AsyncMutex::new(())),
             project_locked: Arc::new(RwLock::new(false)),
             wp_cancel_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            main_wp_lock: Arc::new(AsyncMutex::new(())),
             tool_router: Self::tool_router(),
         }
     }
@@ -2681,6 +2708,18 @@ impl FramaCMcpServer {
                 })
                 .await;
         }
+
+        // One WP transaction per sandbox process, same reason as main_wp_lock
+        // on the main path: config through goal fetch must not interleave with
+        // a second run on this sandbox. The registry read ends before the
+        // await, so the registry lock plays no part in the hold.
+        let wp_lock = {
+            let sandboxes = self.sandboxes.read().await;
+            sandboxes
+                .wp_lock(exp_id)
+                .ok_or_else(|| sandbox_not_found_err(exp_id, &sandboxes.keys()))?
+        };
+        let _wp_op_guard = wp_lock.lock().await;
 
         self.apply_wp_config(client, params, requested_provers.as_ref())
             .await?;

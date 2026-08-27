@@ -3321,6 +3321,14 @@ impl FramaCMcpServer {
                 .await;
         }
 
+        // Held across the whole transaction below: config, target resolution,
+        // scheduling, drain, and goal fetch all act on process-global WP state,
+        // and the client mutex only covers one request at a time. Without
+        // this, two concurrent runs overwrite each other's config mid-flight
+        // and each reports the union of both runs' goals. cancel_wp_queue
+        // takes no lock, so a run stuck in drain can still be cancelled.
+        let _wp_op_guard = self.main_wp_lock.lock().await;
+
         // Recorded, not enforced. Frama-C aborts on SOME memory model changes
         // within one process and not others: Typed+cast to Typed+nocast is
         // routine and the suite depends on it, while Bytes to Typed+cast comes
