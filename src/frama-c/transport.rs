@@ -6,6 +6,13 @@ use tokio::net::UnixStream;
 use super::codec;
 use crate::error::FramaCError;
 
+/// Bound on a single frame write. A healthy server drains its socket
+/// promptly; if a write stalls past this, the server is wedged. Without a
+/// timeout the write blocks while the caller holds the client mutex, which
+/// freezes every subsequent request, including the poll loop that is meant
+/// to enforce request timeouts.
+const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
+
 pub struct Transport {
     stream: UnixStream,
     read_buf: BytesMut,
@@ -22,7 +29,10 @@ impl Transport {
 
     pub async fn send_frame(&mut self, payload: &str) -> Result<(), FramaCError> {
         let frame = codec::encode_frame(payload);
-        self.stream.write_all(&frame).await?;
+        match tokio::time::timeout(WRITE_TIMEOUT, self.stream.write_all(&frame)).await {
+            Ok(res) => res?,
+            Err(_) => return Err(FramaCError::Timeout(WRITE_TIMEOUT)),
+        }
         Ok(())
     }
 
