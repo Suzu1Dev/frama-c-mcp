@@ -3329,6 +3329,18 @@ impl FramaCMcpServer {
         // takes no lock, so a run stuck in drain can still be cancelled.
         let _wp_op_guard = self.main_wp_lock.lock().await;
 
+        // Rechecked under the lock: verify_program_step can set the flag
+        // while this call waits for a run ahead of it, and the check at
+        // the top of the handler was read before that wait.
+        if *self.project_locked.read().await {
+            return Err(project_locked_error(
+                "run_wp",
+                "Project is locked. run_wp is blocked during Phase 2 to prevent state pollution. \
+                 If you are in verify-function, pass sandbox-prefixed functions. \
+                 Do NOT touch the main Frama-C instance. Call verify_program_step with lock_project=false first if this is the final main-project gate.",
+            ));
+        }
+
         // Recorded, not enforced. Frama-C aborts on SOME memory model changes
         // within one process and not others: Typed+cast to Typed+nocast is
         // routine and the suite depends on it, while Bytes to Typed+cast comes
