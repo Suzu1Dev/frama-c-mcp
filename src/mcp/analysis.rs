@@ -4472,7 +4472,16 @@ impl FramaCMcpServer {
                 .await?,
         );
 
+        // The writer takes the WP transaction lock too: setting the flag
+        // declares that no WP run is mutating the main instance from here
+        // on, and without the lock that declaration can go out while a run
+        // that rechecked the flag is still mid-flight. Queuing behind it
+        // makes the ordering real; the recheck in run_wp closes the other
+        // half, a run starting after the flag is already set. This can wait
+        // as long as a run can; cancel_wp_queue takes no lock and remains
+        // the escape.
         if params.lock_project != Some(false) {
+            let _wp_op_guard = self.main_wp_lock.lock().await;
             *self.project_locked.write().await = true;
         }
         let project_locked = *self.project_locked.read().await;
