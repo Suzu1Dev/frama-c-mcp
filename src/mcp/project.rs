@@ -129,6 +129,22 @@ impl FramaCMcpServer {
         };
         validate_project_options(&project_options)?;
 
+        // Serialized with run_wp on the main instance: the steps below
+        // read the live instance (marker snapshot) and ensure_main_spawned
+        // can respawn or re-parse the very process a proof run is draining
+        // on. The flag is rechecked under the lock because
+        // verify_program_step can set it while this call waits for a run
+        // ahead of it.
+        let _wp_op_guard = self.main_wp_lock.lock().await;
+        if *self.project_locked.read().await {
+            return Err(project_locked_error(
+                "reload_project",
+                "Project is locked. reload_project is blocked during Phase 2 to prevent annotation loss. \
+                 If you are verifying in a sandbox, do NOT call reload_project; use create_sandbox or delete_sandbox instead. \
+                 Call verify_program_step with lock_project=false first if this is the final main-project gate.",
+            ));
+        }
+
         let previous_markers = {
             let client = self.client.lock().await.clone();
             match client {
