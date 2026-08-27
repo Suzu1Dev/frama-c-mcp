@@ -1808,7 +1808,8 @@ struct SandboxRuntime {
     child: Arc<AsyncMutex<Option<tokio::process::Child>>>,
     /// Same role as the server's main_wp_lock, for this sandbox's process:
     /// one run_wp transaction (config, schedule, drain, fetch) at a time.
-    /// Kept on the entry so delete_sandbox drops the lock with the sandbox.
+    /// Waiters clone the Arc, so the lock can outlive the entry it came
+    /// from; run_wp_on_sandbox re-checks membership after acquiring it.
     wp_lock: Arc<AsyncMutex<()>>,
 }
 
@@ -2720,6 +2721,23 @@ impl FramaCMcpServer {
                 .ok_or_else(|| sandbox_not_found_err(exp_id, &sandboxes.keys()))?
         };
         let _wp_op_guard = wp_lock.lock().await;
+
+        // A delete_sandbox that landed while this call waited has already
+        // removed the entry and killed the process; the cloned Arc above
+        // kept the lock alive, so acquiring it says nothing about the
+        // sandbox still existing. Re-check membership before touching the
+        // client: same id, and the same lock instance, since a re-created
+        // sandbox under a reused id gets a fresh lock this waiter never
+        // queued for.
+        {
+            let sandboxes = self.sandboxes.read().await;
+            let still_registered = sandboxes
+                .wp_lock(exp_id)
+                .is_some_and(|current| Arc::ptr_eq(&current, &wp_lock));
+            if !still_registered {
+                return Err(sandbox_not_found_err(exp_id, &sandboxes.keys()));
+            }
+        }
 
         self.apply_wp_config(client, params, requested_provers.as_ref())
             .await?;
