@@ -1972,6 +1972,15 @@ pub struct FramaCMcpServer {
     /// the union of the shared goal table, so each reports goals it never
     /// scheduled. Held from before apply_wp_config to the end of the handler.
     ///
+    /// What a waiter can end up waiting on: the proof loop budgets
+    /// WP_PROOF_BUDGET (600s) per function, the drain up to WP_DRAIN_BUDGET,
+    /// and the timeout-retry pass runs proof and drain again, so a stuck
+    /// multi-function run holds this far past any client timeout.
+    /// reload_project (re-parse) and verify_program_step (the lock write)
+    /// queue here too, and the re-parse has no budget of its own. A
+    /// disconnected MCP client shortens none of this: request cancellation
+    /// is cooperative, so the handler runs to completion.
+    ///
     /// cancel_wp_queue stays outside this lock on purpose: it is the way out
     /// of a run that is holding it, and taking the lock there would deadlock
     /// the escape.
