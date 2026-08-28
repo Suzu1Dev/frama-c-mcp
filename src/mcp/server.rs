@@ -2754,6 +2754,17 @@ impl FramaCMcpServer {
                 .ok_or_else(|| sandbox_not_found_err(exp_id, &sandboxes.keys()))?
         };
 
+        // A delete can still land after this point: cleanup_sandbox never
+        // takes wp_lock, on purpose. A WP run can hold this lock for tens
+        // of minutes, and delete_sandbox is the force-kill escape for a
+        // wedged sandbox, so queuing deletion behind the lock would remove
+        // the only way to kill one. A delete that lands mid-run kills the
+        // process group, and the next request on this client fails with a
+        // broken pipe rather than silently corrupting the run. The cloned
+        // client is bound to the killed process's pipes, so it can never
+        // reach a sandbox recreated under the same id, and sandbox clients
+        // never respawn (that path is main-instance-only), so nothing
+        // outlives the kill.
         self.apply_wp_config(&client, params, requested_provers.as_ref())
             .await?;
 
