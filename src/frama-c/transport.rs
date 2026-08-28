@@ -1,4 +1,6 @@
 use bytes::{Buf, BufMut, BytesMut};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
@@ -25,15 +27,13 @@ pub struct Transport {
     /// on every later use; recovery is a new Transport, which the session
     /// gets through the respawn path in ensure_main_spawned.
     ///
-    /// The respawn is not automatic yet. ensure_main_spawned decides
-    /// in-place vs respawn from MainFramaCState alone and never looks at
-    /// this flag, so the first reload with explicit files still fails in
-    /// place (which marks the session poisoned) and only the second one
-    /// respawns; a reload without files never gets that far, because it
-    /// asks this dead transport for the current file list first. Sandbox
-    /// clients have no respawn path at all. Surfacing this flag to the
-    /// respawn decision is a planned follow-up.
-    poisoned: bool,
+    /// Shared with the FramaCClient that owns this transport, so
+    /// ensure_main_spawned can read it without taking the request lock.
+    /// It is the last disjunct of the respawn decision there, so the first
+    /// reload with files respawns instead of failing in place and marking
+    /// the session poisoned for the next caller to find. Sandbox clients
+    /// still have no respawn path at all.
+    poisoned: Arc<AtomicBool>,
 }
 
 impl Transport {
@@ -42,12 +42,12 @@ impl Transport {
         Ok(Transport {
             stream,
             read_buf: BytesMut::with_capacity(8192),
-            poisoned: false,
+            poisoned: Arc::new(AtomicBool::new(false)),
         })
     }
 
     pub async fn send_frame(&mut self, payload: &str) -> Result<(), FramaCError> {
-        if self.poisoned {
+        if self.poisoned.load(Ordering::Relaxed) {
             return Err(poisoned_transport());
         }
         let frame = codec::encode_frame(payload);
@@ -62,7 +62,7 @@ impl Transport {
         &mut self,
         timeout: Duration,
     ) -> Result<Option<String>, FramaCError> {
-        if self.poisoned {
+        if self.poisoned.load(Ordering::Relaxed) {
             return Err(poisoned_transport());
         }
         loop {
@@ -97,9 +97,16 @@ impl Transport {
     /// completion can have left a partial frame in the socket, and no
     /// later frame may follow it on this stream.
     async fn poison(&mut self, error: FramaCError) -> FramaCError {
-        self.poisoned = true;
+        self.poisoned.store(true, Ordering::Relaxed);
         let _ = self.stream.shutdown().await;
         error
+    }
+
+    /// A shared handle on the poison flag. The FramaCClient takes one at
+    /// connect so it can answer is_poisoned without taking the request
+    /// lock that guards this transport.
+    pub fn poison_flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.poisoned)
     }
 }
 
