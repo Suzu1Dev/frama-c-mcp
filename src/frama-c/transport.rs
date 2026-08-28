@@ -24,6 +24,15 @@ pub struct Transport {
     /// command. Poisoning turns that silent corruption into a fast error
     /// on every later use; recovery is a new Transport, which the session
     /// gets through the respawn path in ensure_main_spawned.
+    ///
+    /// The respawn is not automatic yet. ensure_main_spawned decides
+    /// in-place vs respawn from MainFramaCState alone and never looks at
+    /// this flag, so the first reload with explicit files still fails in
+    /// place (which marks the session poisoned) and only the second one
+    /// respawns; a reload without files never gets that far, because it
+    /// asks this dead transport for the current file list first. Sandbox
+    /// clients have no respawn path at all. Surfacing this flag to the
+    /// respawn decision is a planned follow-up.
     poisoned: bool,
 }
 
