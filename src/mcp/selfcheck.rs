@@ -376,15 +376,32 @@ async fn probe_requests(
     // yet, so retry a refused connect for a few seconds. One throwaway
     // connection is not an option here: Frama-C answers its first client and
     // leaves the second waiting, which is what the batching below is about.
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    // Shaped like connect_when_listening, and reporting like it, because it is
+    // the same bind/listen race on a deadline 120 times shorter. It says so in
+    // the same words on the way out, since a refusal reported any other way
+    // reads as a bug the retry does not reach, and it counts absorbed refusals
+    // the same way, since a race this loop swallows is otherwise invisible to
+    // the drift count. See scripts/check-stdio-refusal.sh for both.
+    let deadline = std::time::Instant::now() + PROBE_CONNECT_BUDGET;
+    let mut refusals = 0u32;
     let mut transport = loop {
         match Transport::connect(socket_path).await {
-            Ok(transport) => break transport,
-            Err(e) if socket_not_listening_yet(&e) && std::time::Instant::now() < deadline => {
+            Ok(transport) => {
+                if refusals > 0 {
+                    tracing::warn!(socket = socket_path, refusals, "{RECOVERED_RACE}");
+                }
+                break transport;
+            }
+            Err(e) if socket_not_listening_yet(&e) => {
+                if std::time::Instant::now() >= deadline {
+                    let reason = never_listened(socket_path, PROBE_CONNECT_BUDGET, &e);
+                    return not_probed_requests(requests, &reason);
+                }
+                refusals += u32::from(socket_refused(&e));
                 tokio::time::sleep(Duration::from_millis(25)).await;
             }
             Err(e) => {
-                return not_probed_requests(requests, &format!("probe connection failed: {e}"))
+                return not_probed_requests(requests, &format!("probe connection failed: {e}"));
             }
         }
     };

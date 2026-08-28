@@ -6641,6 +6641,63 @@ async fn self_check_canary_judges_the_backend_without_disturbing_the_session() {
     let _ = client.cancel().await;
 }
 
+/// self_check reached its probe, rather than reporting every request unprobed.
+///
+/// The probe's give-up now says "never listened", which is the wording
+/// scripts/check-stdio-refusal.sh reads as a diagnosed bind/listen race and
+/// filters out of its search for an unexplained refusal. That is right for
+/// connect_when_listening, whose message rides an Err into a failed tool call
+/// and reddens whichever test produced it. It is not right here, because an
+/// unreached probe is only a field in a payload: a probe that timed out under
+/// the parallel suite turned every request into not_probed, the tripwire
+/// filtered the line, and nothing at all went red.
+///
+/// Asserted on the reason and not the status, because not_probed is also the
+/// honest answer for the requests self_check deliberately does not call. Those
+/// carry one fixed reason; every other reason means the probe could not run and
+/// the report says nothing about the plugin.
+#[tokio::test]
+async fn self_check_probes_rather_than_reporting_every_request_unprobed() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let c_file = tmp.path().join("probe-target.c");
+    std::fs::write(&c_file, "int id(int x)\n{\n    return x;\n}\n").expect("write fixture");
+    let client = spawn_mcp_client(c_file.to_str().unwrap()).await;
+
+    let report = call_tool_json(&client, "self_check", json!({})).await.unwrap();
+
+    for field in ["required_requests", "ast_utils_registered_requests"] {
+        let requests = report[field]
+            .as_array()
+            .unwrap_or_else(|| panic!("{field} is not an array: {report}"));
+
+        // An empty array would satisfy the loop below without checking anything,
+        // which is the shape of a guard that passes by not running.
+        assert!(!requests.is_empty(), "{field} is empty: {report}");
+
+        let undone: Vec<&Value> = requests
+            .iter()
+            .filter(|request| {
+                request["status"] == "not_probed"
+                    && request["reason"] != "not a public MCP dependency"
+            })
+            .collect();
+
+        // One entry and a count, not the vector. A probe that could not connect
+        // fails every request with one reason, and printing fifty copies of it
+        // buries the reason that is the whole diagnosis.
+        assert!(
+            undone.is_empty(),
+            "{field}: self_check could not probe {} of {} requests, so its report \
+             describes nothing. First: {}",
+            undone.len(),
+            requests.len(),
+            undone[0]
+        );
+    }
+
+    let _ = client.cancel().await;
+}
+
 /// A prover timeout is reported as a timeout, distinct from a goal WP could
 /// not prove.
 ///

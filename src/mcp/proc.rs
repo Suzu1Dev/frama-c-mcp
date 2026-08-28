@@ -156,13 +156,20 @@ pub fn sandbox_kill_target(pid: u32, pgid: Option<u32>) -> Option<libc::pid_t> {
 /// reaped. Logging that at error level put one line per teardown into the log,
 /// which is how a real failure gets lost.
 ///
-/// EPERM is not in that set, measured rather than assumed: on macOS 25.6 a
-/// killpg against a group that never existed answers ESRCH, so does one against
-/// a child that has exited and been reaped, and a zombie still in its group
-/// answers success. What EPERM does mean is that the group is there and is
-/// somebody else's, which after pid reuse is a tree still running while the
-/// caller reports success. It stays visible, and process_is_alive below reads
-/// EPERM the same way.
+/// EPERM has two meanings here and the code cannot tell them apart, so it
+/// stays visible rather than picking one. The measured half stands: on macOS
+/// 25.6 a killpg against a group that never existed answers ESRCH, so does one
+/// against a child that has exited and been reaped, and a zombie still in its
+/// group answers success. What that elimination missed is the sentence macOS
+/// kill(2) adds to its own EPERM entry, "When signaling a process group, this
+/// error is returned if any members of the group could not be signaled", so a
+/// group that is entirely ours and was entirely signaled still answers EPERM
+/// when one member was mid-reap. The other meaning is the one worth seeing: a
+/// group that is somebody else's, which after pid reuse is a tree still running
+/// while the caller reports success.
+///
+/// "process_is_alive" below reads EPERM as alive for its own reason: it is
+/// asking a different question and is wrong in the safe direction.
 pub fn kill_frama_c_group(what: &str, pid: u32, pgid: Option<u32>) {
     let Some(target) = sandbox_kill_target(pid, pgid) else {
         tracing::error!(pid, "{what}: refusing to signal an unusable pid");
@@ -183,10 +190,18 @@ pub fn kill_frama_c_group(what: &str, pid: u32, pgid: Option<u32>) {
         return;
     }
     let err = std::io::Error::last_os_error();
-    if err.raw_os_error() == Some(libc::ESRCH) {
-        tracing::debug!(pid, error = %err, "{what}: no group left to signal");
-    } else {
-        tracing::error!(pid, error = %err, "{what}: could not kill the group");
+    match err.raw_os_error() {
+        Some(libc::ESRCH) => {
+            tracing::debug!(pid, error = %err, "{what}: no group left to signal");
+        }
+        Some(libc::EPERM) => {
+            tracing::error!(
+                pid,
+                error = %err,
+                "{what}: group partly signalled, or it is not ours after pid reuse"
+            );
+        }
+        _ => tracing::error!(pid, error = %err, "{what}: could not kill the group"),
     }
 }
 
@@ -245,6 +260,33 @@ pub fn socket_refused(e: &FramaCError) -> bool {
     matches!(e, FramaCError::Io(io) if io.kind() == std::io::ErrorKind::ConnectionRefused)
 }
 
+/// What a retry that absorbed a refusal says, once it connects.
+///
+/// A const rather than a literal at the one site that logs it, because
+/// scripts/check-stdio-refusal.sh counts these to report drift back toward the
+/// flake. Both strings that script reads are owned here; the other is
+/// "never_listened" below.
+pub(crate) const RECOVERED_RACE: &str =
+    "connected only after the socket refused: frama-c bound before it listened";
+
+/// The message a retry that never reached a listening server must carry.
+///
+/// One owner, because CI greps a stdio suite log for a "Connection refused" not
+/// accompanied by "never listened" and treats what is left as a bug the retry
+/// does not cover. A second site spelling this same failure its own way reads
+/// as that different bug, so the wording is a contract rather than prose. See
+/// scripts/check-stdio-refusal.sh.
+///
+/// Both arguments by Display, so neither caller allocates a String only to
+/// have it copied into the format below.
+pub(crate) fn never_listened(
+    socket: impl std::fmt::Display,
+    timeout: Duration,
+    e: impl std::fmt::Display,
+) -> String {
+    format!("frama-c never listened on {socket} within {timeout:?}: {e}")
+}
+
 /// Connect to a Frama-C that is still starting, retrying while the socket
 /// refuses connections.
 ///
@@ -290,20 +332,13 @@ pub async fn connect_when_listening(
                 // so a suite drifting toward the flake looks exactly like a
                 // healthy one until the timeout is finally exceeded.
                 if refusals > 0 {
-                    tracing::warn!(
-                        socket = %socket.display(),
-                        refusals,
-                        "connected only after the socket refused: frama-c bound before it listened"
-                    );
+                    tracing::warn!(socket = %socket.display(), refusals, "{RECOVERED_RACE}");
                 }
                 return Ok(client);
             }
             Err(e) if socket_not_listening_yet(&e) => {
                 if std::time::Instant::now() >= deadline {
-                    return Err(format!(
-                        "frama-c never listened on {} within {timeout:?}: {e}",
-                        socket.display()
-                    ));
+                    return Err(never_listened(socket.display(), timeout, &e));
                 }
                 refusals += u32::from(socket_refused(&e));
                 tokio::time::sleep(Duration::from_millis(25)).await;

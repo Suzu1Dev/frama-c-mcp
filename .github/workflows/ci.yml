@@ -43,8 +43,9 @@ concurrency:
     ${{ github.workflow }}-${{ github.event.pull_request.head.repo.full_name || github.repository }}-${{ github.event.pull_request.head.ref || github.ref_name }}
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
-# Nothing here writes to the repository, except the release job, which raises
-# this to contents: write for itself alone.
+# The floor, raised per job by the two that need more: the release job takes
+# contents: write to publish, and artifact-scans takes checks: write because the
+# advisory action reports by creating a check run. Nothing else writes anything.
 permissions:
   contents: read
 
@@ -111,19 +112,47 @@ jobs:
       - name: Release build
         run: cargo build --release --tests
 
-  # Reads the tree and nothing else, so it costs a minute and needs no
-  # toolchain. Kept a separate job rather than a step of the fast lane because
-  # its finding is about the documents, and a person reading a red run should
-  # see which of the two it was without opening a log.
+  # No toolchain and no build. Kept a separate job rather than a step of the
+  # fast lane because its finding is about the documents, and a person reading a
+  # red run should see which of the two it was without opening a log. The
+  # advisory scan is a step here rather than a job of its own so it reuses this
+  # checkout, which is also why this job is no longer only reading the tree: it
+  # fetches a cargo-audit binary and queries the advisory database.
   artifact-scans:
     name: Artifact scans
     runs-on: ubuntu-24.04
     timeout-minutes: 10
+    # Raised for this job alone, the way the release job raises contents. The
+    # advisory action reports by creating a check run, so the workflow-wide
+    # contents: read leaves it unable to publish the only thing it produces.
+    permissions:
+      contents: read
+      checks: write
     steps:
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
       - run: scripts/check-artifacts.sh
+
+      # Not in scripts/run-gates.sh, and deliberately so. Every gate the runner
+      # holds is reproducible from the commit, which is the whole reason
+      # Cargo.lock is tracked; this one answers from an advisory database that
+      # moves on its own, so it is the one check whose verdict is not a function
+      # of the tree. There is no schedule here either, so this catches a
+      # vulnerable dependency arriving rather than one discovered later; the
+      # discovered-later half is what Dependabot alerts are for.
+      #
+      # Skipped on pull requests from forks, where GitHub caps GITHUB_TOKEN at
+      # read-only whatever the permissions block says, so the action cannot
+      # create the check run it reports through and fails on a clean tree. This
+      # repository takes fork pull requests, so that is a real run and not a
+      # hypothetical one. A dependency arriving that way is still scanned, on
+      # the push that merges it.
+      - name: RustSec advisories against the tracked lockfile
+        if: ${{ github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository }}
+        uses: rustsec/audit-check@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
 
   # Full lane: Frama-C + WP provers + the ast-utils plugin, then the
   # integration / MCP-stdio suites that drive a real Frama-C server.
@@ -251,11 +280,34 @@ jobs:
           cargo test --test test-store-conclusion -- --test-threads=1
 
       - name: MCP stdio E2E tests
+        id: stdio
         # Parallel, unlike the gates above: every test in this suite owns its
         # server, its frama-c and its state directory. See scripts/run-gates.sh
         # for the measurement. libtest's default is available parallelism, so
         # this follows the runner rather than pinning a count.
-        run: cargo test --test test-mcp-stdio --release
+        env:
+          # A bind/listen race the retry absorbs is reported as a tracing warn,
+          # and the default EnvFilter admits ERROR only, so without this the one
+          # signal that the flake is coming back is dropped before it reaches
+          # the log the next step scans.
+          RUST_LOG: frama_c_mcp=warn
+        run: |
+          set -o pipefail
+          cargo test --test test-mcp-stdio --release 2>&1 | tee "$RUNNER_TEMP/mcp-stdio.log"
+
+      # Not success(): a refusal is one of the things that fails the suite, so
+      # the scan has to happen on exactly the runs where the step above went
+      # red. !cancelled() alone would not be enough, because it differs from
+      # always() only on cancellation, so an earlier failed step in this job
+      # skips the suite and still reaches here to scan a log nobody wrote. The
+      # outcome check is what excludes that, and it is what lets the script
+      # treat a missing log as a failure instead of tolerating one. A tolerated
+      # missing log is a gate that passes by not running.
+      - name: Detect an unqualified stdio connection refusal
+        if: ${{ !cancelled() && (steps.stdio.outcome == 'success' || steps.stdio.outcome == 'failure') }}
+        env:
+          STDIO_LOG: ${{ runner.temp }}/mcp-stdio.log
+        run: scripts/check-stdio-refusal.sh
 
   # The supported floor, compiled but not measured. The three shell gates in
   # the lane above pin proved-goal counts to Frama-C 33.0 and Alt-Ergo 2.6.3,

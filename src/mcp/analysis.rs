@@ -4378,11 +4378,11 @@ impl FramaCMcpServer {
         }
 
         if order_missing {
-            let _ = tool_result_json(
-                self
-                    .compute_topological_order(Parameters(ComputeTopologicalOrderParams {}))
-                    .await?,
-            );
+            // Called for the order it computes into session state, not for what
+            // it answers. Serializing that answer only to drop it is what the
+            // tool_result_json here used to do.
+            self.compute_topological_order(Parameters(ComputeTopologicalOrderParams {}))
+                .await?;
         }
 
         let (

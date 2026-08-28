@@ -1508,7 +1508,6 @@ let dump_project () : Yojson.Basic.t =
 
   `Assoc [
     ("prog_defs", prog_defs_json);
-    ("prog_public", `List []);  (* TODO: collect public symbols *)
     ("prog_main", (match main_id with Some id -> `Int id | None -> `Null));
     ("ident_names", ident_names_to_json tbl);
     ("acsl_globals", dump_acsl_globals tbl);
@@ -1516,9 +1515,12 @@ let dump_project () : Yojson.Basic.t =
     ("composites", `List (List.rev !composites));
     ("enums", `List (List.rev !enums));
     ("filename", `String (match files with f :: _ -> f | [] -> ""));
-    ("pragmas", `List []);
-    ("texts", `List []);
     ("machdep", machdep_to_json ());
-    ("version", `String "fcil-1.0");
+    (* 1.1 drops prog_public, pragmas and texts. All three arrived with the
+       initial import as empty lists and were never filled, so a reader could
+       only conclude that a project has no public symbols, no pragmas and no
+       texts, which is a different statement from the field not being
+       implemented. Nothing in this tree or outside it consumes the dump. *)
+    ("version", `String "fcil-1.1");
     ("files", `List (List.map (fun f -> `String f) files));
   ]
