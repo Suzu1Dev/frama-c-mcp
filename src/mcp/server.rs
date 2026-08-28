@@ -2083,10 +2083,9 @@ async fn reload_fetch(
     fetch_request: &str,
 ) -> Result<Vec<serde_json::Value>, McpError> {
     client
-        .get(reload_request, json!(null))
+        .reload_fetch(reload_request, fetch_request)
         .await
-        .map_err(McpError::from)?;
-    client.fetch_all(fetch_request).await.map_err(McpError::from)
+        .map_err(McpError::from)
 }
 
 /// Every property Frama-C holds, enriched the way every reader of them wants.

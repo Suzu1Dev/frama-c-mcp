@@ -349,6 +349,10 @@ impl ClientInner {
 
 pub struct FramaCClient {
     inner: Mutex<ClientInner>,
+    /// Serializes reload_fetch pairs. inner covers one request at a time,
+    /// but a reload and the fetch behind it are two requests, and the table
+    /// cursor they share is process-global.
+    fetch_lock: Mutex<()>,
 }
 
 impl FramaCClient {
@@ -413,6 +417,7 @@ impl FramaCClient {
 
         let client = FramaCClient {
             inner: Mutex::new(inner),
+            fetch_lock: Mutex::new(()),
         };
 
         // Auto-fetch function info to populate marker cache
@@ -589,6 +594,24 @@ impl FramaCClient {
             }
         }
         Ok(all_entries)
+    }
+
+    /// A reload and the fetch behind it as one atomic pair.
+    ///
+    /// The table cursor is process-global: a reload resets it, a fetch
+    /// drains it. inner serializes single requests only, so without its own
+    /// lock two pairs can interleave (A reload, B reload, A fetch, B fetch)
+    /// and the later fetch comes back a delta. Measured before this lock
+    /// existed: 79 of 80 concurrent goal reads returned an empty list on an
+    /// 11-goal table, and an empty goal list reads like "everything proved".
+    pub async fn reload_fetch(
+        &self,
+        reload_request: &str,
+        fetch_request: &str,
+    ) -> Result<Vec<serde_json::Value>, FramaCError> {
+        let _fetch_guard = self.fetch_lock.lock().await;
+        self.get(reload_request, serde_json::Value::Null).await?;
+        self.fetch_all(fetch_request).await
     }
 
     pub async fn shutdown(&self) -> Result<(), FramaCError> {
