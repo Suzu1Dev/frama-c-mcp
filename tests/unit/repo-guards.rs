@@ -476,20 +476,7 @@ fn ci_command_text(root: &std::path::Path) -> String {
     let mut text = String::new();
     for dir in [".github/workflows", ".ci"] {
         let dir = root.join(dir);
-        let mut paths: Vec<std::path::PathBuf> = std::fs::read_dir(&dir)
-            .unwrap_or_else(|error| panic!("{}: {error}", dir.display()))
-            .flatten()
-            .map(|entry| entry.path())
-            .filter(|path| {
-                path.extension()
-                    .is_some_and(|ext| ext == "yml" || ext == "yaml" || ext == "sh")
-            })
-            .collect();
-
-        // read_dir order is arbitrary, and a guard that reports what it found
-        // is read by a human.
-        paths.sort();
-        for path in paths {
+        for path in sorted_files(&dir, &["yml", "yaml", "sh"]) {
             text.push_str(&std::fs::read_to_string(&path).unwrap_or_default());
             text.push('\n');
         }
@@ -501,6 +488,144 @@ fn ci_command_text(root: &std::path::Path) -> String {
          pass on an empty requirement set"
     );
     text
+}
+
+/// Every file in a directory with one of these extensions, sorted.
+///
+/// read_dir order is arbitrary and a guard that reports what it found is read
+/// by a human, so the sort is part of the contract rather than a nicety.
+fn sorted_files(dir: &std::path::Path, exts: &[&str]) -> Vec<std::path::PathBuf> {
+    let mut paths: Vec<std::path::PathBuf> = std::fs::read_dir(dir)
+        .unwrap_or_else(|error| panic!("{}: {error}", dir.display()))
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.extension().is_some_and(|ext| exts.iter().any(|want| ext == *want))
+        })
+        .collect();
+    paths.sort();
+    paths
+}
+
+/// Every workflow file, sorted.
+///
+/// The directory rather than ci.yml by name, which is the lesson ci_command_text
+/// above records: the artifact scan once lived in a second workflow file and a
+/// guard reading one file by name reported all clear having compared nothing.
+fn workflow_files(root: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let dir = root.join(".github/workflows");
+    let paths = sorted_files(&dir, &["yml", "yaml"]);
+    assert!(!paths.is_empty(), "{}: no workflow files", dir.display());
+    paths
+}
+
+/// Every job in every workflow, with the file each came from.
+///
+/// The two guards that ask "which job does X" both want this, and spelling it
+/// twice was two shapes for one question in a single commit.
+fn all_workflow_jobs(root: &std::path::Path) -> Vec<(std::path::PathBuf, String, String)> {
+    workflow_files(root)
+        .into_iter()
+        .flat_map(|path| {
+            let text = std::fs::read_to_string(&path).unwrap_or_default();
+            workflow_jobs(&text).into_iter().map(move |(name, body)| (path.clone(), name, body))
+        })
+        .collect()
+}
+
+/// The entries of a YAML flow list, "[a, b]", unquoted.
+///
+/// Two guards parse one of these and they had drifted before they were two
+/// days old: the matrix parse strips quotes and the needs parse did not, so a
+/// needs written ["build"] would have compared a quoted name against a bare one
+/// and reported every job as ungating.
+fn flow_list(text: &str) -> Vec<String> {
+    let Some(inner) = text.split_once('[').and_then(|(_, rest)| rest.split_once(']')) else {
+        return Vec::new();
+    };
+    inner
+        .0
+        .split(',')
+        .map(|entry| entry.trim().trim_matches('"').trim_matches('\'').to_string())
+        .filter(|entry| !entry.is_empty())
+        .collect()
+}
+
+/// A workflow's jobs, as name and body.
+///
+/// One definition, for the reason step_command below records: three copies of
+/// one parsing rule was three chances to fix it in two places. This file had
+/// four copies of this one by 2026-08-28, and every caller now goes through
+/// this one. The copies differed in which trap they fell into: two read a
+/// comment line as a job, so "  # release:" named one, and two tested the raw
+/// line for a closing colon, so a header carrying a trailing comment stopped
+/// being a header and its job merged into the one above it.
+///
+/// Only inside the jobs: mapping. Indentation alone cannot say what a job is:
+/// the on: trigger keys push: and pull_request: sit at the same two spaces, so
+/// a scan without that check collected them as jobs and gave the first one the
+/// whole top-of-file comment block as its body. Harmless while that comment
+/// says nothing a caller greps for, and a trap the day it does.
+fn workflow_jobs(text: &str) -> Vec<(String, String)> {
+    let mut jobs: Vec<(String, String)> = Vec::new();
+    let mut in_jobs = false;
+    for line in text.lines() {
+        // Before the column test, not after: a comment at column zero is not a
+        // key, and treating it as one ended the scan and dropped every job
+        // below it. ci.yml has no such comment today, which is the only reason
+        // nothing failed.
+        if line.trim_start().starts_with('#') {
+            continue;
+        }
+        if !line.starts_with(' ') && !line.trim().is_empty() {
+            in_jobs = line.trim_end() == "jobs:";
+            continue;
+        }
+        if !in_jobs {
+            continue;
+        }
+        // A trailing comment does not stop a line from naming a job, and YAML
+        // allows one. Testing the raw line for a closing colon made
+        // "  build:  # note" fail the test, which merged that job into its
+        // predecessor and let a caller searching one body read two jobs as one.
+        // Found by a control that added such a comment; the guard it broke was
+        // failing green.
+        let header = match line.split_once(" #") {
+            Some((before, _)) => before,
+            None => line,
+        }
+        .trim_end();
+        let is_job_header =
+            line.starts_with("  ") && !line.starts_with("   ") && header.ends_with(':');
+        if is_job_header {
+            jobs.push((header.trim().trim_end_matches(':').to_string(), String::new()));
+        } else if let Some((_, body)) = jobs.last_mut() {
+            body.push_str(line);
+            body.push('\n');
+        }
+    }
+    jobs
+}
+
+/// workflow_jobs reads jobs, and reads nothing else as one.
+///
+/// The property lived as a stray assertion inside the cppo guard, which is
+/// where the parser used to be inlined. It belongs to the parser: the on:
+/// trigger keys push: and pull_request: sit at the same two spaces a job name
+/// does, so a scan that does not track the jobs: mapping collects them, and a
+/// caller then greps a body that is really the top-of-file comment block.
+#[test]
+fn workflow_jobs_reads_jobs_and_not_trigger_keys() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let jobs = all_workflow_jobs(root);
+
+    assert!(!jobs.is_empty(), "no workflow job was read, so this guard compared nothing");
+    let stray: Vec<&String> = jobs
+        .iter()
+        .map(|(_, name, _)| name)
+        .filter(|name| ["push", "pull_request", "schedule", "workflow_dispatch"].contains(&name.as_str()))
+        .collect();
+    assert!(stray.is_empty(), "the job scan collected an on: trigger key as a job: {stray:?}");
 }
 
 /// The command a workflow step runs, or the line unchanged when it runs none.
@@ -730,12 +855,8 @@ fn ci_frama_c_version_matches_supported_minimum() {
 
     let matrix: Vec<String> = workflow
         .lines()
-        .filter_map(|line| line.trim().strip_prefix("frama-c-version:"))
-        .flat_map(|list| {
-            list.trim().trim_start_matches('[').trim_end_matches(']').split(',')
-        })
-        .map(|entry| entry.trim().trim_matches('"').to_string())
-        .filter(|entry| !entry.is_empty())
+        .filter(|line| line.trim().starts_with("frama-c-version:"))
+        .flat_map(flow_list)
         .collect();
 
     assert!(
@@ -853,49 +974,14 @@ fn ci_builds_the_plugin_on_the_supported_floor() {
     // "opam install" and for "cppo" separately is satisfied by a cache key, a
     // step name, or a comment, and even requiring both on one line is satisfied
     // by whichever other lane still installs it.
-    let ci = std::fs::read_to_string(root.join(".github/workflows/ci.yml")).expect("ci.yml");
-    let mut jobs: Vec<(String, String)> = Vec::new();
-
-    // Only inside the jobs: block. Indentation alone cannot say what a job is:
-    // the on: trigger keys push: and pull_request: sit at the same two spaces,
-    // so a scan without this collected them as jobs and gave the first one the
-    // whole top-of-file comment block as its body. Harmless while that comment
-    // says nothing about dune, and a trap the day it does.
-    let mut in_jobs = false;
-    for line in ci.lines() {
-        if !line.starts_with(' ') && !line.trim().is_empty() {
-            in_jobs = line.trim_end() == "jobs:";
-            continue;
-        }
-        if !in_jobs {
-            continue;
-        }
-        let is_job_header = line.starts_with("  ")
-            && !line.starts_with("   ")
-            && line.trim_end().ends_with(':')
-            && !line.trim_start().starts_with('#');
-        if is_job_header {
-            jobs.push((line.trim().trim_end_matches(':').to_string(), String::new()));
-        } else if let Some((_, body)) = jobs.last_mut() {
-            body.push_str(line);
-            body.push('\n');
-        }
-    }
-    assert!(
-        jobs.iter().all(|(name, _)| name != "push" && name != "pull_request"),
-        "the job scan collected an on: trigger key as a job: {:?}",
-        jobs.iter().map(|(name, _)| name).collect::<Vec<_>>()
-    );
-
-    let plugin_builders: Vec<&(String, String)> = jobs
-        .iter()
-        .filter(|(_, body)| body.contains("dune build"))
-        .collect();
+    let jobs = all_workflow_jobs(root);
+    let plugin_builders: Vec<&(std::path::PathBuf, String, String)> =
+        jobs.iter().filter(|(_, _, body)| body.contains("dune build")).collect();
     assert!(
         !plugin_builders.is_empty(),
         "no ci.yml job runs dune build, so this guard compared nothing"
     );
-    for (name, body) in plugin_builders {
+    for (_, name, body) in plugin_builders {
         assert!(
             body.lines()
                 .map(str::trim)
@@ -1346,30 +1432,42 @@ fn jobs_running_repo_scripts_check_out_the_repo() {
 
     let mut offenders = Vec::new();
     let mut checked = 0;
-    for entry in std::fs::read_dir(root.join(".github/workflows"))
-        .expect("workflows dir")
-        .flatten()
-    {
-        let path = entry.path();
-        if !path.extension().is_some_and(|ext| ext == "yml" || ext == "yaml") {
-            continue;
-        }
+    for path in workflow_files(root) {
         let workflow = std::fs::read_to_string(&path).unwrap_or_default();
 
-        // Jobs are the keys at one indent level under "jobs:", and steps run in
-        // file order, so a linear scan is enough to know whether the checkout
+        // Steps run in file order and workflow_jobs keeps a body in that order,
+        // so a linear scan of each body is enough to know whether the checkout
         // came first. A YAML parser would be better and is not worth a
-        // dependency for five jobs.
-        let mut job = String::new();
-        let mut checkout_at = None;
-        let mut runs_repo_script = false;
-        let mut step = 0usize;
-        let mut finish = |job: &str, checkout: Option<usize>, runs: bool| {
-            if !runs {
-                return;
+        // dependency for six jobs.
+        for (job, body) in workflow_jobs(&workflow) {
+            let mut checkout_at = None;
+            let mut runs_repo_script = false;
+            let mut step = 0usize;
+
+            for line in body.lines() {
+                let indent = line.len() - line.trim_start().len();
+                let trimmed = line.trim();
+
+                // Steps sit at six spaces. Counting every "- " would also count
+                // the build matrix's include entries, which are not steps.
+                if indent == 6 && trimmed.starts_with("- ") {
+                    step += 1;
+                }
+                if trimmed.contains("actions/checkout") && checkout_at.is_none() {
+                    checkout_at = Some(step);
+                }
+                if (trimmed.contains(".ci/") || trimmed.contains("scripts/"))
+                    && !trimmed.starts_with('#')
+                {
+                    runs_repo_script = true;
+                }
+            }
+
+            if !runs_repo_script {
+                continue;
             }
             checked += 1;
-            match checkout {
+            match checkout_at {
                 Some(1) => {}
                 Some(at) => offenders.push(format!(
                     "{job}: checks out at step {at} rather than first, so an earlier \
@@ -1377,35 +1475,7 @@ fn jobs_running_repo_scripts_check_out_the_repo() {
                 )),
                 None => offenders.push(format!("{job}: runs a repo script with no checkout")),
             }
-        };
-
-        for line in workflow.lines() {
-            let indent = line.len() - line.trim_start().len();
-            let trimmed = line.trim();
-
-            // A key at two spaces, inside jobs, is a new job.
-            if indent == 2 && trimmed.ends_with(':') && !trimmed.starts_with('#') {
-                finish(&job, checkout_at, runs_repo_script);
-                job = trimmed.trim_end_matches(':').to_string();
-                (checkout_at, runs_repo_script, step) = (None, false, 0);
-                continue;
-            }
-
-            // Steps sit at six spaces. Counting every "- " would also count the
-            // build matrix's include entries, which are not steps.
-            if indent == 6 && trimmed.starts_with("- ") {
-                step += 1;
-            }
-            if trimmed.contains("actions/checkout") && checkout_at.is_none() {
-                checkout_at = Some(step);
-            }
-            if (trimmed.contains(".ci/") || trimmed.contains("scripts/"))
-                && !trimmed.starts_with('#')
-            {
-                runs_repo_script = true;
-            }
         }
-        finish(&job, checkout_at, runs_repo_script);
     }
 
     assert!(
