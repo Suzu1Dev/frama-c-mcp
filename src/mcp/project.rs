@@ -23,19 +23,18 @@ async fn reload_health_get(
         .map_err(|error| reload_health_error(request, error))
 }
 
+// Routed through the client's reload_fetch so the pair holds fetch_lock:
+// these are the same process-global cursors every other reader uses, and a
+// health check that bypasses the lock can split one cursor with a
+// concurrent reader (measured: 2 of 50 concurrent counts reads came back
+// empty mid-reload before this).
 async fn reload_health_fetch_all(
     client: &FramaCClient,
-    reload_request: Option<&str>,
+    reload_request: &str,
     fetch_request: &str,
 ) -> Result<Vec<serde_json::Value>, McpError> {
-    if let Some(request) = reload_request {
-        client
-            .get(request, json!(null))
-            .await
-            .map_err(|error| reload_health_error(request, error))?;
-    }
     client
-        .fetch_all(fetch_request)
+        .reload_fetch(reload_request, fetch_request)
         .await
         .map_err(|error| reload_health_error(fetch_request, error))
 }
@@ -51,19 +50,19 @@ async fn ast_reload_health(
     let files = reload_health_get(client, "kernel.ast.getFiles", json!(null)).await?;
     let functions = reload_health_fetch_all(
         client,
-        Some("kernel.ast.reloadFunctions"),
+        "kernel.ast.reloadFunctions",
         "kernel.ast.fetchFunctions",
     )
     .await?;
     let globals = reload_health_fetch_all(
         client,
-        Some("kernel.ast.reloadGlobals"),
+        "kernel.ast.reloadGlobals",
         "kernel.ast.fetchGlobals",
     )
     .await?;
     let properties = reload_health_fetch_all(
         client,
-        Some("kernel.properties.reloadStatus"),
+        "kernel.properties.reloadStatus",
         "kernel.properties.fetchStatus",
     )
     .await?;
