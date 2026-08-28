@@ -1250,6 +1250,46 @@ fn gate_of(command: &str) -> Option<String> {
     words.next().is_none_or(|word| word.starts_with('-')).then_some(gate)
 }
 
+/// The stdio suite runs under the same RUST_LOG in CI and in the runner.
+///
+/// src/main.rs builds its subscriber from the environment, and EnvFilter admits
+/// ERROR only when RUST_LOG is unset, so the recovered-race warn that
+/// scripts/check-stdio-refusal.sh counts exists only when this variable is set.
+/// Drop it from either caller and the script prints "0 recovered" for every run,
+/// which is exactly what a healthy run prints. That is the silent-drift shape
+/// this file already has several tests about, and it arrived with the two
+/// callers rather than by drift between them.
+#[test]
+fn the_stdio_suite_runs_under_one_log_level() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    const DIRECTIVE: &str = "RUST_LOG: frama_c_mcp=warn";
+    const RUNNER: &str = "RUST_LOG=frama_c_mcp=warn";
+
+    let stdio: Vec<(std::path::PathBuf, String, String)> = all_workflow_jobs(root)
+        .into_iter()
+        .filter(|(_, _, body)| body.contains("--test test-mcp-stdio"))
+        .collect();
+    assert_eq!(stdio.len(), 1, "expected one job to run the stdio suite, found {}", stdio.len());
+    assert!(
+        stdio[0].2.lines().any(|line| line.trim() == DIRECTIVE),
+        "the workflow job running the stdio suite does not set {DIRECTIVE}, so its \
+         log carries no recovered-race warn and check-stdio-refusal.sh reports \
+         zero for every run"
+    );
+
+    let runner =
+        std::fs::read_to_string(root.join("scripts/run-gates.sh")).expect("run-gates.sh");
+    assert!(
+        runner.lines().any(|line| {
+            line.trim_start().starts_with("want stdio")
+                && line.contains(RUNNER)
+                && line.contains("--test test-mcp-stdio")
+        }),
+        "scripts/run-gates.sh runs the stdio suite without {RUNNER}, so a local run \
+         cannot reproduce what CI scans"
+    );
+}
+
 /// scripts/run-gates.sh runs every gate CI runs.
 ///
 /// The runner is what the documents send a person to, so a gate CI has and the

@@ -33,6 +33,13 @@ pub const AST_COMPUTE_BUDGET: Duration = Duration::from_secs(120);
 /// never does.
 pub const PLUGIN_EXEC_BUDGET: Duration = Duration::from_secs(30);
 
+/// Ceiling on the wait for the self_check probe's throwaway Frama-C to start
+/// listening. Its own name rather than the tool probe budget below, which is
+/// the same number for an unrelated reason: waiting for a socket and waiting
+/// for a command to print its version are not the same wait. Quoted as well as
+/// enforced, since the give-up message names it.
+pub const PROBE_CONNECT_BUDGET: Duration = Duration::from_secs(5);
+
 /// Ceiling on an external command run only to ask what it is: frama-c -version,
 /// opam var switch, why3 config, a --help probe. A tool that cannot answer this
 /// quickly is not going to answer at all.

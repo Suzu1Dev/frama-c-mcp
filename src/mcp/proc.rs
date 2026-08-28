@@ -260,6 +260,33 @@ pub fn socket_refused(e: &FramaCError) -> bool {
     matches!(e, FramaCError::Io(io) if io.kind() == std::io::ErrorKind::ConnectionRefused)
 }
 
+/// What a retry that absorbed a refusal says, once it connects.
+///
+/// A const rather than a literal at the one site that logs it, because
+/// scripts/check-stdio-refusal.sh counts these to report drift back toward the
+/// flake. Both strings that script reads are owned here; the other is
+/// "never_listened" below.
+pub(crate) const RECOVERED_RACE: &str =
+    "connected only after the socket refused: frama-c bound before it listened";
+
+/// The message a retry that never reached a listening server must carry.
+///
+/// One owner, because CI greps a stdio suite log for a "Connection refused" not
+/// accompanied by "never listened" and treats what is left as a bug the retry
+/// does not cover. A second site spelling this same failure its own way reads
+/// as that different bug, so the wording is a contract rather than prose. See
+/// scripts/check-stdio-refusal.sh.
+///
+/// Both arguments by Display, so neither caller allocates a String only to
+/// have it copied into the format below.
+pub(crate) fn never_listened(
+    socket: impl std::fmt::Display,
+    timeout: Duration,
+    e: impl std::fmt::Display,
+) -> String {
+    format!("frama-c never listened on {socket} within {timeout:?}: {e}")
+}
+
 /// Connect to a Frama-C that is still starting, retrying while the socket
 /// refuses connections.
 ///
@@ -305,20 +332,13 @@ pub async fn connect_when_listening(
                 // so a suite drifting toward the flake looks exactly like a
                 // healthy one until the timeout is finally exceeded.
                 if refusals > 0 {
-                    tracing::warn!(
-                        socket = %socket.display(),
-                        refusals,
-                        "connected only after the socket refused: frama-c bound before it listened"
-                    );
+                    tracing::warn!(socket = %socket.display(), refusals, "{RECOVERED_RACE}");
                 }
                 return Ok(client);
             }
             Err(e) if socket_not_listening_yet(&e) => {
                 if std::time::Instant::now() >= deadline {
-                    return Err(format!(
-                        "frama-c never listened on {} within {timeout:?}: {e}",
-                        socket.display()
-                    ));
+                    return Err(never_listened(socket.display(), timeout, &e));
                 }
                 refusals += u32::from(socket_refused(&e));
                 tokio::time::sleep(Duration::from_millis(25)).await;

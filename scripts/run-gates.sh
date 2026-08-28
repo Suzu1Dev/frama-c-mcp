@@ -102,7 +102,11 @@ want corpus && run corpus scripts/check-tutorial-corpus.sh
 # 1160.81s serial against 218.42s at libtest's default, both 89/89. The default
 # is available parallelism rather than a pinned number, so a 4-core runner gets
 # 4 and this does not oversubscribe whatever machine it lands on.
-want stdio && run stdio cargo test --test test-mcp-stdio --release
+# RUST_LOG matches the stdio step in .github/workflows/ci.yml: without it the
+# recovered-race warn the check below counts is filtered out before the log.
+want stdio && run stdio env RUST_LOG=frama_c_mcp=warn cargo test --test test-mcp-stdio --release
+# Keyed on the same "want stdio", so the suite cannot be run without its check.
+want stdio && run stdio-refusal env STDIO_LOG="$logs/stdio.log" scripts/check-stdio-refusal.sh
 
 if [ "$ran" -eq 0 ]; then
     echo "no gate matched: ${selected[*]:-}" >&2

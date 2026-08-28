@@ -125,6 +125,7 @@ jobs:
           persist-credentials: false
       - run: scripts/check-artifacts.sh
 
+
   # Full lane: Frama-C + WP provers + the ast-utils plugin, then the
   # integration / MCP-stdio suites that drive a real Frama-C server.
   integration:
@@ -251,11 +252,34 @@ jobs:
           cargo test --test test-store-conclusion -- --test-threads=1
 
       - name: MCP stdio E2E tests
+        id: stdio
         # Parallel, unlike the gates above: every test in this suite owns its
         # server, its frama-c and its state directory. See scripts/run-gates.sh
         # for the measurement. libtest's default is available parallelism, so
         # this follows the runner rather than pinning a count.
-        run: cargo test --test test-mcp-stdio --release
+        env:
+          # A bind/listen race the retry absorbs is reported as a tracing warn,
+          # and the default EnvFilter admits ERROR only, so without this the one
+          # signal that the flake is coming back is dropped before it reaches
+          # the log the next step scans.
+          RUST_LOG: frama_c_mcp=warn
+        run: |
+          set -o pipefail
+          cargo test --test test-mcp-stdio --release 2>&1 | tee "$RUNNER_TEMP/mcp-stdio.log"
+
+      # Not success(): a refusal is one of the things that fails the suite, so
+      # the scan has to happen on exactly the runs where the step above went
+      # red. !cancelled() alone would not be enough, because it differs from
+      # always() only on cancellation, so an earlier failed step in this job
+      # skips the suite and still reaches here to scan a log nobody wrote. The
+      # outcome check is what excludes that, and it is what lets the script
+      # treat a missing log as a failure instead of tolerating one. A tolerated
+      # missing log is a gate that passes by not running.
+      - name: Detect an unqualified stdio connection refusal
+        if: ${{ !cancelled() && (steps.stdio.outcome == 'success' || steps.stdio.outcome == 'failure') }}
+        env:
+          STDIO_LOG: ${{ runner.temp }}/mcp-stdio.log
+        run: scripts/check-stdio-refusal.sh
 
   # The supported floor, compiled but not measured. The three shell gates in
   # the lane above pin proved-goal counts to Frama-C 33.0 and Alt-Ergo 2.6.3,
