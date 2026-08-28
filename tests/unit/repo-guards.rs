@@ -1250,6 +1250,58 @@ fn gate_of(command: &str) -> Option<String> {
     words.next().is_none_or(|word| word.starts_with('-')).then_some(gate)
 }
 
+/// The dependency advisory scan is still in a workflow, with the permission it
+/// needs.
+///
+/// gate_of below recognises a cargo command or a scripts/ path, so this one is
+/// invisible to every guard around it: it is a uses: step, and it is the one
+/// check deliberately absent from scripts/run-gates.sh because its verdict
+/// comes from a database rather than from the tree. Nothing would fail if it
+/// were deleted, which is the shape this file already has four guards for.
+///
+/// The permission is checked inside the job that runs the action, because the
+/// two are one thing. The action reports by creating a check run and the
+/// workflow floor is contents: read, so the job running it needs checks: write
+/// of its own. Asserting the two independently over the whole file was the
+/// first version and it did not say that: the permission could move to any
+/// other job, or to a job that runs nothing, and the guard stayed green while
+/// the step lost what it needs.
+#[test]
+fn ci_still_scans_dependencies_for_advisories() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+
+    // A line predicate rather than a rewritten body, and comment blindness only
+    // where it is needed. documented_gate_list_covers_ci reads a fenced block
+    // rather than a whole document for the same reason: the comment above the
+    // permissions block explains why artifact-scans grants checks: write, so a
+    // whole-text search left the guard green with the permission deleted. The
+    // permission test below needs no such care, since a comment line cannot
+    // equal "checks: write" once trimmed.
+    let runs = |body: &String, needle: &str| {
+        body.lines().any(|line| !line.trim_start().starts_with('#') && line.contains(needle))
+    };
+
+    let jobs = all_workflow_jobs(root);
+    let scanning: Vec<&(std::path::PathBuf, String, String)> =
+        jobs.iter().filter(|(_, _, body)| runs(body, "rustsec/audit-check@")).collect();
+    assert_eq!(
+        scanning.len(),
+        1,
+        "expected exactly one job to run an advisory scan, found these. None means \
+         a vulnerable dependency lands green: {:?}",
+        scanning.iter().map(|(_, name, _)| name).collect::<Vec<_>>()
+    );
+
+    let (path, name, body) = scanning[0];
+    assert!(
+        body.lines().any(|line| line.trim() == "checks: write"),
+        "{}: job {name} runs the advisory action and does not grant itself \
+         checks: write. The workflow floor is contents: read, so the action \
+         cannot create the check run it reports through:\n{body}",
+        path.display()
+    );
+}
+
 /// The stdio suite runs under the same RUST_LOG in CI and in the runner.
 ///
 /// src/main.rs builds its subscriber from the environment, and EnvFilter admits
