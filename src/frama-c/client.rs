@@ -614,6 +614,13 @@ impl FramaCClient {
         self.fetch_all(fetch_request).await
     }
 
+    /// The fetch_lock guard, for the one caller that labels the reload and
+    /// fetch steps differently in its errors (the reload health check in
+    /// project.rs). Everyone else wants reload_fetch.
+    pub(crate) async fn fetch_guard(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.fetch_lock.lock().await
+    }
+
     pub async fn shutdown(&self) -> Result<(), FramaCError> {
         let mut inner = self.inner.lock().await;
         inner.send_command(&FramaCCommand::Shutdown).await?;

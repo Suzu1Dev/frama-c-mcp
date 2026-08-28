@@ -23,18 +23,24 @@ async fn reload_health_get(
         .map_err(|error| reload_health_error(request, error))
 }
 
-// Routed through the client's reload_fetch so the pair holds fetch_lock:
-// these are the same process-global cursors every other reader uses, and a
-// health check that bypasses the lock can split one cursor with a
-// concurrent reader (measured: 2 of 50 concurrent counts reads came back
-// empty mid-reload before this).
+// Holds fetch_lock across the pair: these are the same process-global
+// cursors every other reader uses, and a health check that bypasses the
+// lock can split one cursor with a concurrent reader (measured: 2 of 50
+// concurrent counts reads came back empty mid-reload before this). The
+// guard is taken directly rather than via client.reload_fetch so each
+// step's error keeps its own request label.
 async fn reload_health_fetch_all(
     client: &FramaCClient,
     reload_request: &str,
     fetch_request: &str,
 ) -> Result<Vec<serde_json::Value>, McpError> {
+    let _guard = client.fetch_guard().await;
     client
-        .reload_fetch(reload_request, fetch_request)
+        .get(reload_request, json!(null))
+        .await
+        .map_err(|error| reload_health_error(reload_request, error))?;
+    client
+        .fetch_all(fetch_request)
         .await
         .map_err(|error| reload_health_error(fetch_request, error))
 }
