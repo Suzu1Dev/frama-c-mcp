@@ -1302,6 +1302,65 @@ fn ci_still_scans_dependencies_for_advisories() {
     );
 }
 
+/// Every lane gates the release.
+///
+/// A job that runs and is not among the release job's needs can be red while
+/// the rolling tag is republished, which is a green badge over a binary nothing
+/// vouched for. Measured on 2026-08-28: release needs five jobs while CLAUDE.md
+/// described four, having dropped plugin-floor, so the document did not say that
+/// a Frama-C 32.1 build failure blocks a release. No guard can read that
+/// document, since it is never checked in, so this pins the fact rather than the
+/// prose.
+///
+/// A job that deliberately does not gate a release will fail here. That is the
+/// intent: it is a decision worth writing down rather than one worth inferring
+/// from an absence.
+#[test]
+fn the_release_waits_for_every_lane() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+
+    let jobs = all_workflow_jobs(root);
+
+    // The release job's own needs, read out of its body, so a needs belonging
+    // to some other job cannot stand in for the one being checked.
+    let releases: Vec<&(std::path::PathBuf, String, String)> =
+        jobs.iter().filter(|(_, name, _)| name == "release").collect();
+    assert_eq!(
+        releases.len(),
+        1,
+        "expected exactly one release job across the workflows, found {}",
+        releases.len()
+    );
+    let (path, _, release) = releases[0];
+
+    let needs = release
+        .lines()
+        .find(|line| line.trim_start().starts_with("needs:"))
+        .unwrap_or_else(|| panic!("{}: the release job declares no needs", path.display()));
+    let listed = flow_list(needs);
+    assert!(
+        !listed.is_empty(),
+        "{}: the release needs is empty or not a flow list, so this guard \
+         compared nothing: {needs}",
+        path.display()
+    );
+
+    let ungating: Vec<&String> = jobs
+        .iter()
+        .filter(|(job_path, name, _)| {
+            job_path == path && name != "release" && !listed.contains(name)
+        })
+        .map(|(_, name, _)| name)
+        .collect();
+    assert!(
+        ungating.is_empty(),
+        "{}: these jobs run and the release does not wait for them, so each can \
+         be red while the rolling tag is republished: {ungating:?}. Add them to \
+         needs, or record why they do not gate a release",
+        path.display()
+    );
+}
+
 /// The stdio suite runs under the same RUST_LOG in CI and in the runner.
 ///
 /// src/main.rs builds its subscriber from the environment, and EnvFilter admits
