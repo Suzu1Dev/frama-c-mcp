@@ -1806,6 +1806,11 @@ pub struct ProjectLoadOptions {
 struct SandboxRuntime {
     client: Arc<FramaCClient>,
     child: Arc<AsyncMutex<Option<tokio::process::Child>>>,
+    /// Same role as the server's main_wp_lock, for this sandbox's process:
+    /// one run_wp transaction (config, schedule, drain, fetch) at a time.
+    /// Waiters clone the Arc, so the lock can outlive the entry it came
+    /// from; run_wp_on_sandbox re-checks membership after acquiring it.
+    wp_lock: Arc<AsyncMutex<()>>,
 }
 
 #[derive(Clone)]
@@ -1838,6 +1843,25 @@ impl SandboxRegistry {
         })
     }
 
+    fn wp_lock(&self, experiment_id: &str) -> Option<Arc<AsyncMutex<()>>> {
+        self.entries
+            .get(experiment_id)
+            .map(|entry| entry.runtime.wp_lock.clone())
+    }
+
+    /// The client only while the entry still owns this exact lock. A waiter
+    /// holding a cloned Arc must not send requests to a client it resolved
+    /// before the wait when the entry was removed, or removed and recreated
+    /// under the same id, in between.
+    fn client_if_current(
+        &self,
+        experiment_id: &str,
+        lock: &Arc<AsyncMutex<()>>,
+    ) -> Option<Arc<FramaCClient>> {
+        let entry = self.entries.get(experiment_id)?;
+        Arc::ptr_eq(&entry.runtime.wp_lock, lock).then(|| entry.runtime.client.clone())
+    }
+
     pub fn metadata_list(&self) -> Vec<SandboxMetadata> {
         self.entries
             .values()
@@ -1858,6 +1882,7 @@ impl SandboxRegistry {
                 runtime: SandboxRuntime {
                     client,
                     child: Arc::new(AsyncMutex::new(Some(child))),
+                    wp_lock: Arc::new(AsyncMutex::new(())),
                 },
             },
         );
@@ -1951,6 +1976,30 @@ pub struct FramaCMcpServer {
     /// apart, so the waiter reads this counter before scheduling and again
     /// after draining, and a change means somebody stopped its run.
     wp_cancel_epoch: Arc<std::sync::atomic::AtomicU64>,
+    /// Held across a whole run_wp transaction on the main instance: config,
+    /// schedule, drain, and goal fetch.
+    ///
+    /// WP's config, scheduler, and goal table are process-global state, while
+    /// the client mutex covers one request only. Two runs that interleave see
+    /// the second one's config govern the first one's goals, and both fetch
+    /// the union of the shared goal table, so each reports goals it never
+    /// scheduled. Held from before apply_wp_config to the end of the handler.
+    ///
+    /// What a waiter can end up waiting on: the proof loop budgets
+    /// WP_PROOF_BUDGET (600s) per function, the drain up to WP_DRAIN_BUDGET,
+    /// and the timeout-retry pass runs proof and drain again, so a stuck
+    /// multi-function run holds this far past any client timeout.
+    /// reload_project (re-parse) and verify_program_step (the lock write)
+    /// queue here too, and the re-parse has no budget of its own. A
+    /// disconnected MCP client shortens none of this: request cancellation
+    /// is cooperative, so the handler runs to completion.
+    ///
+    /// cancel_wp_queue stays outside this lock on purpose: it is the way out
+    /// of a run that is holding it, and taking the lock there would deadlock
+    /// the escape.
+    ///
+    /// Outermost lock: taken before the client lock, never inside it.
+    main_wp_lock: Arc<AsyncMutex<()>>,
     tool_router: ToolRouter<Self>,
 }
 
@@ -2047,10 +2096,9 @@ async fn reload_fetch(
     fetch_request: &str,
 ) -> Result<Vec<serde_json::Value>, McpError> {
     client
-        .get(reload_request, json!(null))
+        .reload_fetch(reload_request, fetch_request)
         .await
-        .map_err(McpError::from)?;
-    client.fetch_all(fetch_request).await.map_err(McpError::from)
+        .map_err(McpError::from)
 }
 
 /// Every property Frama-C holds, enriched the way every reader of them wants.
@@ -2522,6 +2570,7 @@ impl FramaCMcpServer {
             main_spawn_lock: Arc::new(AsyncMutex::new(())),
             project_locked: Arc::new(RwLock::new(false)),
             wp_cancel_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            main_wp_lock: Arc::new(AsyncMutex::new(())),
             tool_router: Self::tool_router(),
         }
     }
@@ -2628,8 +2677,6 @@ impl FramaCMcpServer {
                 None,
             ));
         };
-        let resolved = self.resolve_client(first).await?;
-        let client = &resolved.client;
         let mut target_names = Vec::new();
         for name in names {
             match scope_for_function(name) {
@@ -2682,11 +2729,47 @@ impl FramaCMcpServer {
                 .await;
         }
 
-        self.apply_wp_config(client, params, requested_provers.as_ref())
+        // One WP transaction per sandbox process, same reason as main_wp_lock
+        // on the main path: config through goal fetch must not interleave with
+        // a second run on this sandbox. The registry read ends before the
+        // await, so the registry lock plays no part in the hold.
+        let wp_lock = {
+            let sandboxes = self.sandboxes.read().await;
+            sandboxes
+                .wp_lock(exp_id)
+                .ok_or_else(|| sandbox_not_found_err(exp_id, &sandboxes.keys()))?
+        };
+        let _wp_op_guard = wp_lock.lock().await;
+
+        // The client comes from the same registry read that revalidates the
+        // lock. A delete_sandbox that landed while this call waited has
+        // already removed the entry and killed the process, and a sandbox
+        // recreated under the same id owns a fresh lock and a fresh client;
+        // either way a client resolved before the wait belongs to a process
+        // this transaction must not talk to.
+        let client = {
+            let sandboxes = self.sandboxes.read().await;
+            sandboxes
+                .client_if_current(exp_id, &wp_lock)
+                .ok_or_else(|| sandbox_not_found_err(exp_id, &sandboxes.keys()))?
+        };
+
+        // A delete can still land after this point: cleanup_sandbox never
+        // takes wp_lock, on purpose. A WP run can hold this lock for tens
+        // of minutes, and delete_sandbox is the force-kill escape for a
+        // wedged sandbox, so queuing deletion behind the lock would remove
+        // the only way to kill one. A delete that lands mid-run kills the
+        // process group, and the next request on this client fails with a
+        // broken pipe rather than silently corrupting the run. The cloned
+        // client is bound to the killed process's pipes, so it can never
+        // reach a sandbox recreated under the same id, and sandbox clients
+        // never respawn (that path is main-instance-only), so nothing
+        // outlives the kill.
+        self.apply_wp_config(&client, params, requested_provers.as_ref())
             .await?;
 
         let funcs = reload_fetch(
-            client,
+            &client,
             "kernel.ast.reloadFunctions",
             "kernel.ast.fetchFunctions",
         )
@@ -2708,12 +2791,12 @@ impl FramaCMcpServer {
                     .ok_or_else(|| McpError::from(FramaCError::FunctionNotFound(function.clone())))
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let protocol_diagnostics = start_wp_proofs(client, Some(&decl_markers)).await?;
+        let protocol_diagnostics = start_wp_proofs(&client, Some(&decl_markers)).await?;
 
-        let tasks = drain_wp_tasks(client, WP_DRAIN_BUDGET).await?;
+        let tasks = drain_wp_tasks(&client, WP_DRAIN_BUDGET).await?;
         let report_function = (names.len() == 1).then(|| target_names[0].as_str());
         let wp_goals = reload_fetch(
-            client,
+            &client,
             "plugins.wp.reloadGoals",
             "plugins.wp.fetchGoals",
         )
@@ -2740,7 +2823,7 @@ impl FramaCMcpServer {
         // The property table read here is the sandbox's own, which is the only
         // difference from the main path.
         self.attach_run_wp_receipt(
-            client,
+            &client,
             &mut response,
             source_files,
             &wp_goals,

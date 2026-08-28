@@ -3321,6 +3321,26 @@ impl FramaCMcpServer {
                 .await;
         }
 
+        // Held across the whole transaction below: config, target resolution,
+        // scheduling, drain, and goal fetch all act on process-global WP state,
+        // and the client mutex only covers one request at a time. Without
+        // this, two concurrent runs overwrite each other's config mid-flight
+        // and each reports the union of both runs' goals. cancel_wp_queue
+        // takes no lock, so a run stuck in drain can still be cancelled.
+        let _wp_op_guard = self.main_wp_lock.lock().await;
+
+        // Rechecked under the lock: verify_program_step can set the flag
+        // while this call waits for a run ahead of it, and the check at
+        // the top of the handler was read before that wait.
+        if *self.project_locked.read().await {
+            return Err(project_locked_error(
+                "run_wp",
+                "Project is locked. run_wp is blocked during Phase 2 to prevent state pollution. \
+                 If you are in verify-function, pass sandbox-prefixed functions. \
+                 Do NOT touch the main Frama-C instance. Call verify_program_step with lock_project=false first if this is the final main-project gate.",
+            ));
+        }
+
         // Recorded, not enforced. Frama-C aborts on SOME memory model changes
         // within one process and not others: Typed+cast to Typed+nocast is
         // routine and the suite depends on it, while Bytes to Typed+cast comes
@@ -4452,7 +4472,16 @@ impl FramaCMcpServer {
                 .await?,
         );
 
+        // The writer takes the WP transaction lock too: setting the flag
+        // declares that no WP run is mutating the main instance from here
+        // on, and without the lock that declaration can go out while a run
+        // that rechecked the flag is still mid-flight. Queuing behind it
+        // makes the ordering real; the recheck in run_wp closes the other
+        // half, a run starting after the flag is already set. This can wait
+        // as long as a run can; cancel_wp_queue takes no lock and remains
+        // the escape.
         if params.lock_project != Some(false) {
+            let _wp_op_guard = self.main_wp_lock.lock().await;
             *self.project_locked.write().await = true;
         }
         let project_locked = *self.project_locked.read().await;
