@@ -1849,6 +1849,19 @@ impl SandboxRegistry {
             .map(|entry| entry.runtime.wp_lock.clone())
     }
 
+    /// The client only while the entry still owns this exact lock. A waiter
+    /// holding a cloned Arc must not send requests to a client it resolved
+    /// before the wait when the entry was removed, or removed and recreated
+    /// under the same id, in between.
+    fn client_if_current(
+        &self,
+        experiment_id: &str,
+        lock: &Arc<AsyncMutex<()>>,
+    ) -> Option<Arc<FramaCClient>> {
+        let entry = self.entries.get(experiment_id)?;
+        Arc::ptr_eq(&entry.runtime.wp_lock, lock).then(|| entry.runtime.client.clone())
+    }
+
     pub fn metadata_list(&self) -> Vec<SandboxMetadata> {
         self.entries
             .values()
@@ -2664,8 +2677,6 @@ impl FramaCMcpServer {
                 None,
             ));
         };
-        let resolved = self.resolve_client(first).await?;
-        let client = &resolved.client;
         let mut target_names = Vec::new();
         for name in names {
             match scope_for_function(name) {
@@ -2730,28 +2741,24 @@ impl FramaCMcpServer {
         };
         let _wp_op_guard = wp_lock.lock().await;
 
-        // A delete_sandbox that landed while this call waited has already
-        // removed the entry and killed the process; the cloned Arc above
-        // kept the lock alive, so acquiring it says nothing about the
-        // sandbox still existing. Re-check membership before touching the
-        // client: same id, and the same lock instance, since a re-created
-        // sandbox under a reused id gets a fresh lock this waiter never
-        // queued for.
-        {
+        // The client comes from the same registry read that revalidates the
+        // lock. A delete_sandbox that landed while this call waited has
+        // already removed the entry and killed the process, and a sandbox
+        // recreated under the same id owns a fresh lock and a fresh client;
+        // either way a client resolved before the wait belongs to a process
+        // this transaction must not talk to.
+        let client = {
             let sandboxes = self.sandboxes.read().await;
-            let still_registered = sandboxes
-                .wp_lock(exp_id)
-                .is_some_and(|current| Arc::ptr_eq(&current, &wp_lock));
-            if !still_registered {
-                return Err(sandbox_not_found_err(exp_id, &sandboxes.keys()));
-            }
-        }
+            sandboxes
+                .client_if_current(exp_id, &wp_lock)
+                .ok_or_else(|| sandbox_not_found_err(exp_id, &sandboxes.keys()))?
+        };
 
-        self.apply_wp_config(client, params, requested_provers.as_ref())
+        self.apply_wp_config(&client, params, requested_provers.as_ref())
             .await?;
 
         let funcs = reload_fetch(
-            client,
+            &client,
             "kernel.ast.reloadFunctions",
             "kernel.ast.fetchFunctions",
         )
@@ -2773,12 +2780,12 @@ impl FramaCMcpServer {
                     .ok_or_else(|| McpError::from(FramaCError::FunctionNotFound(function.clone())))
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let protocol_diagnostics = start_wp_proofs(client, Some(&decl_markers)).await?;
+        let protocol_diagnostics = start_wp_proofs(&client, Some(&decl_markers)).await?;
 
-        let tasks = drain_wp_tasks(client, WP_DRAIN_BUDGET).await?;
+        let tasks = drain_wp_tasks(&client, WP_DRAIN_BUDGET).await?;
         let report_function = (names.len() == 1).then(|| target_names[0].as_str());
         let wp_goals = reload_fetch(
-            client,
+            &client,
             "plugins.wp.reloadGoals",
             "plugins.wp.fetchGoals",
         )
@@ -2805,7 +2812,7 @@ impl FramaCMcpServer {
         // The property table read here is the sandbox's own, which is the only
         // difference from the main path.
         self.attach_run_wp_receipt(
-            client,
+            &client,
             &mut response,
             source_files,
             &wp_goals,
