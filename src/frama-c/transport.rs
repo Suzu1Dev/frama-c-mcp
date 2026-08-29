@@ -6,9 +6,34 @@ use tokio::net::UnixStream;
 use super::codec;
 use crate::error::FramaCError;
 
+/// Bound on a single frame write. A healthy server drains its socket
+/// promptly; if a write stalls past this, the server is wedged. Without a
+/// timeout the write blocks while the caller holds the client mutex, which
+/// freezes every subsequent request, including the poll loop that is meant
+/// to enforce request timeouts.
+const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
+
 pub struct Transport {
     stream: UnixStream,
     read_buf: BytesMut,
+    /// Set when a frame write failed or timed out part-way through.
+    ///
+    /// write_all is not cancellation-safe: the socket may already hold a
+    /// prefix of that frame, so the next write would append a fresh frame
+    /// onto it and corrupt the length-prefixed protocol for every later
+    /// command. Poisoning turns that silent corruption into a fast error
+    /// on every later use; recovery is a new Transport, which the session
+    /// gets through the respawn path in ensure_main_spawned.
+    ///
+    /// The respawn is not automatic yet. ensure_main_spawned decides
+    /// in-place vs respawn from MainFramaCState alone and never looks at
+    /// this flag, so the first reload with explicit files still fails in
+    /// place (which marks the session poisoned) and only the second one
+    /// respawns; a reload without files never gets that far, because it
+    /// asks this dead transport for the current file list first. Sandbox
+    /// clients have no respawn path at all. Surfacing this flag to the
+    /// respawn decision is a planned follow-up.
+    poisoned: bool,
 }
 
 impl Transport {
@@ -17,19 +42,29 @@ impl Transport {
         Ok(Transport {
             stream,
             read_buf: BytesMut::with_capacity(8192),
+            poisoned: false,
         })
     }
 
     pub async fn send_frame(&mut self, payload: &str) -> Result<(), FramaCError> {
+        if self.poisoned {
+            return Err(poisoned_transport());
+        }
         let frame = codec::encode_frame(payload);
-        self.stream.write_all(&frame).await?;
-        Ok(())
+        match tokio::time::timeout(WRITE_TIMEOUT, self.stream.write_all(&frame)).await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(e)) => Err(self.poison(FramaCError::Io(e)).await),
+            Err(_) => Err(self.poison(FramaCError::Timeout(WRITE_TIMEOUT)).await),
+        }
     }
 
     pub async fn recv_frame(
         &mut self,
         timeout: Duration,
     ) -> Result<Option<String>, FramaCError> {
+        if self.poisoned {
+            return Err(poisoned_transport());
+        }
         loop {
             if let Some((payload, consumed)) = codec::decode_frame(&self.read_buf)? {
                 self.read_buf.advance(consumed);
@@ -56,4 +91,22 @@ impl Transport {
         self.stream.shutdown().await?;
         Ok(())
     }
+
+    /// Mark the stream unusable and close our end of it, returning the
+    /// error the caller should see. Any write that did not run to
+    /// completion can have left a partial frame in the socket, and no
+    /// later frame may follow it on this stream.
+    async fn poison(&mut self, error: FramaCError) -> FramaCError {
+        self.poisoned = true;
+        let _ = self.stream.shutdown().await;
+        error
+    }
+}
+
+/// The error every later call gets on a poisoned transport.
+fn poisoned_transport() -> FramaCError {
+    FramaCError::Io(std::io::Error::new(
+        std::io::ErrorKind::BrokenPipe,
+        "transport poisoned by an incomplete frame write",
+    ))
 }
